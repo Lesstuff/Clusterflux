@@ -1,0 +1,1676 @@
+use std::collections::BTreeMap;
+use std::fs;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitStatus, Stdio};
+use std::time::{Duration, Instant};
+
+#[cfg(test)]
+use clusterflux_core::discover_environments;
+use clusterflux_core::{
+    environment_resource_from_revision_bytes, validate_commit_sha, validate_public_clone_url,
+    validate_workflow_source_path, CommitTrigger, Digest, EnvironmentContextFile, EnvironmentKind,
+    EnvironmentResource, ProjectModel, RepositoryRevision, SourceProviderKind, WorkflowSource,
+    WorkflowSourceFile, MAX_ENVIRONMENT_CONTEXT_BYTES, MAX_ENVIRONMENT_CONTEXT_DEPTH,
+    MAX_ENVIRONMENT_CONTEXT_FILES, MAX_ENVIRONMENT_CONTEXT_FILE_BYTES,
+    MAX_ENVIRONMENT_CONTEXT_PATH_BYTES, MAX_WORKFLOW_SOURCE_BYTES, MAX_WORKFLOW_SOURCE_FILES,
+};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
+
+const MAX_SNAPSHOT_FILES: usize = 20_000;
+const MAX_SNAPSHOT_FILE_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_SNAPSHOT_TOTAL_BYTES: u64 = 1024 * 1024 * 1024;
+const DEFAULT_GIT_TIMEOUT: Duration = Duration::from_secs(90);
+const MAX_GIT_DIAGNOSTIC_BYTES: usize = 64 * 1024;
+const MAX_WORKFLOW_FETCH_DISK_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_REVISION_CHECKOUT_DISK_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectSourceOrigin {
+    LocalCheckout,
+    ExactForgeRevision { commit_sha: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceSnapshotIdentity {
+    pub digest: Digest,
+    pub provider: String,
+    pub mode: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedClusterfluxProject {
+    pub project_root: PathBuf,
+    pub workflow_root: PathBuf,
+    pub manifest_digest: Digest,
+    pub crate_root: PathBuf,
+    pub workflow_files: Vec<WorkflowSourceFile>,
+    pub environments: Vec<EnvironmentResource>,
+    pub source_snapshot: SourceSnapshotIdentity,
+    pub source_origin: ProjectSourceOrigin,
+    pub model: ProjectModel,
+}
+
+pub fn resolve_local_clusterflux_project(
+    project_root: &Path,
+    provider: &SourceProviderKind,
+) -> Result<ResolvedClusterfluxProject, String> {
+    let project_root = project_root
+        .canonicalize()
+        .map_err(|error| format!("resolve Clusterflux project root: {error}"))?;
+    let model =
+        ProjectModel::discover_without_config(&project_root).map_err(|error| error.to_string())?;
+    let workflow_root = project_root.join(".clusterflux");
+    let crate_root = workflow_root.join("main.rs");
+    let mut workflow_files = Vec::new();
+    collect_local_workflow_files(&workflow_root, &workflow_root, &mut workflow_files)?;
+    workflow_files.sort_by(|left, right| left.path.cmp(&right.path));
+    let manifest_count = workflow_files
+        .iter()
+        .filter(|file| file.path == ".clusterflux/Cargo.toml")
+        .count();
+    if manifest_count != 1
+        || !workflow_files
+            .iter()
+            .any(|file| file.path == ".clusterflux/main.rs")
+    {
+        return Err(
+            "Clusterflux project requires .clusterflux/Cargo.toml and .clusterflux/main.rs"
+                .to_owned(),
+        );
+    }
+    let snapshot = snapshot_project_with_provider(&project_root, provider)?;
+    Ok(ResolvedClusterfluxProject {
+        project_root,
+        workflow_root,
+        manifest_digest: model.manifest_digest.clone(),
+        crate_root,
+        workflow_files,
+        environments: model.environments.clone(),
+        source_snapshot: SourceSnapshotIdentity {
+            digest: snapshot.digest,
+            provider: snapshot.provider,
+            mode: snapshot.source_mode,
+        },
+        source_origin: ProjectSourceOrigin::LocalCheckout,
+        model,
+    })
+}
+
+fn collect_local_workflow_files(
+    workflow_root: &Path,
+    directory: &Path,
+    files: &mut Vec<WorkflowSourceFile>,
+) -> Result<(), String> {
+    for entry in fs::read_dir(directory).map_err(|error| {
+        format!(
+            "read workflow source directory {}: {error}",
+            directory.display()
+        )
+    })? {
+        let entry = entry.map_err(|error| format!("inspect workflow source entry: {error}"))?;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|error| format!("inspect workflow source {}: {error}", path.display()))?;
+        if metadata.file_type().is_symlink() {
+            return Err(format!(
+                "workflow source `{}` must not be a symlink",
+                path.display()
+            ));
+        }
+        if metadata.is_dir() {
+            collect_local_workflow_files(workflow_root, &path, files)?;
+            continue;
+        }
+        if !metadata.is_file() {
+            return Err(format!(
+                "workflow source `{}` must be a regular file",
+                path.display()
+            ));
+        }
+        let relative = path
+            .strip_prefix(workflow_root)
+            .map_err(|_| "workflow source escaped .clusterflux".to_owned())?;
+        let relative = slash_path(relative)?;
+        if relative == "Cargo.lock" {
+            continue;
+        }
+        if relative != "Cargo.toml" && !relative.ends_with(".rs") {
+            return Err(format!(
+                "workflow directory contains unsupported source file `.clusterflux/{relative}`"
+            ));
+        }
+        if files.len() >= MAX_WORKFLOW_SOURCE_FILES {
+            return Err(format!(
+                "workflow source exceeds the {MAX_WORKFLOW_SOURCE_FILES} file limit"
+            ));
+        }
+        let source_path = format!(".clusterflux/{relative}");
+        validate_workflow_source_path(&source_path)?;
+        let bytes = fs::read(&path)
+            .map_err(|error| format!("read workflow source {}: {error}", path.display()))?;
+        let mode = if is_executable(&metadata) {
+            0o100755
+        } else {
+            0o100644
+        };
+        files.push(WorkflowSourceFile::new(source_path, mode, bytes)?);
+    }
+    let total = files.iter().map(|file| file.bytes.len()).sum::<usize>();
+    if total > MAX_WORKFLOW_SOURCE_BYTES {
+        return Err(format!(
+            "workflow source exceeds {MAX_WORKFLOW_SOURCE_BYTES} total bytes"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn is_executable(metadata: &fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    metadata.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn is_executable(_metadata: &fs::Metadata) -> bool {
+    false
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExactRevisionSourceLimits {
+    pub max_files: usize,
+    pub max_file_bytes: usize,
+    pub max_total_bytes: usize,
+    pub git_timeout: Duration,
+}
+
+impl Default for ExactRevisionSourceLimits {
+    fn default() -> Self {
+        Self {
+            max_files: MAX_WORKFLOW_SOURCE_FILES,
+            max_file_bytes: clusterflux_core::automation::MAX_WORKFLOW_SOURCE_FILE_BYTES,
+            max_total_bytes: MAX_WORKFLOW_SOURCE_BYTES,
+            git_timeout: DEFAULT_GIT_TIMEOUT,
+        }
+    }
+}
+
+impl ExactRevisionSourceLimits {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.max_files == 0
+            || self.max_files > MAX_WORKFLOW_SOURCE_FILES
+            || self.max_file_bytes == 0
+            || self.max_file_bytes > clusterflux_core::automation::MAX_WORKFLOW_SOURCE_FILE_BYTES
+            || self.max_total_bytes == 0
+            || self.max_total_bytes > MAX_WORKFLOW_SOURCE_BYTES
+            || self.git_timeout.is_zero()
+            || self.git_timeout > Duration::from_secs(10 * 60)
+        {
+            return Err("exact-revision source limits exceed public compiler bounds".to_owned());
+        }
+        Ok(())
+    }
+}
+
+/// Temporary, exact public Git checkout held for the lifetime of one task.
+pub struct MaterializedRepositoryRevision {
+    directory: tempfile::TempDir,
+}
+
+impl MaterializedRepositoryRevision {
+    pub fn root(&self) -> &Path {
+        self.directory.path()
+    }
+}
+
+pub fn materialize_exact_repository_revision(
+    revision: &RepositoryRevision,
+) -> Result<MaterializedRepositoryRevision, String> {
+    materialize_exact_repository_revision_cancellable(revision, || false)
+}
+
+pub fn materialize_exact_repository_revision_cancellable(
+    revision: &RepositoryRevision,
+    cancelled: impl Fn() -> bool,
+) -> Result<MaterializedRepositoryRevision, String> {
+    revision.validate()?;
+    let expected_snapshot = Digest::from_parts([
+        b"clusterflux-git-revision:v1".as_slice(),
+        revision.repository_id.as_str().as_bytes(),
+        revision.clone_url.as_bytes(),
+        revision.commit_sha.as_bytes(),
+    ]);
+    if expected_snapshot != revision.source_snapshot {
+        return Err("repository revision source handle does not match its metadata".to_owned());
+    }
+    let directory = tempfile::Builder::new()
+        .prefix("clusterflux-exact-checkout-")
+        .tempdir()
+        .map_err(|error| format!("create exact checkout: {error}"))?;
+    run_git_cancellable_bounded(
+        directory.path(),
+        ["init", "--quiet"],
+        DEFAULT_GIT_TIMEOUT,
+        MAX_GIT_DIAGNOSTIC_BYTES,
+        MAX_REVISION_CHECKOUT_DISK_BYTES,
+        &cancelled,
+    )?;
+    run_git_cancellable_bounded(
+        directory.path(),
+        ["remote", "add", "origin", revision.clone_url.as_str()],
+        DEFAULT_GIT_TIMEOUT,
+        MAX_GIT_DIAGNOSTIC_BYTES,
+        MAX_REVISION_CHECKOUT_DISK_BYTES,
+        &cancelled,
+    )?;
+    run_git_cancellable_bounded(
+        directory.path(),
+        [
+            "fetch",
+            "--quiet",
+            "--depth=1",
+            "--no-tags",
+            "origin",
+            revision.commit_sha.as_str(),
+        ],
+        DEFAULT_GIT_TIMEOUT,
+        MAX_GIT_DIAGNOSTIC_BYTES,
+        MAX_REVISION_CHECKOUT_DISK_BYTES,
+        &cancelled,
+    )?;
+    run_git_cancellable_bounded(
+        directory.path(),
+        ["checkout", "--quiet", "--detach", "FETCH_HEAD"],
+        DEFAULT_GIT_TIMEOUT,
+        MAX_GIT_DIAGNOSTIC_BYTES,
+        MAX_REVISION_CHECKOUT_DISK_BYTES,
+        &cancelled,
+    )?;
+    let actual = run_git_cancellable_bounded(
+        directory.path(),
+        ["rev-parse", "--verify", "HEAD^{commit}"],
+        DEFAULT_GIT_TIMEOUT,
+        256,
+        MAX_REVISION_CHECKOUT_DISK_BYTES,
+        &cancelled,
+    )?;
+    if String::from_utf8(actual)
+        .map_err(|_| "Git returned a non-UTF-8 checkout identity".to_owned())?
+        .trim()
+        != revision.commit_sha
+    {
+        return Err("materialized checkout does not match the required commit".to_owned());
+    }
+    Ok(MaterializedRepositoryRevision { directory })
+}
+
+pub fn load_exact_workflow_source(
+    trigger: &CommitTrigger,
+    configured_clone_url: &str,
+    limits: &ExactRevisionSourceLimits,
+) -> Result<(WorkflowSource, RepositoryRevision), String> {
+    trigger.validate()?;
+    validate_public_clone_url(configured_clone_url)?;
+    validate_commit_sha(&trigger.commit_sha)?;
+    limits.validate()?;
+    if trigger.repository_url != configured_clone_url {
+        return Err("trigger repository URL does not match the configured binding".to_owned());
+    }
+
+    let loaded =
+        load_exact_workflow_source_from_validated_binding(trigger, configured_clone_url, limits)?;
+    loaded.1.validate()?;
+    Ok(loaded)
+}
+
+fn load_exact_workflow_source_from_validated_binding(
+    trigger: &CommitTrigger,
+    configured_clone_url: &str,
+    limits: &ExactRevisionSourceLimits,
+) -> Result<(WorkflowSource, RepositoryRevision), String> {
+    let checkout = tempfile::Builder::new()
+        .prefix("clusterflux-exact-source-")
+        .tempdir()
+        .map_err(|error| format!("create exact-source temporary directory: {error}"))?;
+    run_git(
+        checkout.path(),
+        ["init", "--quiet"],
+        limits.git_timeout,
+        MAX_GIT_DIAGNOSTIC_BYTES,
+    )?;
+    run_git(
+        checkout.path(),
+        ["remote", "add", "origin", configured_clone_url],
+        limits.git_timeout,
+        MAX_GIT_DIAGNOSTIC_BYTES,
+    )?;
+
+    let filtered = run_git(
+        checkout.path(),
+        [
+            "fetch",
+            "--quiet",
+            "--filter=blob:none",
+            "--depth=1",
+            "origin",
+            trigger.commit_sha.as_str(),
+        ],
+        limits.git_timeout,
+        MAX_GIT_DIAGNOSTIC_BYTES,
+    );
+    if filtered.is_err() {
+        run_git(
+            checkout.path(),
+            [
+                "fetch",
+                "--quiet",
+                "--depth=1",
+                "origin",
+                trigger.commit_sha.as_str(),
+            ],
+            limits.git_timeout,
+            MAX_GIT_DIAGNOSTIC_BYTES,
+        )?;
+    }
+
+    let fetched = run_git(
+        checkout.path(),
+        ["rev-parse", "--verify", "FETCH_HEAD^{commit}"],
+        limits.git_timeout,
+        256,
+    )?;
+    let fetched = String::from_utf8(fetched)
+        .map_err(|_| "Git returned a non-UTF-8 commit identity".to_owned())?;
+    if fetched.trim() != trigger.commit_sha {
+        return Err(format!(
+            "fetched commit {} does not match trigger commit {}",
+            fetched.trim(),
+            trigger.commit_sha
+        ));
+    }
+
+    let tree = run_git(
+        checkout.path(),
+        [
+            "ls-tree",
+            "-rz",
+            "-l",
+            "--full-tree",
+            "FETCH_HEAD",
+            "--",
+            ".clusterflux",
+            "envs",
+        ],
+        limits.git_timeout,
+        limits
+            .max_files
+            .saturating_mul(clusterflux_core::automation::MAX_WORKFLOW_SOURCE_PATH_BYTES + 128),
+    )?;
+    let all_entries = parse_revision_tree(&tree, limits)?;
+    let entries = all_entries
+        .iter()
+        .filter(|entry| entry.3.starts_with(".clusterflux/"))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut files = Vec::with_capacity(entries.len());
+    let total_bytes = entries
+        .iter()
+        .try_fold(0_usize, |total, (_, _, size, path)| {
+            let maximum = if path == ".clusterflux/Cargo.toml" {
+                clusterflux_core::MAX_WORKFLOW_MANIFEST_BYTES
+            } else {
+                limits.max_file_bytes
+            };
+            if *size > maximum {
+                return Err(format!(
+                    "workflow source file `{path}` is {size} bytes; limit is {maximum} bytes"
+                ));
+            }
+            let next = total.saturating_add(*size);
+            if next > limits.max_total_bytes {
+                return Err(format!(
+                    "workflow source exceeds {} total bytes",
+                    limits.max_total_bytes
+                ));
+            }
+            Ok(next)
+        })?;
+    let _ = total_bytes;
+    for (mode, object_id, expected_size, path) in entries {
+        let bytes = run_git(
+            checkout.path(),
+            ["cat-file", "blob", object_id.as_str()],
+            limits.git_timeout,
+            expected_size,
+        )?;
+        if bytes.len() != expected_size {
+            return Err(format!(
+                "workflow blob `{path}` size changed during exact-commit loading"
+            ));
+        }
+        files.push(WorkflowSourceFile::new(path, mode, bytes)?);
+    }
+
+    let environments = load_revision_environments(checkout.path(), &all_entries, limits)?;
+
+    let source = WorkflowSource::new_with_environments(
+        trigger.trigger_id.clone(),
+        trigger.repository_id.clone(),
+        trigger.commit_sha.clone(),
+        files,
+        environments,
+    )?;
+    let source_snapshot = Digest::from_parts([
+        b"clusterflux-git-revision:v1".as_slice(),
+        trigger.repository_id.as_str().as_bytes(),
+        configured_clone_url.as_bytes(),
+        trigger.commit_sha.as_bytes(),
+    ]);
+    let revision = RepositoryRevision {
+        repository_id: trigger.repository_id.clone(),
+        clone_url: configured_clone_url.to_owned(),
+        commit_sha: trigger.commit_sha.clone(),
+        source_snapshot,
+    };
+    Ok((source, revision))
+}
+
+fn parse_revision_tree(
+    bytes: &[u8],
+    limits: &ExactRevisionSourceLimits,
+) -> Result<Vec<(u32, String, usize, String)>, String> {
+    let mut entries = Vec::new();
+    for record in bytes
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+    {
+        if entries.len() >= limits.max_files {
+            return Err(format!(
+                "workflow source exceeds the {} file limit",
+                limits.max_files
+            ));
+        }
+        let record = std::str::from_utf8(record)
+            .map_err(|_| "Git workflow tree contains a non-UTF-8 path".to_owned())?;
+        let (metadata, path) = record
+            .split_once('\t')
+            .ok_or_else(|| "Git workflow tree record is malformed".to_owned())?;
+        let mut metadata = metadata.split_ascii_whitespace();
+        let mode = metadata
+            .next()
+            .ok_or_else(|| "Git workflow tree record omits mode".to_owned())?;
+        let kind = metadata
+            .next()
+            .ok_or_else(|| "Git workflow tree record omits object kind".to_owned())?;
+        let object_id = metadata
+            .next()
+            .ok_or_else(|| "Git workflow tree record omits object ID".to_owned())?;
+        let size = metadata
+            .next()
+            .ok_or_else(|| "Git workflow tree record omits blob size".to_owned())?
+            .parse::<usize>()
+            .map_err(|_| "Git workflow tree blob size is malformed".to_owned())?;
+        if kind != "blob" || !matches!(mode, "100644" | "100755") {
+            return Err(format!(
+                "workflow source `{path}` must be a regular non-symlink file"
+            ));
+        }
+        if path.starts_with(".clusterflux/") {
+            if path != ".clusterflux/Cargo.toml" && !path.ends_with(".rs") {
+                return Err(format!(
+                    "workflow directory contains unsupported non-Rust file `{path}`"
+                ));
+            }
+            validate_workflow_source_path(path)?;
+        } else {
+            validate_environment_revision_path(path)?;
+        }
+        let mode = u32::from_str_radix(mode, 8)
+            .map_err(|_| "Git workflow tree mode is malformed".to_owned())?;
+        entries.push((mode, object_id.to_owned(), size, path.to_owned()));
+    }
+    entries.sort_by(|left, right| left.3.cmp(&right.3));
+    Ok(entries)
+}
+
+fn validate_environment_revision_path(path: &str) -> Result<(), String> {
+    let Some((name, relative)) = path
+        .strip_prefix("envs/")
+        .and_then(|rest| rest.split_once('/'))
+    else {
+        return Err(format!(
+            "unsupported or invalid environment revision path `{path}`"
+        ));
+    };
+    let first = relative.split('/').next().unwrap_or_default();
+    let valid = !name.is_empty()
+        && name.len() <= 128
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        && !matches!(first, ".git" | "target" | ".clusterflux")
+        && !relative.is_empty()
+        && relative.len() <= MAX_ENVIRONMENT_CONTEXT_PATH_BYTES
+        && relative.split('/').count() <= MAX_ENVIRONMENT_CONTEXT_DEPTH
+        && !relative.contains('\\')
+        && relative
+            .split('/')
+            .all(|component| !component.is_empty() && !matches!(component, "." | ".."));
+    if !valid || path.len() > clusterflux_core::automation::MAX_WORKFLOW_SOURCE_PATH_BYTES {
+        return Err(format!(
+            "unsupported or invalid environment revision path `{path}`"
+        ));
+    }
+    Ok(())
+}
+
+fn load_revision_environments(
+    checkout: &Path,
+    entries: &[(u32, String, usize, String)],
+    limits: &ExactRevisionSourceLimits,
+) -> Result<Vec<EnvironmentResource>, String> {
+    let mut by_name: BTreeMap<String, Vec<(u32, String, String, usize)>> = BTreeMap::new();
+    for (mode, object, size, path) in entries.iter().filter(|entry| entry.3.starts_with("envs/")) {
+        let name = path
+            .strip_prefix("envs/")
+            .and_then(|rest| rest.split_once('/'))
+            .map(|(name, _)| name.to_owned())
+            .ok_or_else(|| format!("invalid environment revision path `{path}`"))?;
+        by_name
+            .entry(name)
+            .or_default()
+            .push((*mode, path.clone(), object.clone(), *size));
+    }
+    if by_name.len() > 64 {
+        return Err("exact revision contains too many environments".to_owned());
+    }
+    let mut resources = Vec::new();
+    for (name, files) in by_name {
+        let recipe = files.iter().find(|(_, path, _, _)| {
+            matches!(
+                path.rsplit('/').next(),
+                Some("Containerfile" | "Dockerfile" | "flake.nix")
+            )
+        });
+        let Some((_, recipe_path, recipe_object, recipe_size)) = recipe else {
+            continue;
+        };
+        if *recipe_size > limits.max_file_bytes {
+            return Err(format!(
+                "environment recipe `{recipe_path}` exceeds its byte limit"
+            ));
+        }
+        let recipe_bytes = run_git(
+            checkout,
+            ["cat-file", "blob", recipe_object.as_str()],
+            limits.git_timeout,
+            *recipe_size,
+        )?;
+        let metadata_bytes = if let Some((_, path, object, size)) = files
+            .iter()
+            .find(|(_, path, _, _)| path.ends_with("/environment.toml"))
+        {
+            if *size > limits.max_file_bytes {
+                return Err(format!(
+                    "environment metadata `{path}` exceeds its byte limit"
+                ));
+            }
+            run_git(
+                checkout,
+                ["cat-file", "blob", object.as_str()],
+                limits.git_timeout,
+                *size,
+            )?
+        } else {
+            Vec::new()
+        };
+        if files.len() > MAX_ENVIRONMENT_CONTEXT_FILES {
+            return Err(format!(
+                "environment `{name}` exceeds its context file limit"
+            ));
+        }
+        let context_total = files
+            .iter()
+            .try_fold(0_usize, |total, (_, path, _, size)| {
+                if *size > MAX_ENVIRONMENT_CONTEXT_FILE_BYTES {
+                    return Err(format!(
+                        "environment context file `{path}` exceeds its byte limit"
+                    ));
+                }
+                let total = total.saturating_add(*size);
+                if total > MAX_ENVIRONMENT_CONTEXT_BYTES {
+                    return Err(format!(
+                        "environment `{name}` exceeds its total context byte limit"
+                    ));
+                }
+                Ok(total)
+            })?;
+        let mut context_manifest = Vec::with_capacity(files.len());
+        for (mode, path, object, size) in &files {
+            let bytes = run_git(
+                checkout,
+                ["cat-file", "blob", object.as_str()],
+                limits.git_timeout,
+                *size,
+            )?;
+            if bytes.len() != *size {
+                return Err(format!(
+                    "environment blob `{path}` size changed while loading"
+                ));
+            }
+            let relative = path
+                .strip_prefix(&format!("envs/{name}/"))
+                .ok_or_else(|| format!("environment context path `{path}` escaped its root"))?;
+            context_manifest.push(EnvironmentContextFile {
+                path: relative.to_owned(),
+                mode: *mode,
+                size: *size as u64,
+                digest: Digest::sha256(&bytes),
+            });
+        }
+        let _ = context_total;
+        let kind = match recipe_path.rsplit('/').next() {
+            Some("Containerfile") => EnvironmentKind::Containerfile,
+            Some("Dockerfile") => EnvironmentKind::Dockerfile,
+            Some("flake.nix") => EnvironmentKind::NixFlake,
+            _ => unreachable!("recipe selection was bounded"),
+        };
+        resources.push(environment_resource_from_revision_bytes(
+            &name,
+            kind,
+            PathBuf::from(recipe_path),
+            PathBuf::from(format!("envs/{name}")),
+            &recipe_bytes,
+            &metadata_bytes,
+            context_manifest,
+        )?);
+    }
+    Ok(resources)
+}
+
+fn run_git<const N: usize>(
+    directory: &Path,
+    arguments: [&str; N],
+    timeout: Duration,
+    max_stdout_bytes: usize,
+) -> Result<Vec<u8>, String> {
+    run_git_cancellable(directory, arguments, timeout, max_stdout_bytes, &|| false)
+}
+
+fn run_git_cancellable<const N: usize>(
+    directory: &Path,
+    arguments: [&str; N],
+    timeout: Duration,
+    max_stdout_bytes: usize,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<Vec<u8>, String> {
+    run_git_cancellable_bounded(
+        directory,
+        arguments,
+        timeout,
+        max_stdout_bytes,
+        MAX_WORKFLOW_FETCH_DISK_BYTES,
+        cancelled,
+    )
+}
+
+fn run_git_cancellable_bounded<const N: usize>(
+    directory: &Path,
+    arguments: [&str; N],
+    timeout: Duration,
+    max_stdout_bytes: usize,
+    max_workspace_bytes: u64,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<Vec<u8>, String> {
+    let stdout =
+        tempfile::tempfile().map_err(|error| format!("create Git stdout file: {error}"))?;
+    let stderr =
+        tempfile::tempfile().map_err(|error| format!("create Git stderr file: {error}"))?;
+    let mut command = Command::new("git");
+    command
+        .current_dir(directory)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .args(arguments)
+        .stdout(Stdio::from(
+            stdout
+                .try_clone()
+                .map_err(|error| format!("clone Git stdout file: {error}"))?,
+        ))
+        .stderr(Stdio::from(
+            stderr
+                .try_clone()
+                .map_err(|error| format!("clone Git stderr file: {error}"))?,
+        ));
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: setpgid is async-signal-safe and does not access Rust-owned memory.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            });
+        }
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("start Git: {error}"))?;
+    let started = Instant::now();
+    let mut last_disk_check = Instant::now();
+    let status = loop {
+        if cancelled() {
+            terminate_process_group(&mut child);
+            return Err("Git operation was cancelled".to_owned());
+        }
+        if last_disk_check.elapsed() >= Duration::from_millis(100) {
+            last_disk_check = Instant::now();
+            if workspace_size(directory, max_workspace_bytes)? > max_workspace_bytes {
+                terminate_process_group(&mut child);
+                return Err(format!(
+                    "Git workspace exceeds the {max_workspace_bytes}-byte disk limit"
+                ));
+            }
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() >= timeout => {
+                terminate_process_group(&mut child);
+                return Err(format!(
+                    "Git operation exceeded {} seconds",
+                    timeout.as_secs()
+                ));
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(25)),
+            Err(error) => {
+                terminate_process_group(&mut child);
+                return Err(format!("wait for Git: {error}"));
+            }
+        }
+    };
+    finish_git_output(status, stdout, stderr, max_stdout_bytes)
+}
+
+fn terminate_process_group(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(-(child.id() as i32), libc::SIGKILL);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn workspace_size(root: &Path, limit: u64) -> Result<u64, String> {
+    let mut total = 0_u64;
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(&directory)
+            .map_err(|error| format!("inspect Git workspace disk use: {error}"))?
+        {
+            let entry = entry.map_err(|error| format!("inspect Git workspace entry: {error}"))?;
+            let metadata = fs::symlink_metadata(entry.path())
+                .map_err(|error| format!("inspect Git workspace metadata: {error}"))?;
+            if metadata.is_dir() {
+                pending.push(entry.path());
+            } else if metadata.is_file() {
+                total = total.saturating_add(metadata.len());
+                if total > limit {
+                    return Ok(total);
+                }
+            }
+        }
+    }
+    Ok(total)
+}
+
+fn finish_git_output(
+    status: ExitStatus,
+    mut stdout: fs::File,
+    mut stderr: fs::File,
+    max_stdout_bytes: usize,
+) -> Result<Vec<u8>, String> {
+    use std::io::{Seek, SeekFrom};
+    stdout
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| format!("seek Git stdout: {error}"))?;
+    stderr
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| format!("seek Git stderr: {error}"))?;
+    let mut output = Vec::new();
+    stdout
+        .by_ref()
+        .take(max_stdout_bytes.saturating_add(1) as u64)
+        .read_to_end(&mut output)
+        .map_err(|error| format!("read Git stdout: {error}"))?;
+    if output.len() > max_stdout_bytes {
+        return Err(format!(
+            "Git output exceeds the {max_stdout_bytes}-byte limit"
+        ));
+    }
+    let mut diagnostic = Vec::new();
+    stderr
+        .take(MAX_GIT_DIAGNOSTIC_BYTES as u64)
+        .read_to_end(&mut diagnostic)
+        .map_err(|error| format!("read Git stderr: {error}"))?;
+    if !status.success() {
+        return Err(format!(
+            "Git exited with status {:?}: {}",
+            status.code(),
+            String::from_utf8_lossy(&diagnostic).trim()
+        ));
+    }
+    Ok(output)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceSnapshotInventory {
+    pub digest: Digest,
+    pub provider: String,
+    pub file_count: usize,
+    pub total_bytes: u64,
+    pub source_mode: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SnapshotFile {
+    path: String,
+    kind: &'static str,
+    executable: bool,
+    digest: Digest,
+    size_bytes: u64,
+}
+
+pub fn snapshot_project(project_root: &Path) -> Result<SourceSnapshotInventory, String> {
+    snapshot_project_cancellable(project_root, || false)
+}
+
+pub fn snapshot_project_cancellable(
+    project_root: &Path,
+    cancelled: impl Fn() -> bool,
+) -> Result<SourceSnapshotInventory, String> {
+    let project_root = resolve_project_root(project_root)?;
+    check_snapshot_cancelled(&cancelled)?;
+    if let Some(repository_root) = git_repository_root(&project_root)? {
+        snapshot_git_project(&repository_root, &project_root, &cancelled)
+    } else {
+        snapshot_filesystem_project(&project_root, &cancelled)
+    }
+}
+
+pub fn snapshot_project_with_provider(
+    project_root: &Path,
+    provider: &SourceProviderKind,
+) -> Result<SourceSnapshotInventory, String> {
+    let project_root = resolve_project_root(project_root)?;
+    match provider {
+        SourceProviderKind::Filesystem => snapshot_filesystem_project(&project_root, &|| false),
+        SourceProviderKind::Git => {
+            let repository_root = git_repository_root(&project_root)?.ok_or_else(|| {
+                "Git source provider requires the project to be inside a Git checkout".to_owned()
+            })?;
+            snapshot_git_project(&repository_root, &project_root, &|| false)
+        }
+        SourceProviderKind::Custom(provider) => Err(format!(
+            "custom source provider `{provider}` has no built-in snapshot implementation"
+        )),
+    }
+}
+
+pub fn detect_source_provider(project_root: &Path) -> Result<SourceProviderKind, String> {
+    let project_root = resolve_project_root(project_root)?;
+    Ok(if git_repository_root(&project_root)?.is_some() {
+        SourceProviderKind::Git
+    } else {
+        SourceProviderKind::Filesystem
+    })
+}
+
+fn resolve_project_root(project_root: &Path) -> Result<PathBuf, String> {
+    let project_root = project_root
+        .canonicalize()
+        .map_err(|error| format!("resolve source checkout: {error}"))?;
+    if !project_root.is_dir() {
+        return Err("source checkout root is not a directory".to_owned());
+    }
+    Ok(project_root)
+}
+
+fn snapshot_git_project(
+    repository_root: &Path,
+    project_root: &Path,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<SourceSnapshotInventory, String> {
+    check_snapshot_cancelled(cancelled)?;
+    let project_prefix = project_root
+        .strip_prefix(repository_root)
+        .map_err(|_| "source checkout is outside its discovered Git repository".to_owned())?;
+    let project_prefix = if project_prefix.as_os_str().is_empty() {
+        ".".to_owned()
+    } else {
+        slash_path(project_prefix)?
+    };
+    let mut command = git_command(repository_root);
+    command
+        .args([
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "--",
+        ])
+        .arg(&project_prefix);
+    let output = command
+        .output()
+        .map_err(|error| format!("enumerate Git source snapshot: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "enumerate Git source snapshot failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let mut files = Vec::new();
+    for raw in output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|raw| !raw.is_empty())
+    {
+        check_snapshot_cancelled(cancelled)?;
+        let repository_relative =
+            std::str::from_utf8(raw).map_err(|_| "Git source path is not UTF-8".to_owned())?;
+        let absolute = repository_root.join(repository_relative);
+        let relative = absolute
+            .strip_prefix(project_root)
+            .map_err(|_| "Git enumerated source outside the selected project".to_owned())?;
+        files.push(snapshot_file(&absolute, &slash_path(relative)?, cancelled)?);
+    }
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+    files.dedup_by(|left, right| left.path == right.path);
+    validate_snapshot_bounds(&files)?;
+
+    let head =
+        git_text(repository_root, &["rev-parse", "HEAD"]).unwrap_or_else(|| "unborn".to_owned());
+    let roots = git_text(repository_root, &["rev-list", "--max-parents=0", "HEAD"])
+        .unwrap_or_else(|| "unborn".to_owned());
+    let remote = git_text(repository_root, &["config", "--get", "remote.origin.url"])
+        .unwrap_or_else(|| "no-origin".to_owned());
+    let submodules = git_text(
+        repository_root,
+        &["submodule", "status", "--recursive", "--", &project_prefix],
+    )
+    .unwrap_or_else(|| "no-submodules".to_owned());
+    finish_snapshot(
+        "git",
+        "working_tree",
+        [
+            b"node-source-snapshot:git:v1".to_vec(),
+            head.into_bytes(),
+            roots.into_bytes(),
+            remote.into_bytes(),
+            submodules.into_bytes(),
+            project_prefix.into_bytes(),
+        ],
+        files,
+    )
+}
+
+fn snapshot_filesystem_project(
+    project_root: &Path,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<SourceSnapshotInventory, String> {
+    let mut paths = Vec::new();
+    collect_filesystem_paths(project_root, project_root, &mut paths, cancelled)?;
+    paths.sort();
+    if paths.len() > MAX_SNAPSHOT_FILES {
+        return Err(format!(
+            "source snapshot has {} files; limit is {MAX_SNAPSHOT_FILES}",
+            paths.len()
+        ));
+    }
+    let mut files = Vec::with_capacity(paths.len());
+    for absolute in paths {
+        check_snapshot_cancelled(cancelled)?;
+        let relative = absolute
+            .strip_prefix(project_root)
+            .map_err(|_| "filesystem source escaped its project root".to_owned())?;
+        files.push(snapshot_file(&absolute, &slash_path(relative)?, cancelled)?);
+    }
+    validate_snapshot_bounds(&files)?;
+    finish_snapshot(
+        "filesystem",
+        "filesystem_tree",
+        [b"node-source-snapshot:filesystem:v1".to_vec()],
+        files,
+    )
+}
+
+fn finish_snapshot<const N: usize>(
+    provider: &'static str,
+    source_mode: &'static str,
+    identity_parts: [Vec<u8>; N],
+    files: Vec<SnapshotFile>,
+) -> Result<SourceSnapshotInventory, String> {
+    let mut parts = identity_parts.into_iter().collect::<Vec<_>>();
+    let mut total_bytes = 0_u64;
+    for file in &files {
+        total_bytes = total_bytes
+            .checked_add(file.size_bytes)
+            .ok_or_else(|| "source snapshot byte accounting overflowed".to_owned())?;
+        parts.push(file.path.as_bytes().to_vec());
+        parts.push(file.kind.as_bytes().to_vec());
+        parts.push(if file.executable { b"x" } else { b"-" }.to_vec());
+        parts.push(file.digest.as_str().as_bytes().to_vec());
+        parts.push(file.size_bytes.to_string().into_bytes());
+    }
+    Ok(SourceSnapshotInventory {
+        digest: Digest::from_parts(parts),
+        provider: provider.to_owned(),
+        file_count: files.len(),
+        total_bytes,
+        source_mode: source_mode.to_owned(),
+    })
+}
+
+fn snapshot_file(
+    absolute: &Path,
+    relative: &str,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<SnapshotFile, String> {
+    check_snapshot_cancelled(cancelled)?;
+    validate_relative_source_path(relative)?;
+    let metadata = match fs::symlink_metadata(absolute) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(SnapshotFile {
+                path: relative.to_owned(),
+                kind: "deleted",
+                executable: false,
+                digest: Digest::sha256("deleted"),
+                size_bytes: 0,
+            })
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    if metadata.file_type().is_symlink() {
+        let target = fs::read_link(absolute).map_err(|error| error.to_string())?;
+        let target = target
+            .to_str()
+            .ok_or_else(|| "source symlink target is not UTF-8".to_owned())?;
+        return Ok(SnapshotFile {
+            path: relative.to_owned(),
+            kind: "symlink",
+            executable: false,
+            digest: Digest::from_parts([b"source-symlink:v1".as_slice(), target.as_bytes()]),
+            size_bytes: target.len() as u64,
+        });
+    }
+    if !metadata.is_file() {
+        return Err(format!("source snapshot entry `{relative}` is not a file"));
+    }
+    if metadata.len() > MAX_SNAPSHOT_FILE_BYTES {
+        return Err(format!(
+            "source file `{relative}` is {} bytes; per-file limit is {MAX_SNAPSHOT_FILE_BYTES}",
+            metadata.len()
+        ));
+    }
+    let mut file = fs::File::open(absolute).map_err(|error| error.to_string())?;
+    let mut hasher = Sha256::new();
+    let mut size_bytes = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        check_snapshot_cancelled(cancelled)?;
+        let read = file.read(&mut buffer).map_err(|error| error.to_string())?;
+        if read == 0 {
+            break;
+        }
+        size_bytes = size_bytes
+            .checked_add(read as u64)
+            .ok_or_else(|| "source file size overflowed".to_owned())?;
+        if size_bytes > MAX_SNAPSHOT_FILE_BYTES {
+            return Err(format!(
+                "source file `{relative}` grew beyond {MAX_SNAPSHOT_FILE_BYTES} bytes while hashing"
+            ));
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let digest = Digest::from_sha256_hex(format!("{:x}", hasher.finalize()))?;
+    #[cfg(unix)]
+    let executable = {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    };
+    #[cfg(not(unix))]
+    let executable = false;
+    Ok(SnapshotFile {
+        path: relative.to_owned(),
+        kind: "file",
+        executable,
+        digest,
+        size_bytes,
+    })
+}
+
+fn validate_snapshot_bounds(files: &[SnapshotFile]) -> Result<(), String> {
+    if files.len() > MAX_SNAPSHOT_FILES {
+        return Err(format!(
+            "source snapshot has {} files; limit is {MAX_SNAPSHOT_FILES}",
+            files.len()
+        ));
+    }
+    let total = files
+        .iter()
+        .try_fold(0_u64, |total, file| total.checked_add(file.size_bytes))
+        .ok_or_else(|| "source snapshot byte accounting overflowed".to_owned())?;
+    if total > MAX_SNAPSHOT_TOTAL_BYTES {
+        return Err(format!(
+            "source snapshot is {total} bytes; limit is {MAX_SNAPSHOT_TOTAL_BYTES}"
+        ));
+    }
+    Ok(())
+}
+
+fn collect_filesystem_paths(
+    root: &Path,
+    directory: &Path,
+    paths: &mut Vec<PathBuf>,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<(), String> {
+    check_snapshot_cancelled(cancelled)?;
+    for entry in fs::read_dir(directory).map_err(|error| error.to_string())? {
+        check_snapshot_cancelled(cancelled)?;
+        let entry = entry.map_err(|error| error.to_string())?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| "source path is not UTF-8".to_owned())?;
+        if directory == root && matches!(name.as_str(), ".git" | ".clusterflux-state" | "target") {
+            continue;
+        }
+        let file_type = entry.file_type().map_err(|error| error.to_string())?;
+        if file_type.is_dir() {
+            collect_filesystem_paths(root, &entry.path(), paths, cancelled)?;
+        } else if file_type.is_file() || file_type.is_symlink() {
+            paths.push(entry.path());
+            if paths.len() > MAX_SNAPSHOT_FILES {
+                return Err(format!(
+                    "source snapshot exceeds file-count limit of {MAX_SNAPSHOT_FILES}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn check_snapshot_cancelled(cancelled: &dyn Fn() -> bool) -> Result<(), String> {
+    if cancelled() {
+        Err("source snapshot cancelled".to_owned())
+    } else {
+        Ok(())
+    }
+}
+
+fn git_repository_root(project_root: &Path) -> Result<Option<PathBuf>, String> {
+    let output = git_command(project_root)
+        .args(["rev-parse", "--show-toplevel"])
+        .output();
+    let Ok(output) = output else {
+        return Ok(None);
+    };
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let root = String::from_utf8(output.stdout)
+        .map_err(|_| "Git repository root is not UTF-8".to_owned())?;
+    let root = PathBuf::from(root.trim())
+        .canonicalize()
+        .map_err(|error| error.to_string())?;
+    Ok(Some(root))
+}
+
+fn git_text(repository_root: &Path, args: &[&str]) -> Option<String> {
+    let output = git_command(repository_root).args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout)
+        .ok()
+        .map(|value| value.trim().to_owned())
+}
+
+fn git_command(repository_root: &Path) -> Command {
+    let mut command = Command::new("git");
+    command
+        .arg("-C")
+        .arg(repository_root)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_TERMINAL_PROMPT", "0");
+    command
+}
+
+fn slash_path(path: &Path) -> Result<String, String> {
+    let mut result = String::new();
+    for component in path.components() {
+        let component = component
+            .as_os_str()
+            .to_str()
+            .ok_or_else(|| "source path is not UTF-8".to_owned())?;
+        if !result.is_empty() {
+            result.push('/');
+        }
+        result.push_str(component);
+    }
+    Ok(result)
+}
+
+fn validate_relative_source_path(path: &str) -> Result<(), String> {
+    if path.is_empty()
+        || path.starts_with('/')
+        || path.split('/').any(|component| {
+            component.is_empty()
+                || component == "."
+                || component == ".."
+                || component.contains('\0')
+        })
+    {
+        return Err("source snapshot path must be a safe relative path".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn git(root: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "Clusterflux Test")
+            .env("GIT_AUTHOR_EMAIL", "test@clusterflux.invalid")
+            .env("GIT_COMMITTER_NAME", "Clusterflux Test")
+            .env("GIT_COMMITTER_EMAIL", "test@clusterflux.invalid")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn initialize_repository(root: &Path, message: &str) {
+        git(root, &["init", "--quiet"]);
+        git(root, &["add", "."]);
+        git(root, &["commit", "--quiet", "-m", message]);
+    }
+
+    fn git_text_output(root: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    fn exact_trigger(repository_url: String, sha: String) -> CommitTrigger {
+        CommitTrigger {
+            trigger_id: clusterflux_core::TriggerId::from("trigger-source-test"),
+            forge: clusterflux_core::ForgeKind::GitHub,
+            repository_id: clusterflux_core::RepositoryId::from("github:example/source"),
+            repository_url,
+            commit_sha: sha,
+            git_ref: "refs/heads/main".to_owned(),
+            delivery_id: "delivery-source-test".to_owned(),
+            event_kind: clusterflux_core::TriggerEventKind::Push,
+            actor: Some("developer".to_owned()),
+            trusted: true,
+            received_at: 1,
+        }
+    }
+
+    fn local_repository_url(path: &Path) -> String {
+        format!("{}{}", concat!("file:", "//"), path.display())
+    }
+
+    #[test]
+    fn dirty_and_untracked_content_changes_snapshot_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("src")).unwrap();
+        fs::write(temp.path().join("src/lib.rs"), "pub fn value() -> u8 { 1 }").unwrap();
+        initialize_repository(temp.path(), "initial source");
+        let first = snapshot_project(temp.path()).unwrap();
+
+        fs::write(temp.path().join("src/lib.rs"), "pub fn value() -> u8 { 2 }").unwrap();
+        let dirty = snapshot_project(temp.path()).unwrap();
+        fs::write(
+            temp.path().join("fixture.c"),
+            "int main(void) { return 0; }",
+        )
+        .unwrap();
+        let untracked = snapshot_project(temp.path()).unwrap();
+
+        assert_ne!(first.digest, dirty.digest);
+        assert_ne!(dirty.digest, untracked.digest);
+        assert_eq!(untracked.provider, "git");
+        assert_eq!(untracked.file_count, 2);
+    }
+
+    #[test]
+    fn different_repositories_at_the_same_path_are_not_identified_by_path() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("source.txt"), "identical source content").unwrap();
+        initialize_repository(temp.path(), "first repository identity");
+        let first = snapshot_project(temp.path()).unwrap();
+
+        fs::remove_dir_all(temp.path().join(".git")).unwrap();
+        initialize_repository(temp.path(), "second repository identity");
+        let second = snapshot_project(temp.path()).unwrap();
+
+        assert_ne!(first.digest, second.digest);
+        assert_eq!(first.provider, "git");
+        assert_eq!(second.provider, "git");
+    }
+
+    #[test]
+    fn nested_projects_detect_and_use_the_repository_source_provider() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("workspace/member");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(project.join("source.txt"), "member source").unwrap();
+        initialize_repository(temp.path(), "workspace source");
+
+        assert_eq!(
+            detect_source_provider(&project).unwrap(),
+            SourceProviderKind::Git
+        );
+        let snapshot = snapshot_project_with_provider(&project, &SourceProviderKind::Git).unwrap();
+        assert_eq!(snapshot.provider, "git");
+        assert_eq!(snapshot.source_mode, "working_tree");
+        assert_eq!(snapshot.file_count, 1);
+    }
+
+    #[test]
+    fn explicit_filesystem_mode_is_stable_even_inside_a_git_checkout() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("source.txt"), "source").unwrap();
+        initialize_repository(temp.path(), "source");
+
+        let git_snapshot = snapshot_project(temp.path()).unwrap();
+        let filesystem_snapshot =
+            snapshot_project_with_provider(temp.path(), &SourceProviderKind::Filesystem).unwrap();
+
+        assert_eq!(filesystem_snapshot.provider, "filesystem");
+        assert_eq!(filesystem_snapshot.source_mode, "filesystem_tree");
+        assert_ne!(git_snapshot.digest, filesystem_snapshot.digest);
+        let encoded = serde_json::to_value(&filesystem_snapshot).unwrap();
+        assert_eq!(encoded["digest"], filesystem_snapshot.digest.as_str());
+    }
+
+    #[test]
+    fn filesystem_snapshot_includes_workflow_source_but_excludes_generated_state() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join(".clusterflux")).unwrap();
+        fs::create_dir_all(temp.path().join(".clusterflux-state")).unwrap();
+        fs::write(temp.path().join(".clusterflux/main.rs"), "fn main() {}\n").unwrap();
+        fs::write(temp.path().join(".clusterflux-state/views.json"), "first\n").unwrap();
+        let first =
+            snapshot_project_with_provider(temp.path(), &SourceProviderKind::Filesystem).unwrap();
+
+        fs::write(
+            temp.path().join(".clusterflux-state/views.json"),
+            "second\n",
+        )
+        .unwrap();
+        let state_changed =
+            snapshot_project_with_provider(temp.path(), &SourceProviderKind::Filesystem).unwrap();
+        fs::write(temp.path().join(".clusterflux/main.rs"), "fn main() { }\n").unwrap();
+        let source_changed =
+            snapshot_project_with_provider(temp.path(), &SourceProviderKind::Filesystem).unwrap();
+
+        assert_eq!(first.digest, state_changed.digest);
+        assert_ne!(state_changed.digest, source_changed.digest);
+        assert_eq!(first.file_count, 1);
+    }
+
+    #[test]
+    fn hostile_relative_paths_and_oversized_files_are_rejected() {
+        for path in ["", "/absolute", "../escape", "a/../escape", "a//b"] {
+            assert!(
+                validate_relative_source_path(path).is_err(),
+                "accepted {path}"
+            );
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let oversized = fs::File::create(temp.path().join("oversized.bin")).unwrap();
+        oversized.set_len(MAX_SNAPSHOT_FILE_BYTES + 1).unwrap();
+        let error = snapshot_project_with_provider(temp.path(), &SourceProviderKind::Filesystem)
+            .unwrap_err();
+        assert!(error.contains("per-file limit"));
+    }
+
+    fn write_workflow_manifest(root: &Path) -> usize {
+        let manifest = b"[package]\nname='source-test'\nversion='0.0.0'\nedition='2024'\npublish=false\n[lib]\npath='main.rs'\ncrate-type=['cdylib']\n[dependencies]\nclusterflux={package='clusterflux-sdk',version='=0.1.0'}\n[workspace]\nresolver='3'\n";
+        fs::write(root.join(".clusterflux/Cargo.toml"), manifest).unwrap();
+        manifest.len()
+    }
+
+    #[test]
+    fn exact_workflow_loader_keeps_the_triggered_old_commit_after_branch_advances() {
+        let repository = tempfile::tempdir().unwrap();
+        fs::create_dir_all(repository.path().join(".clusterflux/nested")).unwrap();
+        write_workflow_manifest(repository.path());
+        fs::write(
+            repository.path().join(".clusterflux/main.rs"),
+            "mod nested; const REVISION: &str = \"old\";",
+        )
+        .unwrap();
+        fs::write(
+            repository.path().join(".clusterflux/nested.rs"),
+            "pub fn workflow() {}",
+        )
+        .unwrap();
+        fs::write(repository.path().join("outside.txt"), "not compiler input").unwrap();
+        fs::create_dir_all(repository.path().join("envs/linux")).unwrap();
+        fs::write(
+            repository.path().join("envs/linux/Containerfile"),
+            "FROM alpine:3.21\n",
+        )
+        .unwrap();
+        fs::write(
+            repository.path().join("envs/linux/environment.toml"),
+            "version = 1\nname = 'linux'\n",
+        )
+        .unwrap();
+        fs::write(
+            repository.path().join("envs/linux/install-tool.sh"),
+            "echo old tool\n",
+        )
+        .unwrap();
+        initialize_repository(repository.path(), "old workflow");
+        let old_sha = git_text_output(repository.path(), &["rev-parse", "HEAD"]);
+        let old_environment_digest = discover_environments(repository.path()).unwrap()[0]
+            .digest
+            .clone();
+
+        fs::write(
+            repository.path().join(".clusterflux/main.rs"),
+            "mod nested; const REVISION: &str = \"new\";",
+        )
+        .unwrap();
+        fs::write(
+            repository.path().join("envs/linux/Containerfile"),
+            "FROM alpine:3.22\n",
+        )
+        .unwrap();
+        fs::write(
+            repository.path().join("envs/linux/install-tool.sh"),
+            "echo new tool\n",
+        )
+        .unwrap();
+        git(repository.path(), &["add", "."]);
+        git(
+            repository.path(),
+            &["commit", "--quiet", "-m", "new workflow"],
+        );
+
+        let url = local_repository_url(repository.path());
+        let trigger = exact_trigger(url.clone(), old_sha.clone());
+        let (source, revision) = load_exact_workflow_source_from_validated_binding(
+            &trigger,
+            &url,
+            &ExactRevisionSourceLimits::default(),
+        )
+        .unwrap();
+
+        assert_eq!(source.commit_sha, old_sha);
+        assert_eq!(source.files.len(), 3);
+        assert_eq!(source.environments.len(), 1);
+        assert_eq!(source.environments[0].name, "linux");
+        assert_eq!(source.environments[0].digest, old_environment_digest);
+        assert!(source.environments[0]
+            .context_manifest
+            .iter()
+            .any(|file| file.path == "install-tool.sh"));
+        assert_ne!(
+            source.environments[0].digest,
+            discover_environments(repository.path()).unwrap()[0].digest
+        );
+        assert!(String::from_utf8(
+            source
+                .files
+                .iter()
+                .find(|file| file.path == ".clusterflux/main.rs")
+                .unwrap()
+                .bytes
+                .clone()
+        )
+        .unwrap()
+        .contains("old"));
+        assert_eq!(revision.commit_sha, source.commit_sha);
+        assert_eq!(
+            revision.source_snapshot,
+            Digest::from_parts([
+                b"clusterflux-git-revision:v1".as_slice(),
+                trigger.repository_id.as_str().as_bytes(),
+                url.as_bytes(),
+                old_sha.as_bytes(),
+            ])
+        );
+    }
+
+    #[test]
+    fn exact_workflow_loader_rejects_missing_main_non_rust_and_oversized_source() {
+        for (name, path, contents, expected) in [
+            (
+                "missing-main",
+                ".clusterflux/tasks.rs",
+                "pub fn task() {}",
+                "main.rs",
+            ),
+            (
+                "non-rust",
+                ".clusterflux/config.toml",
+                "forbidden = true",
+                "non-Rust",
+            ),
+        ] {
+            let repository = tempfile::tempdir().unwrap();
+            fs::create_dir_all(repository.path().join(".clusterflux")).unwrap();
+            write_workflow_manifest(repository.path());
+            if name == "non-rust" {
+                fs::write(
+                    repository.path().join(".clusterflux/main.rs"),
+                    "fn main() {}",
+                )
+                .unwrap();
+            }
+            fs::write(repository.path().join(path), contents).unwrap();
+            initialize_repository(repository.path(), name);
+            let sha = git_text_output(repository.path(), &["rev-parse", "HEAD"]);
+            let url = local_repository_url(repository.path());
+            let trigger = exact_trigger(url.clone(), sha);
+            let error = load_exact_workflow_source_from_validated_binding(
+                &trigger,
+                &url,
+                &ExactRevisionSourceLimits::default(),
+            )
+            .unwrap_err();
+            assert!(error.contains(expected), "{error}");
+        }
+
+        let repository = tempfile::tempdir().unwrap();
+        fs::create_dir_all(repository.path().join(".clusterflux")).unwrap();
+        let manifest_bytes = write_workflow_manifest(repository.path());
+        fs::write(repository.path().join(".clusterflux/main.rs"), "12345").unwrap();
+        initialize_repository(repository.path(), "oversized");
+        let sha = git_text_output(repository.path(), &["rev-parse", "HEAD"]);
+        let url = local_repository_url(repository.path());
+        let trigger = exact_trigger(url.clone(), sha);
+        let error = load_exact_workflow_source_from_validated_binding(
+            &trigger,
+            &url,
+            &ExactRevisionSourceLimits {
+                max_file_bytes: 4,
+                max_total_bytes: manifest_bytes + 4,
+                ..ExactRevisionSourceLimits::default()
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("limit"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_workflow_tree_rejects_symlinks_and_path_traversal() {
+        use std::os::unix::fs::symlink;
+
+        let repository = tempfile::tempdir().unwrap();
+        fs::create_dir_all(repository.path().join(".clusterflux")).unwrap();
+        write_workflow_manifest(repository.path());
+        fs::write(repository.path().join("real.rs"), "pub fn real() {}").unwrap();
+        fs::write(
+            repository.path().join(".clusterflux/main.rs"),
+            "fn main() {}",
+        )
+        .unwrap();
+        symlink("../real.rs", repository.path().join(".clusterflux/link.rs")).unwrap();
+        initialize_repository(repository.path(), "symlink");
+        let sha = git_text_output(repository.path(), &["rev-parse", "HEAD"]);
+        let url = local_repository_url(repository.path());
+        let trigger = exact_trigger(url.clone(), sha);
+        assert!(load_exact_workflow_source_from_validated_binding(
+            &trigger,
+            &url,
+            &ExactRevisionSourceLimits::default(),
+        )
+        .unwrap_err()
+        .contains("regular non-symlink"));
+
+        let limits = ExactRevisionSourceLimits::default();
+        assert!(parse_revision_tree(
+            b"100644 blob 0123456789abcdef 12\t.clusterflux/../escape.rs\0",
+            &limits,
+        )
+        .is_err());
+        assert!(parse_revision_tree(
+            b"100644 blob 0123456789abcdef 12\t.clusterflux/main.rs\0\
+              100644 blob 1123456789abcdef 12\t.clusterflux/tasks.rs\0",
+            &ExactRevisionSourceLimits {
+                max_files: 1,
+                ..limits
+            },
+        )
+        .unwrap_err()
+        .contains("file limit"));
+    }
+}
