@@ -79,7 +79,7 @@ impl CoordinatorService {
             record.run.ended_at = Some(now);
             record.run.failure_code = Some("coordinator_restart_interrupted_run".to_owned());
             record.run.failure_message = Some(
-                "The coordinator restarted while this automated process was running; push a new commit to retry."
+                "The coordinator restarted while this automated process was running; retry the run after the coordinator is healthy."
                     .to_owned(),
             );
             record.run.waiting_reason = None;
@@ -383,6 +383,7 @@ impl CoordinatorService {
                     record.run.created_at,
                     run_id.clone(),
                     record.run_key.clone(),
+                    record.run.primary_trigger_id.clone(),
                 )
             })
             .collect::<Vec<_>>();
@@ -393,21 +394,35 @@ impl CoordinatorService {
         let terminal = terminal.into_iter().take(remove_count).collect::<Vec<_>>();
         let removed_runs = terminal
             .iter()
-            .map(|(_, run_id, _)| run_id.clone())
+            .map(|(_, run_id, _, _)| run_id.clone())
             .collect::<BTreeSet<_>>();
         let removed_keys = terminal
             .iter()
-            .map(|(_, _, run_key)| run_key.clone())
+            .map(|(_, _, run_key, _)| run_key.clone())
+            .collect::<BTreeSet<_>>();
+        let removed_primary_triggers = terminal
+            .iter()
+            .map(|(_, _, _, trigger_id)| trigger_id.clone())
+            .collect::<BTreeSet<_>>();
+        let surviving_primary_triggers = self
+            .coordinator
+            .durable_state()
+            .automated_runs
+            .iter()
+            .filter(|(run_id, _)| !removed_runs.contains(*run_id))
+            .map(|(_, record)| record.run.primary_trigger_id.clone())
             .collect::<BTreeSet<_>>();
         let removed_triggers = self
             .coordinator
             .durable_state()
             .accepted_commit_triggers
             .iter()
-            .filter(|(_, record)| {
-                &record.tenant == tenant
-                    && &record.project == project
-                    && removed_keys.contains(&record.trigger.run_identity(project))
+            .filter(|(trigger_id, record)| {
+                removed_primary_triggers.contains(*trigger_id)
+                    || (&record.tenant == tenant
+                        && &record.project == project
+                        && removed_keys.contains(&record.trigger.run_identity(project))
+                        && !surviving_primary_triggers.contains(*trigger_id))
             })
             .map(|(trigger_id, _)| trigger_id.clone())
             .collect::<BTreeSet<_>>();
@@ -1558,6 +1573,146 @@ impl CoordinatorService {
         let response = record.clone();
         self.persist_durable_state()?;
         Ok(response)
+    }
+
+    pub fn retry_automated_run(
+        &mut self,
+        run_id: &RunId,
+    ) -> Result<AutomatedRunStageRecord, CoordinatorServiceError> {
+        let snapshot = self
+            .automated_run(run_id)
+            .cloned()
+            .ok_or_else(|| CoordinatorServiceError::Protocol("unknown automated run".to_owned()))?;
+        if !matches!(
+            snapshot.run.state,
+            AutomatedRunState::Failed | AutomatedRunState::Cancelled
+        ) {
+            return Err(CoordinatorServiceError::Protocol(
+                "only failed or cancelled automated runs can be retried".to_owned(),
+            ));
+        }
+        let accepted_trigger = self
+            .coordinator
+            .durable_state()
+            .accepted_commit_triggers
+            .get(&snapshot.run.primary_trigger_id)
+            .cloned()
+            .ok_or_else(|| {
+                CoordinatorServiceError::Protocol(
+                    "automated run no longer has retained trigger source".to_owned(),
+                )
+            })?;
+        let queued = self
+            .coordinator
+            .durable_state()
+            .automated_runs
+            .values()
+            .filter(|record| {
+                record.run.tenant == snapshot.run.tenant
+                    && record.run.project == snapshot.run.project
+                    && !record.run.state.is_terminal()
+                    && record.run.state != AutomatedRunState::Running
+            })
+            .count();
+        if queued >= MAX_QUEUED_RUNS_PER_PROJECT {
+            return Err(CoordinatorServiceError::Protocol(format!(
+                "project automated-run queue is full ({MAX_QUEUED_RUNS_PER_PROJECT})"
+            )));
+        }
+        self.compact_automated_run_history(&snapshot.run.tenant, &snapshot.run.project)?;
+        let retained = self
+            .coordinator
+            .durable_state()
+            .automated_runs
+            .values()
+            .filter(|record| {
+                record.run.tenant == snapshot.run.tenant
+                    && record.run.project == snapshot.run.project
+            })
+            .count();
+        if retained >= MAX_RUNS_PER_PROJECT {
+            return Err(CoordinatorServiceError::Protocol(format!(
+                "project automated-run retention is full ({MAX_RUNS_PER_PROJECT})"
+            )));
+        }
+
+        let (run_key, retry_number) = (1_u32..=MAX_RUNS_PER_PROJECT as u32)
+            .find_map(|retry_number| {
+                let retry = retry_number.to_string();
+                let key = Digest::from_parts([
+                    b"clusterflux-automated-run-retry:v1".as_slice(),
+                    run_id.as_str().as_bytes(),
+                    retry.as_bytes(),
+                ]);
+                (!self
+                    .coordinator
+                    .durable_state()
+                    .automated_run_keys
+                    .contains_key(&key))
+                .then_some((key, retry_number))
+            })
+            .ok_or_else(|| {
+                CoordinatorServiceError::Protocol("automated run retry history is full".to_owned())
+            })?;
+        let retry_run_id = run_id_from_key(&run_key);
+        let retry_trigger_id = TriggerId::new(format!(
+            "trigger-retry-{}",
+            id_suffix(retry_run_id.as_str())
+        ));
+        let now = self.current_epoch_seconds()?;
+        let mut trigger = accepted_trigger.trigger;
+        trigger.trigger_id = retry_trigger_id.clone();
+        trigger.delivery_id = format!("manual-retry-{}-{retry_number}", run_id.as_str());
+        trigger.received_at = now;
+
+        let mut run = snapshot.run;
+        run.run_id = retry_run_id.clone();
+        run.primary_trigger_id = retry_trigger_id.clone();
+        run.workflow_tree_digest = None;
+        run.bundle_digest = None;
+        run.state = AutomatedRunState::Accepted;
+        run.process_id = None;
+        run.created_at = now;
+        run.started_at = None;
+        run.ended_at = None;
+        run.failure_code = None;
+        run.failure_message = None;
+        run.waiting_reason = None;
+        run.publication_tag = None;
+        run.publication_url = None;
+        let record = AutomatedRunStageRecord {
+            run,
+            run_key: run_key.clone(),
+            source: None,
+            revision_environments: Vec::new(),
+            revision: None,
+            compilation_request: None,
+            assignment_retry: Default::default(),
+            compiled_bundle: None,
+            compiled_summary: None,
+            trigger_context: None,
+            launch_attempt: None,
+        };
+        let durable = self.coordinator.durable_state_mut();
+        durable.accepted_commit_triggers.insert(
+            retry_trigger_id,
+            AcceptedCommitTriggerRecord {
+                tenant: accepted_trigger.tenant,
+                project: accepted_trigger.project,
+                binding_id: accepted_trigger.binding_id,
+                body_digest: Digest::sha256(format!(
+                    "manual-retry\0{}\0{retry_number}",
+                    run_id.as_str()
+                )),
+                trigger,
+            },
+        );
+        durable
+            .automated_run_keys
+            .insert(run_key, retry_run_id.clone());
+        durable.automated_runs.insert(retry_run_id, record.clone());
+        self.persist_durable_state()?;
+        Ok(record)
     }
 
     pub fn configure_project_environment(

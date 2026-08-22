@@ -51,6 +51,9 @@ pub enum AuthenticatedCoordinatorRequest {
     CancelAutomatedRun {
         run: String,
     },
+    RetryAutomatedRun {
+        run: String,
+    },
     SetProjectSecret {
         name: String,
         value_base64: String,
@@ -221,6 +224,7 @@ impl AuthenticatedCoordinatorRequest {
             Self::ListAutomatedRuns { .. } => "list_automated_runs",
             Self::GetAutomatedRun { .. } => "get_automated_run",
             Self::CancelAutomatedRun { .. } => "cancel_automated_run",
+            Self::RetryAutomatedRun { .. } => "retry_automated_run",
             Self::SetProjectSecret { .. } => "set_project_secret",
             Self::ListProjectSecrets => "list_project_secrets",
             Self::RevokeProjectSecret { .. } => "revoke_project_secret",

@@ -101,8 +101,8 @@ do
 done
 
 system_package=${CLUSTERFLUX_SYSTEM_PACKAGE_DIR:-/clusterflux/system}
+"$target/clusterflux-system-package" verify --share-dir "$system_package" >/dev/null
 for name in \
-  system-compiler-image.oci.tar \
   system-bundles.json \
   compiler-environment.json \
   compiler-image-digest.txt
@@ -110,7 +110,25 @@ do
   test -f "$system_package/$name"
   install -m 0644 "$system_package/$name" "$stage/share/clusterflux/$name"
 done
-"$target/clusterflux-system-package" verify --share-dir "$stage/share/clusterflux"
+
+# A large archive copy can fail transiently under a busy rootless container
+# store. Only accept a byte-for-byte verified copy, and retry that copy in
+# place rather than publishing a package with a rewritten digest.
+archive_name=system-compiler-image.oci.tar
+archive_copy_attempt=1
+while [ "$archive_copy_attempt" -le 3 ]; do
+  install -m 0644 "$system_package/$archive_name" "$stage/share/clusterflux/$archive_name"
+  if "$target/clusterflux-system-package" verify --share-dir "$stage/share/clusterflux"; then
+    break
+  fi
+  if [ "$archive_copy_attempt" -eq 3 ]; then
+    echo "failed to stage a verified compiler image archive after 3 attempts" >&2
+    exit 1
+  fi
+  echo "compiler image archive copy failed verification; retrying ($archive_copy_attempt/3)" >&2
+  rm -f "$stage/share/clusterflux/$archive_name"
+  archive_copy_attempt=$((archive_copy_attempt + 1))
+done
 
 install -m 0644 LICENSE-APACHE "$stage/share/doc/clusterflux/LICENSE-APACHE"
 install -m 0644 LICENSE-MIT "$stage/share/doc/clusterflux/LICENSE-MIT"

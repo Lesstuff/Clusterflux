@@ -253,20 +253,46 @@ where
     encode_result(result)
 }
 
-#[cfg(target_arch = "wasm32")]
-fn bounded_task_error(mut error: String) -> String {
+#[cfg(any(target_arch = "wasm32", test))]
+fn bounded_task_error(error: String) -> String {
     const LIMIT: usize = 4 * 1024;
-    const SUFFIX: &str = "… [truncated]";
+    const SEPARATOR: &str = "\n… [middle truncated]\n";
     if error.len() <= LIMIT {
         return error;
     }
-    let mut end = LIMIT.saturating_sub(SUFFIX.len());
-    while !error.is_char_boundary(end) {
-        end = end.saturating_sub(1);
+    let available = LIMIT.saturating_sub(SEPARATOR.len());
+    let mut head_end = available / 3;
+    while !error.is_char_boundary(head_end) {
+        head_end = head_end.saturating_sub(1);
     }
-    error.truncate(end);
-    error.push_str(SUFFIX);
-    error
+    let mut tail_start = error.len().saturating_sub(available - head_end);
+    while tail_start < error.len() && !error.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    format!(
+        "{}{}{}",
+        &error[..head_end],
+        SEPARATOR,
+        &error[tail_start..]
+    )
+}
+
+#[cfg(test)]
+mod bounded_task_error_tests {
+    use super::bounded_task_error;
+
+    #[test]
+    fn oversized_task_errors_preserve_context_and_root_cause() {
+        let error = format!(
+            "command failed: {}root cause: compiler image digest mismatch",
+            "é".repeat(4_000)
+        );
+        let bounded = bounded_task_error(error);
+        assert!(bounded.starts_with("command failed:"));
+        assert!(bounded.contains("[middle truncated]"));
+        assert!(bounded.ends_with("root cause: compiler image digest mismatch"));
+        assert!(bounded.len() <= 4 * 1024);
+    }
 }
 
 #[cfg(target_arch = "wasm32")]

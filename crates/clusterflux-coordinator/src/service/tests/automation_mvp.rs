@@ -419,6 +419,84 @@ fn trigger_dedup_queue_pagination_and_cancellation_are_bounded_and_durable() {
 }
 
 #[test]
+fn failed_or_cancelled_run_retry_creates_a_fresh_attempt_for_the_same_revision() {
+    let mut service = service_with_project();
+    let original_trigger = trigger(62, 62);
+    let original = accept(&mut service, "binding", original_trigger.clone());
+    service.cancel_automated_run(&original.run.run_id).unwrap();
+
+    let retry = service.retry_automated_run(&original.run.run_id).unwrap();
+    assert_ne!(retry.run.run_id, original.run.run_id);
+    assert_ne!(
+        retry.run.primary_trigger_id,
+        original.run.primary_trigger_id
+    );
+    assert_eq!(retry.run.repository_id, original.run.repository_id);
+    assert_eq!(retry.run.commit_sha, original.run.commit_sha);
+    assert_eq!(retry.run.git_ref, original.run.git_ref);
+    assert_eq!(retry.run.trusted, original.run.trusted);
+    assert_eq!(retry.run.state, AutomatedRunState::Accepted);
+    assert!(retry.run.process_id.is_none());
+    assert!(retry.run.failure_code.is_none());
+    assert!(retry.run.failure_message.is_none());
+
+    let pending = service.pending_source_loads(8);
+    assert!(pending
+        .iter()
+        .any(|record| record.trigger.trigger_id == retry.run.primary_trigger_id));
+    assert!(service.retry_automated_run(&retry.run.run_id).is_err());
+
+    let second_retry = service.retry_automated_run(&original.run.run_id).unwrap();
+    assert_ne!(second_retry.run.run_id, retry.run.run_id);
+
+    let duplicate = service
+        .accept_commit_trigger(
+            TenantId::from("tenant"),
+            ProjectId::from("project"),
+            "binding".to_owned(),
+            Digest::sha256(format!("body-{}", original_trigger.delivery_id)),
+            original_trigger,
+        )
+        .unwrap();
+    assert_eq!(duplicate.run.run_id, original.run.run_id);
+}
+
+#[test]
+fn retention_compaction_keeps_the_trigger_for_a_surviving_retry() {
+    let mut service = service_with_project();
+    let original_trigger = trigger(70, 70);
+    let original = accept(&mut service, "binding", original_trigger.clone());
+    service.cancel_automated_run(&original.run.run_id).unwrap();
+    service
+        .coordinator
+        .durable_state_mut()
+        .automated_runs
+        .get_mut(&original.run.run_id)
+        .unwrap()
+        .run
+        .created_at = 0;
+    let retry = service.retry_automated_run(&original.run.run_id).unwrap();
+
+    for index in 100..162 {
+        let record = accept(&mut service, "binding", trigger(index, index));
+        service.cancel_automated_run(&record.run.run_id).unwrap();
+    }
+    accept(&mut service, "binding", trigger(163, 163));
+
+    assert!(service.automated_run(&original.run.run_id).is_none());
+    assert!(service.automated_run(&retry.run.run_id).is_some());
+    assert!(service
+        .coordinator
+        .durable_state()
+        .accepted_commit_triggers
+        .contains_key(&retry.run.primary_trigger_id));
+    assert!(service
+        .pending_source_loads(8)
+        .iter()
+        .any(|record| record.trigger.trigger_id == retry.run.primary_trigger_id));
+}
+
+#[test]
 fn cancelled_system_assignment_is_revoked_through_normal_node_poll() {
     let mut service = service_with_project();
     let commit = trigger(9, 9);

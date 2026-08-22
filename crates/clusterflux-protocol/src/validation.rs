@@ -822,7 +822,8 @@ fn validate_authenticated_request(
             validate_page_limit(*limit, &format!("{path}.limit"), 64)
         }
         AuthenticatedCoordinatorRequest::GetAutomatedRun { run }
-        | AuthenticatedCoordinatorRequest::CancelAutomatedRun { run } => {
+        | AuthenticatedCoordinatorRequest::CancelAutomatedRun { run }
+        | AuthenticatedCoordinatorRequest::RetryAutomatedRun { run } => {
             validate_external_id(run, &format!("{path}.run"), RunId::try_new)
         }
         AuthenticatedCoordinatorRequest::SetProjectSecret { name, value_base64 } => {

@@ -194,8 +194,12 @@ pub fn verify_system_compiler_package(
         return Err("compiler image digest file disagrees with package manifests".to_owned());
     }
     let archive = share_dir.join(&environment.compiler_image_archive);
-    if sha256_file(&archive)? != environment.compiler_image_archive_digest {
-        return Err("compiler image archive digest verification failed".to_owned());
+    let actual_archive_digest = sha256_file(&archive)?;
+    if actual_archive_digest != environment.compiler_image_archive_digest {
+        return Err(format!(
+            "compiler image archive digest verification failed: expected {}, got {}",
+            environment.compiler_image_archive_digest, actual_archive_digest
+        ));
     }
     Ok(VerifiedSystemCompilerPackage {
         share_dir: share_dir.to_owned(),
@@ -255,8 +259,9 @@ mod tests {
             b"corrupt",
         )
         .unwrap();
-        assert!(verify_system_compiler_package(directory.path())
-            .unwrap_err()
-            .contains("archive digest"));
+        let error = verify_system_compiler_package(directory.path()).unwrap_err();
+        assert!(error.contains("archive digest"));
+        assert!(error.contains("expected sha256:"));
+        assert!(error.contains("got sha256:"));
     }
 }

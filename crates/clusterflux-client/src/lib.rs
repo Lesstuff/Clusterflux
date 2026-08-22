@@ -18,7 +18,7 @@ pub use clusterflux_core::{
     AgentId, ApiErrorCategory, ApiErrorCode, ArtifactId, Authorization, AutomatedRunRecord,
     AutomatedRunState, Capability, CredentialKind, Digest, DownloadLink, EnvironmentBackend,
     LimitKind, NodeCapabilities, NodeDrainBlocker, NodeDrainBlockerKind, NodeDrainStatus, NodeId,
-    NodeLifecycleState, Os, ProcessId, ProjectId, ResourceLimits, TaskDefinitionId,
+    NodeLifecycleState, Os, ProcessId, ProjectId, ResourceLimits, RunId, TaskDefinitionId,
     TaskFailurePolicy, TaskInstanceId, TenantId, UserId, VfsPath,
 };
 pub use clusterflux_protocol::{CONTROL_API_PATH, LOGIN_API_PATH};
@@ -436,6 +436,21 @@ impl ClusterfluxClient {
                 runs, next_cursor, ..
             } => Ok(AutomatedRunPage { runs, next_cursor }),
             _ => Err(unexpected_response("automated_runs")),
+        }
+    }
+
+    pub async fn retry_automated_run(&self, run: RunId) -> Result<AutomatedRunRecord, ClientError> {
+        match self
+            .send_authenticated(
+                AuthenticatedCoordinatorRequest::RetryAutomatedRun {
+                    run: run.to_string(),
+                },
+                "automated_run",
+            )
+            .await?
+        {
+            CoordinatorResponse::AutomatedRun { run, .. } => Ok(run),
+            _ => Err(unexpected_response("automated_run")),
         }
     }
 

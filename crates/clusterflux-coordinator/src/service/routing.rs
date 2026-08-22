@@ -747,6 +747,24 @@ impl CoordinatorService {
                     actor,
                 })
             }
+            AuthenticatedCoordinatorRequest::RetryAutomatedRun { run } => {
+                let run = clusterflux_core::RunId::new(run);
+                let existing = self.automated_run(&run).ok_or_else(|| {
+                    CoordinatorServiceError::Protocol("unknown automated run".to_owned())
+                })?;
+                if existing.run.tenant != context.tenant || existing.run.project != context.project
+                {
+                    return Err(CoordinatorError::Unauthorized(
+                        "automated run is outside the authenticated project".to_owned(),
+                    )
+                    .into());
+                }
+                let record = self.retry_automated_run(&run)?;
+                Ok(CoordinatorResponse::AutomatedRun {
+                    run: record.run,
+                    actor,
+                })
+            }
             request @ (AuthenticatedCoordinatorRequest::SetProjectSecret { .. }
             | AuthenticatedCoordinatorRequest::ListProjectSecrets
             | AuthenticatedCoordinatorRequest::RevokeProjectSecret { .. }) => {
