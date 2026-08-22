@@ -114,7 +114,9 @@ The release includes the public binaries and the release-pinned compiler
 appliance consumed by `clusterflux-node`.
 
 On NixOS or another system with Nix, install the equivalent package with
-`nix profile install github:lesstuff/clusterflux#clusterflux-tools`.
+`nix profile install --accept-flake-config github:lesstuff/clusterflux#clusterflux-tools`.
+The accepted flake configuration uses the public, signed Clusterflux Cachix
+cache so a matching stable build is downloaded instead of compiled locally.
 
 Source contributors can instead use `nix build .#clusterflux-tools` or build the
 workspace with Cargo from a checkout of

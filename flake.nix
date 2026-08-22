@@ -1,6 +1,13 @@
 {
   description = "Clusterflux development and verification environment";
 
+  nixConfig = {
+    extra-substituters = [ "https://clusterflux.cachix.org" ];
+    extra-trusted-public-keys = [
+      "clusterflux.cachix.org-1:bwo70JO4f9xI89aT6C9jwdeUUcno8y2hmKBUjBivyYs="
+    ];
+  };
+
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
 
   outputs = { self, nixpkgs }:

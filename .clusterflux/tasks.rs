@@ -27,6 +27,14 @@ pub struct BuildReleaseInput {
 
 #[derive(Clone, Serialize, Deserialize, clusterflux::TaskArg)]
 #[serde(crate = "clusterflux::serde")]
+pub struct CacheNixInput {
+    pub source: SourceSnapshot,
+    pub commit_sha: String,
+    pub tag: String,
+}
+
+#[derive(Clone, Serialize, Deserialize, clusterflux::TaskArg)]
+#[serde(crate = "clusterflux::serde")]
 pub struct ReleaseAssets {
     pub version: String,
     pub tag: String,
@@ -113,6 +121,27 @@ pub async fn build_release_assets(input: BuildReleaseInput) -> Result<ReleaseAss
     })
 }
 
+#[clusterflux::task(capabilities = "command,network,secrets,source_filesystem,source_git")]
+pub async fn cache_nix_package(input: CacheNixInput) -> Result<()> {
+    let root = input.source.mount()?;
+    Command::new("sh")
+        .args([
+            "-eu",
+            "-c",
+            CACHE_NIX_SCRIPT,
+            "clusterflux-cache",
+            input.commit_sha.as_str(),
+            input.tag.as_str(),
+        ])
+        .cwd(root)
+        .secret_env("CACHIX_AUTH_TOKEN", "cachix-auth-token")
+        .network_enabled()
+        .timeout(Duration::from_secs(60 * 60))
+        .run()
+        .await?;
+    Ok(())
+}
+
 fn result_field(stdout: &str, prefix: &str) -> Result<String> {
     stdout
         .lines()
@@ -120,9 +149,7 @@ fn result_field(stdout: &str, prefix: &str) -> Result<String> {
         .filter(|value| !value.is_empty())
         .map(str::to_owned)
         .ok_or_else(|| {
-            clusterflux::Error::Protocol(format!(
-                "release builder omitted result field {prefix}"
-            ))
+            clusterflux::Error::Protocol(format!("release builder omitted result field {prefix}"))
         })
 }
 
@@ -140,4 +167,19 @@ cp -a vscode-extension /tmp/clusterflux-vscode-test
 cd /tmp/clusterflux-vscode-test
 npm ci --ignore-scripts --no-audit --no-fund
 node --check extension.js
+"#;
+
+const CACHE_NIX_SCRIPT: &str = r#"
+test "$(git rev-parse HEAD)" = "$1"
+case "$2" in
+  v[0-9]*.[0-9]*.[0-9]*) ;;
+  *) echo "Cachix publication requires a stable version tag" >&2; exit 1 ;;
+esac
+output=$(nix build --accept-flake-config --no-link --print-out-paths .#clusterflux-tools)
+case "$output" in
+  /nix/store/*-clusterflux-tools-*) ;;
+  *) echo "Nix build returned an unexpected Clusterflux output path" >&2; exit 1 ;;
+esac
+printf '%s\n' "$output" | cachix push clusterflux
+cachix pin clusterflux stable "$output" --keep-revisions 2
 "#;

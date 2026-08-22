@@ -2,8 +2,11 @@ mod release;
 mod tasks;
 
 use clusterflux::prelude::*;
-use release::{publish, PublicationResult, PublishInput};
-use tasks::{build_release_assets, test_public_repo, BuildReleaseInput, TestInput};
+use release::{PublicationResult, PublishInput, publish};
+use tasks::{
+    BuildReleaseInput, CacheNixInput, TestInput, build_release_assets, cache_nix_package,
+    test_public_repo,
+};
 
 #[clusterflux::main]
 pub async fn main() -> Result<Option<PublicationResult>> {
@@ -26,7 +29,7 @@ pub async fn main() -> Result<Option<PublicationResult>> {
     }
 
     let assets = clusterflux::spawn!(build_release_assets(BuildReleaseInput {
-        source,
+        source: source.clone(),
         commit_sha: trigger.commit_sha.clone(),
         git_ref: trigger.git_ref.clone(),
     }))
@@ -34,6 +37,19 @@ pub async fn main() -> Result<Option<PublicationResult>> {
     .await?
     .join()
     .await?;
+
+    if stable_release_ref(&trigger.git_ref) {
+        clusterflux::spawn!(cache_nix_package(CacheNixInput {
+            source,
+            commit_sha: trigger.commit_sha.clone(),
+            tag: assets.tag.clone(),
+        }))
+        .on(clusterflux::env!("nix-cache-publish"))
+        .secret("cachix-auth-token")
+        .await?
+        .join()
+        .await?;
+    }
 
     let publication = clusterflux::spawn!(publish(PublishInput {
         repository_id: trigger.repository_id,
@@ -52,10 +68,13 @@ pub async fn main() -> Result<Option<PublicationResult>> {
 }
 
 fn publishable_ref(git_ref: &str) -> bool {
-    git_ref == "refs/heads/main"
-        || git_ref
-            .strip_prefix("refs/tags/v")
-            .is_some_and(is_semver_core)
+    git_ref == "refs/heads/main" || stable_release_ref(git_ref)
+}
+
+fn stable_release_ref(git_ref: &str) -> bool {
+    git_ref
+        .strip_prefix("refs/tags/v")
+        .is_some_and(is_semver_core)
 }
 
 fn is_semver_core(value: &str) -> bool {

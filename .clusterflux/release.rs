@@ -4,7 +4,7 @@ use clusterflux::prelude::*;
 use clusterflux::serde::{Deserialize, Serialize};
 
 use crate::tasks::{
-    ReleaseAssets, ARCHIVE_NAME, CHECKSUMS_NAME, DEB_NAME, INSTALLER_NAME, RPM_NAME, VSIX_NAME,
+    ARCHIVE_NAME, CHECKSUMS_NAME, DEB_NAME, INSTALLER_NAME, RPM_NAME, ReleaseAssets, VSIX_NAME,
 };
 
 #[derive(Clone, Serialize, Deserialize, clusterflux::TaskArg)]

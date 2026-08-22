@@ -26,7 +26,9 @@ also contains release tooling that builds the compiler environment and reports
 the immutable image ID accepted by `--system-compiler-image`.
 
 On NixOS or another system with Nix, install the equivalent package with
-`nix profile install github:lesstuff/clusterflux#clusterflux-tools`.
+`nix profile install --accept-flake-config github:lesstuff/clusterflux#clusterflux-tools`.
+This accepts only the repository-declared public Clusterflux Cachix URL and
+signing key, allowing Nix to download a matching stable build.
 
 Install Cargo, rustc, and the `wasm32-unknown-unknown` Rust target for local
 `clusterflux check`, `build`, `run`, and `debug`. Hosted automatic compilation
