@@ -6,3 +6,4 @@
 !system-bundles/workflow-compiler/.clusterflux/Cargo.lock
 **/.clusterflux-state/
 /vscode-extension/node_modules/
+/AGENTS.md

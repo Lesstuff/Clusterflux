@@ -85,6 +85,7 @@ let
       pkgs.makeWrapper
       pkgs.jq
       pkgs.gnutar
+      pkgs.gzip
     ];
     cargoBuildFlags = [
       "--package"
@@ -115,6 +116,7 @@ let
     postInstall = ''
       mkdir -p "$out/share/clusterflux"
       cp ${compiler-image} "$out/share/clusterflux/system-compiler-image.oci.tar"
+      ${pkgs.gzip}/bin/gzip --test "$out/share/clusterflux/system-compiler-image.oci.tar"
       image_config="$(${pkgs.gnutar}/bin/tar -xOf ${compiler-image} manifest.json | ${pkgs.jq}/bin/jq -r '.[0].Config')"
       image_digest="sha256:''${image_config%.json}"
       "$out/bin/clusterflux-system-package" write \
