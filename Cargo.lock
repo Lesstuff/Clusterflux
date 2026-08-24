@@ -447,7 +447,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "clusterflux-artifact-transfer"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "clusterflux-core",
  "futures-util",
@@ -464,7 +464,7 @@ dependencies = [
 
 [[package]]
 name = "clusterflux-cli"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "base64",
@@ -481,7 +481,7 @@ dependencies = [
 
 [[package]]
 name = "clusterflux-client"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "clusterflux-coordinator",
  "clusterflux-core",
@@ -496,7 +496,7 @@ dependencies = [
 
 [[package]]
 name = "clusterflux-coordinator"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "aes-gcm",
  "base64",
@@ -516,7 +516,7 @@ dependencies = [
 
 [[package]]
 name = "clusterflux-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "base64",
  "ed25519-dalek 2.2.0",
@@ -534,7 +534,7 @@ dependencies = [
 
 [[package]]
 name = "clusterflux-dap"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "base64",
@@ -548,7 +548,7 @@ dependencies = [
 
 [[package]]
 name = "clusterflux-macros"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "hex",
  "proc-macro2",
@@ -560,7 +560,7 @@ dependencies = [
 
 [[package]]
 name = "clusterflux-node"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "base64",
  "clap",
@@ -586,7 +586,7 @@ dependencies = [
 
 [[package]]
 name = "clusterflux-protocol"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "clusterflux-core",
  "serde",
@@ -596,7 +596,7 @@ dependencies = [
 
 [[package]]
 name = "clusterflux-relay"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "clap",
  "iroh",
@@ -610,7 +610,7 @@ dependencies = [
 
 [[package]]
 name = "clusterflux-sdk"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "clusterflux-core",
  "clusterflux-macros",
@@ -621,7 +621,7 @@ dependencies = [
 
 [[package]]
 name = "clusterflux-source"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "clusterflux-core",
  "libc",
@@ -633,7 +633,7 @@ dependencies = [
 
 [[package]]
 name = "clusterflux-system-compiler-driver"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "clusterflux-core",
  "serde_json",
@@ -641,7 +641,7 @@ dependencies = [
 
 [[package]]
 name = "clusterflux-wasm-runtime"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "clusterflux-core",
  "serde",

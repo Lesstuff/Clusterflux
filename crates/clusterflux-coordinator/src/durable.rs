@@ -256,7 +256,11 @@ pub struct EncryptedProjectSecretRecord {
     pub nonce_base64: String,
     pub key_version: u32,
     pub allowed_entrypoint: String,
+    // Legacy wire metadata retained for older CLIs. Task names are not authority;
+    // the active task must explicitly request the secret and required capabilities.
     pub allowed_task_definition: String,
+    // Exact refs and the stable-tag class (`refs/tags/v*`). Older exact version
+    // entries are interpreted as the same stable-tag class.
     pub allowed_trusted_refs: Vec<String>,
     pub created_at: u64,
     pub updated_at: u64,

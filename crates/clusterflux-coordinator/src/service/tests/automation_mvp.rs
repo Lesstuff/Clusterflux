@@ -217,7 +217,7 @@ fn source_for(trigger: &CommitTrigger, commit_sha: &str) -> WorkflowSource {
             WorkflowSourceFile::new(
                 ".clusterflux/Cargo.toml",
                 0o100644,
-                b"[package]\nname='automation-test'\nversion='0.0.0'\nedition='2024'\npublish=false\n[lib]\npath='main.rs'\ncrate-type=['cdylib']\n[dependencies]\nclusterflux={package='clusterflux-sdk',version='=0.1.1'}\n[workspace]\nresolver='3'\n"
+                b"[package]\nname='automation-test'\nversion='0.0.0'\nedition='2024'\npublish=false\n[lib]\npath='main.rs'\ncrate-type=['cdylib']\n[dependencies]\nclusterflux={package='clusterflux-sdk',version='=0.1.2'}\n[workspace]\nresolver='3'\n"
                     .to_vec(),
             )
             .unwrap(),
@@ -886,7 +886,7 @@ fn source_identity_and_system_assignment_lease_ownership_fail_closed() {
                         "-Cpanic=abort".to_owned(),
                         "--remap-path-prefix=/workspace=.clusterflux".to_owned(),
                     ],
-                    sdk_version: "0.1.1".to_owned(),
+                    sdk_version: "0.1.2".to_owned(),
                     sdk_digest: system_manifest.sdk_digest,
                     trusted_dependencies: Vec::new(),
                     sandbox_image_digest: Some(system_manifest.environment_digest),
@@ -1127,10 +1127,7 @@ fn project_secret_values_are_randomized_at_rest_and_absent_from_user_reads() {
         .clone();
     assert_eq!(
         first.allowed_trusted_refs,
-        [
-            "refs/heads/main".to_owned(),
-            format!("refs/tags/v{}", env!("CARGO_PKG_VERSION")),
-        ]
+        ["refs/heads/main".to_owned(), "refs/tags/v*".to_owned(),]
     );
     assert_ne!(first.ciphertext_base64, encoded);
     service.handle_request(set()).unwrap();
@@ -1165,4 +1162,66 @@ fn project_secret_values_are_randomized_at_rest_and_absent_from_user_reads() {
     assert!(serde_json::to_string(&revoked)
         .unwrap()
         .contains("revoked_at"));
+}
+
+#[test]
+fn secret_authority_uses_explicit_request_and_capabilities_not_task_name() {
+    let mut cache_task = test_task_spec_instance(
+        "tenant",
+        "project",
+        "release",
+        "cache_nix_package",
+        "cache-nix",
+        1,
+        [
+            Capability::Command,
+            Capability::Network,
+            Capability::Secrets,
+        ],
+    );
+    cache_task
+        .requested_secrets
+        .push("cachix-auth-token".to_owned());
+
+    assert!(
+        super::super::secrets::task_declares_secret_materialization_authority(
+            &cache_task,
+            "cachix-auth-token"
+        )
+    );
+    assert!(
+        !super::super::secrets::task_declares_secret_materialization_authority(
+            &cache_task,
+            "github-release"
+        )
+    );
+
+    for capability in [
+        Capability::Command,
+        Capability::Network,
+        Capability::Secrets,
+    ] {
+        let mut incomplete_task = cache_task.clone();
+        incomplete_task.required_capabilities.remove(&capability);
+        assert!(
+            !super::super::secrets::task_declares_secret_materialization_authority(
+                &incomplete_task,
+                "cachix-auth-token"
+            )
+        );
+    }
+
+    let legacy_refs = ["refs/heads/main".to_owned(), "refs/tags/v0.1.1".to_owned()];
+    assert!(super::super::secrets::secret_ref_is_authorized(
+        &legacy_refs,
+        "refs/tags/v0.1.2"
+    ));
+    assert!(!super::super::secrets::secret_ref_is_authorized(
+        &legacy_refs,
+        "refs/tags/build-123456789abc"
+    ));
+    assert!(!super::super::secrets::secret_ref_is_authorized(
+        &legacy_refs,
+        "refs/tags/v0.1.2-rc.1"
+    ));
 }

@@ -2,7 +2,7 @@
 let
   compiler-artifacts = pkgs.rustPlatform.buildRustPackage {
     pname = "clusterflux-system-compiler-artifacts";
-    version = "0.1.1";
+    version = "0.1.2";
     src = self;
     cargoLock.lockFile = ./Cargo.lock;
     nativeBuildInputs = [ pkgs.lld ];
@@ -87,7 +87,7 @@ let
 
   clusterflux-tools = pkgs.rustPlatform.buildRustPackage {
     pname = "clusterflux-tools";
-    version = "0.1.1";
+    version = "0.1.2";
     src = self;
     cargoLock.lockFile = ./Cargo.lock;
     # Nix's default `strip -S` keeps the ELF symbol table. These are standalone

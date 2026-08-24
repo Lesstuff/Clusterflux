@@ -237,7 +237,7 @@ mod tests {
         fs::create_dir_all(root.join(".clusterflux")).unwrap();
         fs::write(
             root.join(".clusterflux/Cargo.toml"),
-            "[package]\nname='test-workflow'\nversion='0.0.0'\nedition='2024'\npublish=false\n[lib]\npath='main.rs'\ncrate-type=['cdylib']\n[dependencies]\nclusterflux={package='clusterflux-sdk',version='=0.1.1'}\n[workspace]\nresolver='3'\n",
+            "[package]\nname='test-workflow'\nversion='0.0.0'\nedition='2024'\npublish=false\n[lib]\npath='main.rs'\ncrate-type=['cdylib']\n[dependencies]\nclusterflux={package='clusterflux-sdk',version='=0.1.2'}\n[workspace]\nresolver='3'\n",
         )
         .unwrap();
     }

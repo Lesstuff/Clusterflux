@@ -7,7 +7,10 @@ pub struct ProjectSecretMetadata {
     pub name: String,
     pub key_version: u32,
     pub allowed_entrypoint: String,
+    /// Legacy compatibility metadata. Coordinators authorize the active task's
+    /// explicit secret request and capabilities rather than its function name.
     pub allowed_task_definition: String,
+    /// Exact trusted refs plus the `refs/tags/v*` stable-release class.
     pub allowed_trusted_refs: Vec<String>,
     pub created_at: u64,
     pub updated_at: u64,

@@ -236,7 +236,7 @@ impl CoordinatorService {
                     allowed_task_definition: "publish".to_owned(),
                     allowed_trusted_refs: vec![
                         "refs/heads/main".to_owned(),
-                        format!("refs/tags/v{}", env!("CARGO_PKG_VERSION")),
+                        "refs/tags/v*".to_owned(),
                     ],
                     created_at,
                     updated_at: now,
@@ -393,20 +393,10 @@ impl CoordinatorService {
                     "secret grant requires the task's active assignment".to_owned(),
                 )
             })?;
-        if !task_spec
-            .requested_secrets
-            .iter()
-            .any(|name| name == &secret_name)
-            || !task_spec
-                .required_capabilities
-                .contains(&Capability::Command)
-            || !task_spec
-                .required_capabilities
-                .contains(&Capability::Network)
-            || task_spec.task_definition.as_str() != "publish"
-        {
+        if !task_declares_secret_materialization_authority(&task_spec, &secret_name) {
             return Err(crate::CoordinatorError::Unauthorized(
-                "task did not declare the required secret and publish capabilities".to_owned(),
+                "task did not explicitly request the secret and declare command, network, and secrets capabilities"
+                    .to_owned(),
             )
             .into());
         }
@@ -444,8 +434,7 @@ impl CoordinatorService {
                 )
             })?;
         if record.allowed_entrypoint != "main"
-            || record.allowed_task_definition != task_spec.task_definition.as_str()
-            || !record.allowed_trusted_refs.contains(&run.run.git_ref)
+            || !secret_ref_is_authorized(&record.allowed_trusted_refs, &run.run.git_ref)
         {
             return Err(crate::CoordinatorError::Unauthorized(
                 "project secret policy does not authorize this task".to_owned(),
@@ -532,6 +521,46 @@ impl CoordinatorService {
             occurred_at,
         });
     }
+}
+
+pub(super) fn task_declares_secret_materialization_authority(
+    task_spec: &clusterflux_core::TaskSpec,
+    secret_name: &str,
+) -> bool {
+    task_spec
+        .requested_secrets
+        .iter()
+        .any(|name| name == secret_name)
+        && [
+            Capability::Command,
+            Capability::Network,
+            Capability::Secrets,
+        ]
+        .iter()
+        .all(|capability| task_spec.required_capabilities.contains(capability))
+}
+
+pub(super) fn secret_ref_is_authorized(allowed_refs: &[String], git_ref: &str) -> bool {
+    if allowed_refs.iter().any(|allowed| allowed == git_ref) {
+        return true;
+    }
+    is_stable_release_ref(git_ref)
+        && allowed_refs
+            .iter()
+            .any(|allowed| allowed == "refs/tags/v*" || is_stable_release_ref(allowed))
+}
+
+fn is_stable_release_ref(git_ref: &str) -> bool {
+    let Some(version) = git_ref.strip_prefix("refs/tags/v") else {
+        return false;
+    };
+    let mut parts = version.split('.');
+    let valid = (0..3).all(|_| {
+        parts
+            .next()
+            .is_some_and(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+    });
+    valid && parts.next().is_none()
 }
 
 fn validate_secret_name(name: &str) -> Result<(), CoordinatorServiceError> {

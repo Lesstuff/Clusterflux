@@ -9,7 +9,7 @@ path = "main.rs"
 crate-type = ["cdylib"]
 
 [dependencies]
-clusterflux = { package = "clusterflux-sdk", version = "=0.1.1", path = "../crates/clusterflux-sdk" }
+clusterflux = { package = "clusterflux-sdk", version = "=0.1.2", path = "../crates/clusterflux-sdk" }
 
 [workspace]
 resolver = "3"
