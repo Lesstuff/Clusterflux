@@ -195,13 +195,9 @@ pub(crate) fn run_cli() -> Result<()> {
             command: NodeCommands::Attach(args),
         } => {
             let json_output = args.json;
-            if args.coordinator.is_some() {
-                let report = execute_node_attach(args)?;
-                emit_report(&report, json_output)?;
-            } else {
-                let plan = attach_plan(args);
-                emit_report(&plan, json_output)?;
-            }
+            let cwd = std::env::current_dir()?;
+            let report = execute_node_attach(args, &cwd)?;
+            emit_report(&report, json_output)?;
         }
         Commands::Node { command } => {
             let cwd = std::env::current_dir()?;

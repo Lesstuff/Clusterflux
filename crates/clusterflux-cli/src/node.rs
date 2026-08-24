@@ -12,7 +12,9 @@ use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::client::{authenticated_or_local_trusted_request, JsonLineSession};
-use crate::config::{effective_scope_value, read_cli_session, StoredCliSession};
+use crate::config::{
+    default_hosted_coordinator_endpoint, effective_scope_value, read_cli_session, StoredCliSession,
+};
 use crate::tools::{command_available, command_nonce, unix_timestamp_seconds};
 use crate::{
     confirmation_required_report, AttachArgs, CliScopeArgs, NodeEnrollArgs, NodeListArgs,
@@ -32,6 +34,9 @@ pub(crate) struct NodeAttachPlan {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub(crate) struct NodeAttachReport {
     pub(crate) command: String,
+    pub(crate) coordinator: String,
+    pub(crate) tenant: String,
+    pub(crate) project: String,
     pub(crate) node: String,
     pub(crate) plan: NodeAttachPlan,
     pub(crate) grant_disclosures: Vec<CapabilityGrantDisclosure>,
@@ -98,6 +103,12 @@ struct StoredNodeCredential {
     private_key: String,
     public_key: String,
     credential_scope: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    coordinator: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tenant: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    project: Option<String>,
 }
 
 pub(crate) fn node_enroll_report(args: NodeEnrollArgs, cwd: PathBuf) -> Result<Value> {
@@ -555,15 +566,46 @@ fn capability_grant_disclosures(capabilities: &NodeCapabilities) -> Vec<Capabili
     disclosures
 }
 
-pub(crate) fn execute_node_attach(args: AttachArgs) -> Result<NodeAttachReport> {
+pub(crate) fn execute_node_attach(args: AttachArgs, cwd: &Path) -> Result<NodeAttachReport> {
+    let stored_session = read_cli_session(cwd)?;
     let coordinator = args
         .coordinator
         .clone()
-        .context("node attach execution requires --coordinator")?;
-    let tenant = args.tenant.clone();
-    let project = args.project.clone();
+        .or_else(|| {
+            stored_session
+                .as_ref()
+                .map(|session| session.coordinator.clone())
+        })
+        .unwrap_or_else(default_hosted_coordinator_endpoint);
+    if args.tenant != "tenant"
+        && stored_session
+            .as_ref()
+            .filter(|session| session.session_secret.is_some())
+            .is_some_and(|session| session.tenant != args.tenant)
+    {
+        let authenticated_tenant = &stored_session
+            .as_ref()
+            .expect("checked stored session")
+            .tenant;
+        anyhow::bail!(
+            "--tenant `{}` conflicts with the authenticated tenant `{authenticated_tenant}`; omit --tenant to use the authenticated scope",
+            args.tenant
+        );
+    }
+    let tenant = session_or_effective_scope_value(
+        stored_session.as_ref(),
+        &args.tenant,
+        |session| session.tenant.as_str(),
+        "tenant",
+    );
+    let project = session_or_effective_scope_value(
+        stored_session.as_ref(),
+        &args.project,
+        |session| session.project.as_str(),
+        "project",
+    );
     let node = args.node.clone().unwrap_or_else(default_node_id);
-    let node_private_key = node_private_key_for_attach(&node)?;
+    let node_private_key = node_private_key_for_attach(&node, cwd)?;
     let derived_public_key =
         node_ed25519_public_key_from_private_key(&node_private_key).map_err(anyhow::Error::msg)?;
     let public_key = args
@@ -576,6 +618,7 @@ pub(crate) fn execute_node_attach(args: AttachArgs) -> Result<NodeAttachReport> 
         );
     }
     let mut plan = attach_plan(args);
+    plan.coordinator = Some(coordinator.clone());
     if let Some(enrollment) = &mut plan.enrollment {
         enrollment.public_key_fingerprint = Digest::sha256(&public_key);
     }
@@ -612,6 +655,7 @@ pub(crate) fn execute_node_attach(args: AttachArgs) -> Result<NodeAttachReport> 
     if !identity_accepted {
         anyhow::bail!("coordinator returned an unexpected node-identity response");
     }
+    persist_node_credential_scope(cwd, &node, &coordinator, &tenant, &project)?;
     let heartbeat_request = CoordinatorRequest::NodeHeartbeat {
         tenant: tenant.clone(),
         project: project.clone(),
@@ -666,6 +710,9 @@ pub(crate) fn execute_node_attach(args: AttachArgs) -> Result<NodeAttachReport> 
 
     Ok(NodeAttachReport {
         command: "node attach".to_owned(),
+        coordinator: coordinator.clone(),
+        tenant,
+        project,
         node: plan.node.clone(),
         grant_disclosures: plan.grant_disclosures.clone(),
         plan,
@@ -681,11 +728,11 @@ pub(crate) fn execute_node_attach(args: AttachArgs) -> Result<NodeAttachReport> 
     })
 }
 
-fn node_private_key_for_attach(node: &str) -> Result<String> {
+fn node_private_key_for_attach(node: &str, project_root: &Path) -> Result<String> {
     if let Ok(private_key) = std::env::var("CLUSTERFLUX_NODE_PRIVATE_KEY") {
         return Ok(private_key);
     }
-    load_or_create_local_node_credential(&std::env::current_dir()?, node)
+    load_or_create_local_node_credential(project_root, node)
 }
 
 pub(crate) fn load_or_create_local_node_credential(project: &Path, node: &str) -> Result<String> {
@@ -723,9 +770,57 @@ pub(crate) fn load_or_create_local_node_credential(project: &Path, node: &str) -
         private_key: private_key.clone(),
         public_key,
         credential_scope: "local_project_node_identity".to_owned(),
+        coordinator: None,
+        tenant: None,
+        project: None,
     };
     persist_node_credential(&file, &credential)?;
     Ok(private_key)
+}
+
+fn persist_node_credential_scope(
+    project_root: &Path,
+    node: &str,
+    coordinator: &str,
+    tenant: &str,
+    project: &str,
+) -> Result<()> {
+    use std::io::Write;
+
+    let file = local_node_credential_file(project_root, node);
+    let bytes =
+        std::fs::read(&file).with_context(|| format!("failed to read {}", file.display()))?;
+    let mut credential: StoredNodeCredential = serde_json::from_slice(&bytes)
+        .with_context(|| format!("failed to parse {}", file.display()))?;
+    credential.coordinator = Some(coordinator.to_owned());
+    credential.tenant = Some(tenant.to_owned());
+    credential.project = Some(project.to_owned());
+    let parent = file
+        .parent()
+        .with_context(|| format!("node credential path {} has no parent", file.display()))?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent).with_context(|| {
+        format!(
+            "failed to create temporary credential in {}",
+            parent.display()
+        )
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        temporary
+            .as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    temporary.write_all(&serde_json::to_vec_pretty(&credential)?)?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(&file).map_err(|error| {
+        anyhow::anyhow!(
+            "failed to update node credential scope {}: {}",
+            file.display(),
+            error.error
+        )
+    })?;
+    Ok(())
 }
 
 fn credential_file_exists_without_symlink(file: &Path) -> Result<bool> {

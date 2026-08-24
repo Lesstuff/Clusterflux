@@ -510,7 +510,7 @@ impl CoordinatorService {
                         && attempt_process == &process
                 },
             )
-            .flat_map(|(_, attempts)| attempts.iter().cloned())
+            .flat_map(|(_, attempts)| attempts.iter().rev().cloned())
             .collect();
         Ok(CoordinatorResponse::TaskSnapshots { snapshots })
     }

@@ -72,3 +72,5 @@ debug = 0
 # compiler-side ThinLTO failure cannot make otherwise identical builds flaky.
 [profile.release]
 lto = "off"
+panic = "abort"
+strip = "symbols"

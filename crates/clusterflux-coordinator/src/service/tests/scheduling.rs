@@ -758,6 +758,27 @@ fn same_definition_instances_join_correctly_when_they_complete_in_reverse_order(
     );
     assert_eq!(restarted_assignment.wasm_module_base64, replacement_module);
 
+    let CoordinatorResponse::TaskSnapshots { snapshots } = service
+        .handle_request(CoordinatorRequest::ListTaskSnapshots {
+            tenant: "tenant".to_owned(),
+            project: "project".to_owned(),
+            actor_user: "user".to_owned(),
+            process: "vp".to_owned(),
+        })
+        .unwrap()
+    else {
+        panic!("expected task snapshots after restart");
+    };
+    let compile_one_attempts = snapshots
+        .iter()
+        .filter(|snapshot| snapshot.task == TaskInstanceId::from("compile-1"))
+        .collect::<Vec<_>>();
+    assert_eq!(compile_one_attempts.len(), 2);
+    assert_eq!(compile_one_attempts[0].attempt_number, 2);
+    assert!(compile_one_attempts[0].current);
+    assert_eq!(compile_one_attempts[1].attempt_number, 1);
+    assert!(!compile_one_attempts[1].current);
+
     let incompatible_compatibility = Digest::sha256("compile-changed-signature");
     let (incompatible_module, incompatible_bundle_digest) =
         test_edited_task_bundle(&incompatible_compatibility, "incompatible-body");

@@ -49,11 +49,18 @@ const MAX_DEBUG_FREEZE_TIMEOUT_MILLIS: u64 = 5 * 60 * 1_000;
 const MAX_CONTROL_POLL_MILLIS: u64 = 60_000;
 const MAX_EPHEMERAL_TIMEOUT_SECONDS: u64 = 24 * 60 * 60;
 const MAX_PROVIDER_DEADLINE_HORIZON_SECONDS: u64 = 30 * 24 * 60 * 60;
+const MAX_COORDINATOR_RECONNECT_SECONDS: u64 = 24 * 60 * 60;
+pub(crate) const DEFAULT_HOSTED_COORDINATOR_ENDPOINT: &str = "https://clusterflux.lesstuff.com";
 
 #[derive(Clone, Parser)]
 #[command(name = "clusterflux-node", version, about = "Clusterflux node worker")]
 pub(crate) struct Args {
-    #[arg(long, value_name = "URL", value_parser = parse_coordinator_endpoint)]
+    #[arg(
+        long,
+        value_name = "URL",
+        default_value = DEFAULT_HOSTED_COORDINATOR_ENDPOINT,
+        value_parser = parse_coordinator_endpoint
+    )]
     pub(crate) coordinator: String,
     #[arg(long, default_value = "tenant", value_parser = parse_tenant_id)]
     pub(crate) tenant: String,
@@ -71,6 +78,13 @@ pub(crate) struct Args {
     pub(crate) control_poll_ms: u64,
     #[arg(long, default_value_t = 100, value_parser = parse_assignment_poll_ms)]
     pub(crate) assignment_poll_ms: u64,
+    /// Maximum jittered reconnect delay after a transient coordinator failure; zero disables retries.
+    #[arg(
+        long,
+        default_value_t = 60 * 60,
+        value_parser = parse_coordinator_reconnect_max_seconds
+    )]
+    pub(crate) coordinator_reconnect_max_seconds: u64,
     /// Maximum CPUs available to each project task container on this node.
     #[arg(long, default_value_t = 2, value_parser = parse_task_cpu_count)]
     pub(crate) task_cpus: u16,
@@ -134,7 +148,6 @@ pub(crate) struct RuntimeTask {
     pub(crate) task_spec: Option<TaskSpec>,
     pub(crate) bundle_digest: Option<Digest>,
     pub(crate) wasm_module_base64: Option<String>,
-    pub(crate) task_assignment_response: Value,
     pub(crate) assignment_authority: AssignmentAuthority,
 }
 
@@ -204,7 +217,10 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let node_private_key = node_private_key_for_runtime(args.project_root.as_deref(), &args.node)?;
     validate_node_identity_configuration(&args, &node_private_key)?;
-    let mut session = CoordinatorSession::connect(&args.coordinator)?;
+    let reconnect_max_delay = (args.coordinator_reconnect_max_seconds > 0)
+        .then(|| Duration::from_secs(args.coordinator_reconnect_max_seconds));
+    let mut session =
+        CoordinatorSession::connect_with_retries(&args.coordinator, reconnect_max_delay)?;
     let registration = establish_node_identity(&mut session, &args, &node_private_key)?;
     let heartbeat_request = CoordinatorRequest::NodeHeartbeat {
         tenant: args.tenant.clone(),
@@ -668,9 +684,9 @@ async fn worker_loop(
                     "node": &args.node,
                     "process": &runtime_task.process,
                     "virtual_thread": &runtime_task.task,
+                    "task_spec": &runtime_task.task_spec,
                     "required_artifact_count": required_artifact_count,
                     "locally_ready_artifact_count": locally_ready_artifact_count,
-                    "task_assignment_response": &runtime_task.task_assignment_response,
                 }))?
             );
             std::io::stdout().flush()?;
@@ -965,7 +981,6 @@ fn cached_environment_digests(
 pub(crate) fn runtime_task_from_assignment(
     assignment: TaskAssignment,
 ) -> Result<RuntimeTask, Box<dyn std::error::Error>> {
-    let value = serde_json::to_value(&assignment)?;
     let assignment_authority = AssignmentAuthority {
         assignment_id: assignment.assignment_id.clone(),
         attempt_id: assignment.attempt_id.clone(),
@@ -979,7 +994,6 @@ pub(crate) fn runtime_task_from_assignment(
         bundle_digest: task_spec.bundle_digest.clone(),
         task_spec: Some(task_spec),
         wasm_module_base64: Some(assignment.wasm_module_base64),
-        task_assignment_response: value,
         assignment_authority,
     })
 }
@@ -1201,6 +1215,7 @@ fn finish_runtime_task(
 
 fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
     let mut args = Args::parse();
+    crate::node_identity::apply_stored_node_scope(&mut args)?;
     args.debug_freeze_timeout_ms = environment_bounded_u64(
         "CLUSTERFLUX_DEBUG_FREEZE_TIMEOUT_MS",
         DEFAULT_DEBUG_FREEZE_TIMEOUT_MILLIS,
@@ -1318,6 +1333,18 @@ fn parse_control_poll_ms(value: &str) -> Result<u64, String> {
     if value > MAX_CONTROL_POLL_MILLIS {
         return Err(format!(
             "control poll duration must not exceed {MAX_CONTROL_POLL_MILLIS} milliseconds"
+        ));
+    }
+    Ok(value)
+}
+
+fn parse_coordinator_reconnect_max_seconds(value: &str) -> Result<u64, String> {
+    let value = value
+        .parse::<u64>()
+        .map_err(|error| format!("invalid coordinator reconnect delay: {error}"))?;
+    if value > MAX_COORDINATOR_RECONNECT_SECONDS {
+        return Err(format!(
+            "--coordinator-reconnect-max-seconds must be between 0 and {MAX_COORDINATOR_RECONNECT_SECONDS}"
         ));
     }
     Ok(value)
@@ -1489,7 +1516,8 @@ mod tests {
         control_endpoint_identity, ephemeral_drain_due, load_or_create_local_node_credential,
         next_worker_drain_wait, parse_control_poll_ms, parse_positive_u64,
         validate_assignment_poll_ms, validate_provider_deadlines, wait_for_worker_poll, Args,
-        ContainerRunPolicy, RuntimeTask, MAX_PROVIDER_DEADLINE_HORIZON_SECONDS,
+        ContainerRunPolicy, RuntimeTask, DEFAULT_HOSTED_COORDINATOR_ENDPOINT,
+        MAX_PROVIDER_DEADLINE_HORIZON_SECONDS,
     };
     use crate::assignment_runner::{
         node_wasm_execution_service, submit_verified_wasmtime_assignment,
@@ -1505,6 +1533,23 @@ mod tests {
 
     #[test]
     fn clap_configuration_rejects_unsafe_or_unknown_values() {
+        let hosted = Args::try_parse_from(["clusterflux-node", "--worker"]).unwrap();
+        assert_eq!(hosted.coordinator, DEFAULT_HOSTED_COORDINATOR_ENDPOINT);
+        assert_eq!(hosted.coordinator_reconnect_max_seconds, 60 * 60);
+        let reconnect_disabled = Args::try_parse_from([
+            "clusterflux-node",
+            "--coordinator-reconnect-max-seconds",
+            "0",
+        ])
+        .unwrap();
+        assert_eq!(reconnect_disabled.coordinator_reconnect_max_seconds, 0);
+        assert!(Args::try_parse_from([
+            "clusterflux-node",
+            "--coordinator-reconnect-max-seconds",
+            "86401",
+        ])
+        .is_err());
+
         let args = Args::try_parse_from([
             "clusterflux-node",
             "--coordinator",
@@ -1790,7 +1835,6 @@ mod tests {
             }),
             bundle_digest: Some(Digest::sha256(&wasm)),
             wasm_module_base64: Some(BASE64_STANDARD.encode(&wasm)),
-            task_assignment_response: serde_json::json!({}),
             assignment_authority: clusterflux_core::AssignmentAuthority {
                 assignment_id: "test-assignment".to_owned(),
                 attempt_id: "test-attempt".to_owned(),
@@ -1865,6 +1909,7 @@ mod tests {
             public_key: None,
             control_poll_ms: 0,
             assignment_poll_ms: 1,
+            coordinator_reconnect_max_seconds: 0,
             task_cpus: 2,
             task_memory_gib: 2,
             task_pids_limit: 256,

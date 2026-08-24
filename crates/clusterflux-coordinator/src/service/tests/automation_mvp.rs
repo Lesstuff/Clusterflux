@@ -217,7 +217,7 @@ fn source_for(trigger: &CommitTrigger, commit_sha: &str) -> WorkflowSource {
             WorkflowSourceFile::new(
                 ".clusterflux/Cargo.toml",
                 0o100644,
-                b"[package]\nname='automation-test'\nversion='0.0.0'\nedition='2024'\npublish=false\n[lib]\npath='main.rs'\ncrate-type=['cdylib']\n[dependencies]\nclusterflux={package='clusterflux-sdk',version='=0.1.0'}\n[workspace]\nresolver='3'\n"
+                b"[package]\nname='automation-test'\nversion='0.0.0'\nedition='2024'\npublish=false\n[lib]\npath='main.rs'\ncrate-type=['cdylib']\n[dependencies]\nclusterflux={package='clusterflux-sdk',version='=0.1.1'}\n[workspace]\nresolver='3'\n"
                     .to_vec(),
             )
             .unwrap(),
@@ -886,7 +886,7 @@ fn source_identity_and_system_assignment_lease_ownership_fail_closed() {
                         "-Cpanic=abort".to_owned(),
                         "--remap-path-prefix=/workspace=.clusterflux".to_owned(),
                     ],
-                    sdk_version: "0.1.0".to_owned(),
+                    sdk_version: "0.1.1".to_owned(),
                     sdk_digest: system_manifest.sdk_digest,
                     trusted_dependencies: Vec::new(),
                     sandbox_image_digest: Some(system_manifest.environment_digest),

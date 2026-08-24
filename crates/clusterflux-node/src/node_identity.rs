@@ -19,6 +19,88 @@ struct StoredNodeCredential {
     private_key: String,
     public_key: String,
     credential_scope: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    coordinator: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tenant: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    project: Option<String>,
+}
+
+pub(crate) fn apply_stored_node_scope(args: &mut Args) -> Result<(), Box<dyn std::error::Error>> {
+    let current_directory;
+    let project_root = match args.project_root.as_deref() {
+        Some(project_root) => project_root,
+        None => {
+            current_directory = std::env::current_dir()?;
+            current_directory.as_path()
+        }
+    };
+    let file = local_node_credential_file(project_root, &args.node);
+    if !credential_file_exists_without_symlink(&file)? {
+        return Ok(());
+    }
+    let bytes = std::fs::read(&file)?;
+    let credential: StoredNodeCredential = serde_json::from_slice(&bytes)?;
+    if credential.node != args.node {
+        return Err(format!(
+            "stored node credential {} belongs to node `{}` instead of `{}`",
+            file.display(),
+            credential.node,
+            args.node
+        )
+        .into());
+    }
+    apply_or_validate_scope_value(
+        "--tenant",
+        &mut args.tenant,
+        "tenant",
+        credential.tenant.as_deref(),
+        args.enrollment_grant.is_some(),
+    )?;
+    apply_or_validate_scope_value(
+        "--project-id",
+        &mut args.project,
+        "project",
+        credential.project.as_deref(),
+        args.enrollment_grant.is_some(),
+    )?;
+    if let Some(stored_coordinator) = credential.coordinator.as_deref() {
+        let uses_default = args.coordinator == crate::daemon::DEFAULT_HOSTED_COORDINATOR_ENDPOINT;
+        let same_endpoint = clusterflux_client::endpoint_identity(&args.coordinator).ok()
+            == clusterflux_client::endpoint_identity(stored_coordinator).ok();
+        if uses_default {
+            args.coordinator = stored_coordinator.to_owned();
+        } else if !same_endpoint && args.enrollment_grant.is_none() {
+            return Err(format!(
+                "--coordinator `{}` conflicts with the enrolled coordinator `{stored_coordinator}`; omit --coordinator to reuse the enrolled scope or provide a new enrollment grant",
+                args.coordinator
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn apply_or_validate_scope_value(
+    argument: &str,
+    current: &mut String,
+    placeholder: &str,
+    stored: Option<&str>,
+    reenrolling: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(stored) = stored else {
+        return Ok(());
+    };
+    if current == placeholder {
+        *current = stored.to_owned();
+    } else if current != stored && !reenrolling {
+        return Err(format!(
+            "{argument} `{current}` conflicts with the enrolled value `{stored}`; omit {argument} to reuse the enrolled scope or provide a new enrollment grant"
+        )
+        .into());
+    }
+    Ok(())
 }
 
 pub(crate) fn establish_node_identity(
@@ -48,6 +130,7 @@ pub(crate) fn establish_node_identity(
         })?;
         match response {
             response @ CoordinatorResponse::NodeEnrollmentExchanged { .. } => {
+                persist_runtime_scope_if_stored(args)?;
                 Ok(serde_json::to_value(response)?)
             }
             _ => Err("coordinator returned an unexpected enrollment-exchange response".into()),
@@ -144,9 +227,54 @@ pub(crate) fn load_or_create_local_node_credential(
         private_key: private_key.clone(),
         public_key,
         credential_scope: "local_project_node_identity".to_owned(),
+        coordinator: None,
+        tenant: None,
+        project: None,
     };
     persist_node_credential(&file, &credential)?;
     Ok(private_key)
+}
+
+fn persist_runtime_scope_if_stored(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Write;
+
+    let current_directory;
+    let project_root = match args.project_root.as_deref() {
+        Some(project_root) => project_root,
+        None => {
+            current_directory = std::env::current_dir()?;
+            current_directory.as_path()
+        }
+    };
+    let file = local_node_credential_file(project_root, &args.node);
+    if !credential_file_exists_without_symlink(&file)? {
+        return Ok(());
+    }
+    let mut credential: StoredNodeCredential = serde_json::from_slice(&std::fs::read(&file)?)?;
+    credential.coordinator = Some(args.coordinator.clone());
+    credential.tenant = Some(args.tenant.clone());
+    credential.project = Some(args.project.clone());
+    let parent = file
+        .parent()
+        .ok_or_else(|| format!("node credential path {} has no parent", file.display()))?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        temporary
+            .as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    temporary.write_all(&serde_json::to_vec_pretty(&credential)?)?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(&file).map_err(|error| {
+        format!(
+            "failed to update node credential scope {}: {}",
+            file.display(),
+            error.error
+        )
+    })?;
+    Ok(())
 }
 
 fn credential_file_exists_without_symlink(file: &Path) -> Result<bool, Box<dyn std::error::Error>> {
@@ -287,4 +415,42 @@ pub(crate) fn unix_timestamp_nanos() -> u128 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn enrolled_scope_is_reused_and_conflicting_scope_is_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let node = "scope-test-node";
+        load_or_create_local_node_credential(temp.path(), node).unwrap();
+
+        let mut enrolled = Args::try_parse_from(["clusterflux-node", "--node", node]).unwrap();
+        enrolled.project_root = Some(temp.path().to_owned());
+        enrolled.coordinator = "https://coordinator.example".to_owned();
+        enrolled.tenant = "tenant-enrolled".to_owned();
+        enrolled.project = "project-enrolled".to_owned();
+        persist_runtime_scope_if_stored(&enrolled).unwrap();
+
+        let mut reused = Args::try_parse_from(["clusterflux-node", "--node", node]).unwrap();
+        reused.project_root = Some(temp.path().to_owned());
+        apply_stored_node_scope(&mut reused).unwrap();
+        assert_eq!(reused.coordinator, "https://coordinator.example");
+        assert_eq!(reused.tenant, "tenant-enrolled");
+        assert_eq!(reused.project, "project-enrolled");
+
+        let mut conflicting = reused.clone();
+        conflicting.tenant = "tenant-wrong".to_owned();
+        let error = apply_stored_node_scope(&mut conflicting).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("conflicts with the enrolled value `tenant-enrolled`"));
+
+        conflicting.enrollment_grant = Some("replacement-grant".to_owned());
+        apply_stored_node_scope(&mut conflicting).unwrap();
+        assert_eq!(conflicting.tenant, "tenant-wrong");
+    }
 }

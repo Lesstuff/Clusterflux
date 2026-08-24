@@ -36,17 +36,15 @@ clusterflux node attach \
 
 Treat the enrollment grant as a short-lived secret. It is exchanged once and is
 not a worker credential. By default, `clusterflux node attach` creates and stores
-a local node key with restricted permissions. Use an explicit `--public-key`
-with `CLUSTERFLUX_NODE_PRIVATE_KEY` only when external secret management owns the
-key pair.
+a local node key with restricted permissions, along with its coordinator,
+tenant, and project scope. Use an explicit `--public-key` with
+`CLUSTERFLUX_NODE_PRIVATE_KEY` only when external secret management owns the key
+pair.
 
 ## Run the worker
 
 ~~~bash
 clusterflux-node \
-  --coordinator https://clusterflux.lesstuff.com \
-  --tenant "$TENANT" \
-  --project-id <project-id> \
   --node workstation \
   --project-root "$PWD" \
   --worker \

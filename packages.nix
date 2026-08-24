@@ -2,7 +2,7 @@
 let
   compiler-artifacts = pkgs.rustPlatform.buildRustPackage {
     pname = "clusterflux-system-compiler-artifacts";
-    version = "0.1.0";
+    version = "0.1.1";
     src = self;
     cargoLock.lockFile = ./Cargo.lock;
     nativeBuildInputs = [ pkgs.lld ];
@@ -51,9 +51,13 @@ let
     ln -s ${pkgs.lld}/bin/wasm-ld "$out/opt/rust/bin/rust-lld"
   '';
 
-  compiler-image = pkgs.dockerTools.buildImage {
+  compiler-image-tar = pkgs.dockerTools.buildImage {
     name = "clusterflux-system-compiler";
     tag = "release";
+    # Nixpkgs' gzip compressor uses parallel pigz and does not validate its
+    # output. Keep archive construction separate from checked compression so a
+    # corrupt stream can never be registered as the packaged compiler image.
+    compressor = "none";
     copyToRoot = pkgs.buildEnv {
       name = "clusterflux-system-compiler-image-root";
       paths = [
@@ -74,11 +78,21 @@ let
     };
   };
 
+  compiler-image = pkgs.runCommand "clusterflux-system-compiler-image.tar.gz" {
+    nativeBuildInputs = [ pkgs.gzip ];
+  } ''
+    gzip -n -c ${compiler-image-tar} > "$out"
+    gzip --test "$out"
+  '';
+
   clusterflux-tools = pkgs.rustPlatform.buildRustPackage {
     pname = "clusterflux-tools";
-    version = "0.1.0";
+    version = "0.1.1";
     src = self;
     cargoLock.lockFile = ./Cargo.lock;
+    # Nix's default `strip -S` keeps the ELF symbol table. These are standalone
+    # release tools, so remove symbols as well as debug sections.
+    stripAllList = [ "bin" ];
     nativeBuildInputs = [
       pkgs.git
       pkgs.lld

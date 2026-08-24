@@ -92,8 +92,10 @@ use logout::{auth_logout_report, logout_report};
 #[cfg(test)]
 use logs::logs_report;
 use logs::logs_report_with_session;
+#[cfg(test)]
+use node::attach_plan;
 use node::{
-    attach_plan, execute_node_attach, node_enroll_report, node_list_report, node_revoke_report,
+    execute_node_attach, node_enroll_report, node_list_report, node_revoke_report,
     node_status_report,
 };
 use output::emit_report;

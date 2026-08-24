@@ -530,6 +530,167 @@ fn node_attach_local_credential_is_durable_and_project_scoped() {
     }
 }
 
+#[test]
+fn node_attach_rejects_an_explicit_tenant_outside_the_authenticated_scope() {
+    let temp = tempfile::tempdir().unwrap();
+    write_cli_session(
+        temp.path(),
+        &StoredCliSession {
+            kind: "human".to_owned(),
+            coordinator: "127.0.0.1:1".to_owned(),
+            tenant: "tenant-authenticated".to_owned(),
+            project: "project-authenticated".to_owned(),
+            user: "user-authenticated".to_owned(),
+            cli_session_credential_kind: "CliDeviceSession".to_owned(),
+            session_secret: Some("session-secret".to_owned()),
+            token_expiry_posture: "unknown_coordinator_session".to_owned(),
+            expires_at: None,
+            provider_tokens_exposed_to_cli: false,
+            provider_tokens_sent_to_nodes: false,
+            created_at_unix_seconds: 1,
+        },
+    )
+    .unwrap();
+    let Cli {
+        command: Commands::Node {
+            command: NodeCommands::Attach(args),
+        },
+    } = parse(&[
+        "clusterflux",
+        "node",
+        "attach",
+        "--tenant",
+        "tenant-wrong",
+        "--node",
+        "node-wrong-tenant",
+    ])
+    else {
+        panic!("wrong command");
+    };
+
+    let error = execute_node_attach(args, temp.path()).unwrap_err();
+
+    assert!(error
+        .to_string()
+        .contains("conflicts with the authenticated tenant `tenant-authenticated`"));
+    assert!(!node::local_node_credential_file(temp.path(), "node-wrong-tenant").exists());
+}
+
+#[test]
+fn node_attach_without_coordinator_enrolls_and_persists_authenticated_scope() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+
+    let temp = tempfile::tempdir().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let coordinator = listener.local_addr().unwrap().to_string();
+    write_cli_session(
+        temp.path(),
+        &StoredCliSession {
+            kind: "human".to_owned(),
+            coordinator: coordinator.clone(),
+            tenant: "tenant-authenticated".to_owned(),
+            project: "project-authenticated".to_owned(),
+            user: "user-authenticated".to_owned(),
+            cli_session_credential_kind: "CliDeviceSession".to_owned(),
+            session_secret: Some("session-secret".to_owned()),
+            token_expiry_posture: "unknown_coordinator_session".to_owned(),
+            expires_at: None,
+            provider_tokens_exposed_to_cli: false,
+            provider_tokens_sent_to_nodes: false,
+            created_at_unix_seconds: 1,
+        },
+    )
+    .unwrap();
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut writer = stream.try_clone().unwrap();
+        let mut reader = BufReader::new(stream);
+        for response in [
+            clusterflux_protocol::CoordinatorResponse::NodeEnrollmentExchanged {
+                node: clusterflux_core::NodeId::from("node-attached"),
+                tenant: clusterflux_core::TenantId::from("tenant-authenticated"),
+                project: clusterflux_core::ProjectId::from("project-authenticated"),
+                credential: clusterflux_core::NodeCredential {
+                    node: clusterflux_core::NodeId::from("node-attached"),
+                    tenant: clusterflux_core::TenantId::from("tenant-authenticated"),
+                    project: clusterflux_core::ProjectId::from("project-authenticated"),
+                    public_key_fingerprint: clusterflux_core::Digest::sha256("node-key"),
+                    scope: "node:attach".to_owned(),
+                    capability_policy_digest: clusterflux_core::Digest::sha256("policy"),
+                    credential_kind: clusterflux_core::CredentialKind::NodeCredential,
+                },
+            },
+            clusterflux_protocol::CoordinatorResponse::NodeHeartbeat {
+                node: clusterflux_core::NodeId::from("node-attached"),
+                epoch: 1,
+            },
+            clusterflux_protocol::CoordinatorResponse::NodeCapabilitiesRecorded {
+                node: clusterflux_core::NodeId::from("node-attached"),
+                node_descriptors: 1,
+            },
+        ] {
+            let mut request = String::new();
+            reader.read_line(&mut request).unwrap();
+            let request: serde_json::Value = serde_json::from_str(&request).unwrap();
+            assert_eq!(
+                request
+                    .pointer("/payload/tenant")
+                    .or_else(|| request.pointer("/payload/request/tenant"))
+                    .and_then(|value| value.as_str()),
+                Some("tenant-authenticated")
+            );
+            assert_eq!(
+                request
+                    .pointer("/payload/project")
+                    .or_else(|| request.pointer("/payload/request/project"))
+                    .and_then(|value| value.as_str()),
+                Some("project-authenticated")
+            );
+            serde_json::to_writer(&mut writer, &response).unwrap();
+            writer.write_all(b"\n").unwrap();
+        }
+    });
+    let Cli {
+        command: Commands::Node {
+            command: NodeCommands::Attach(args),
+        },
+    } = parse(&[
+        "clusterflux",
+        "node",
+        "attach",
+        "--node",
+        "node-attached",
+        "--enrollment-grant",
+        "enrollment-grant",
+    ])
+    else {
+        panic!("wrong command");
+    };
+
+    let report = execute_node_attach(args, temp.path()).unwrap();
+    server.join().unwrap();
+
+    assert_eq!(report.coordinator, coordinator);
+    assert_eq!(
+        report.plan.coordinator.as_deref(),
+        Some(coordinator.as_str())
+    );
+    assert_eq!(report.tenant, "tenant-authenticated");
+    assert_eq!(report.project, "project-authenticated");
+    assert!(report.boundary.used_enrollment_exchange);
+    let rendered = human_report(&serde_json::to_value(&report).unwrap());
+    assert!(rendered.contains(&format!("coordinator: {coordinator}")));
+    assert!(rendered.contains("tenant: tenant-authenticated"));
+    assert!(rendered.contains("project: project-authenticated"));
+    let credential_file = node::local_node_credential_file(temp.path(), "node-attached");
+    let stored: serde_json::Value =
+        serde_json::from_slice(&fs::read(credential_file).unwrap()).unwrap();
+    assert_eq!(stored["coordinator"], coordinator);
+    assert_eq!(stored["tenant"], "tenant-authenticated");
+    assert_eq!(stored["project"], "project-authenticated");
+}
+
 #[cfg(unix)]
 #[test]
 fn node_attach_refuses_a_symlink_credential_target() {

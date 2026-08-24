@@ -136,7 +136,6 @@ pub(crate) fn record_completed_task(
         registration,
         heartbeat,
         capability_report,
-        task.task_assignment_response,
         debug_command,
         log_event,
         vfs_metadata,
@@ -360,7 +359,6 @@ pub(crate) fn record_cancelled_task(
         registration,
         heartbeat,
         capability_report,
-        task.task_assignment_response.clone(),
         debug_command,
         log_event,
         recorded,
@@ -406,7 +404,6 @@ pub(crate) fn completed_node_report(
     registration_response: Value,
     heartbeat_response: Value,
     capability_response: Value,
-    task_assignment_response: Value,
     debug_command_response: Value,
     log_event_response: Value,
     vfs_metadata_response: Value,
@@ -430,7 +427,6 @@ pub(crate) fn completed_node_report(
         "registration_response": registration_response,
         "heartbeat_response": heartbeat_response,
         "capability_response": capability_response,
-        "task_assignment_response": task_assignment_response,
         "debug_command_response": debug_command_response,
         "log_event_response": log_event_response,
         "vfs_metadata_response": vfs_metadata_response,
@@ -446,7 +442,6 @@ pub(crate) fn cancelled_node_report(
     registration_response: Value,
     heartbeat_response: Value,
     capability_response: Value,
-    task_assignment_response: Value,
     debug_command_response: Value,
     log_event_response: Value,
     coordinator_response: Value,
@@ -469,7 +464,6 @@ pub(crate) fn cancelled_node_report(
         "registration_response": registration_response,
         "heartbeat_response": heartbeat_response,
         "capability_response": capability_response,
-        "task_assignment_response": task_assignment_response,
         "debug_command_response": debug_command_response,
         "log_event_response": log_event_response,
         "vfs_metadata_response": null,
@@ -508,7 +502,6 @@ pub(crate) fn failed_node_report(
         "registration_response": registration_response,
         "heartbeat_response": heartbeat_response,
         "capability_response": capability_response,
-        "task_assignment_response": &task.task_assignment_response,
         "debug_command_response": debug_command_response,
         "log_event_response": log_event_response,
         "vfs_metadata_response": vfs_metadata_response,
@@ -554,12 +547,12 @@ mod tests {
             Value::Null,
             Value::Null,
             Value::Null,
-            Value::Null,
             1,
         );
 
         assert_eq!(report["stdout_bytes"], 519);
         assert_eq!(report["stdout_tail"], "bounded tail");
+        assert!(report.get("task_assignment_response").is_none());
     }
 
     #[test]
@@ -609,6 +602,7 @@ mod tests {
             public_key: None,
             control_poll_ms: 0,
             assignment_poll_ms: 1,
+            coordinator_reconnect_max_seconds: 0,
             task_cpus: 2,
             task_memory_gib: 2,
             task_pids_limit: 256,
@@ -640,7 +634,6 @@ mod tests {
             task_spec: None,
             bundle_digest: None,
             wasm_module_base64: None,
-            task_assignment_response: Value::Null,
             assignment_authority: clusterflux_core::AssignmentAuthority {
                 assignment_id: "report-test-assignment".to_owned(),
                 attempt_id: "report-test-attempt".to_owned(),
@@ -751,6 +744,7 @@ mod tests {
             public_key: None,
             control_poll_ms: 0,
             assignment_poll_ms: 1,
+            coordinator_reconnect_max_seconds: 0,
             task_cpus: 2,
             task_memory_gib: 2,
             task_pids_limit: 256,
@@ -782,7 +776,6 @@ mod tests {
             task_spec: None,
             bundle_digest: None,
             wasm_module_base64: None,
-            task_assignment_response: Value::Null,
             assignment_authority: clusterflux_core::AssignmentAuthority {
                 assignment_id: "multi-report-assignment".to_owned(),
                 attempt_id: "multi-report-attempt".to_owned(),

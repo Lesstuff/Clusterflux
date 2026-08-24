@@ -70,15 +70,12 @@ clusterflux node attach \
   --json
 ~~~
 
-Clusterflux creates and stores the node key locally with restricted permissions.
-The enrollment grant is not needed again. Stop and restart the worker with the
-same stored identity:
+Clusterflux creates and stores the node key and its coordinator, tenant, and
+project scope locally with restricted permissions. The enrollment grant is not
+needed again. Stop and restart the worker with the same stored identity:
 
 ~~~bash
 clusterflux-node \
-  --coordinator https://clusterflux.lesstuff.com \
-  --tenant "$TENANT" \
-  --project-id <hosted-project-id> \
   --node workstation \
   --project-root "$PWD" \
   --worker \

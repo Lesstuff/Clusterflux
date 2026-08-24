@@ -927,7 +927,7 @@ mod tests {
                 WorkflowSourceFile::new(
                     ".clusterflux/Cargo.toml",
                     0o100644,
-                    b"[package]\nname='compiler-test'\nversion='0.0.0'\nedition='2024'\npublish=false\n[lib]\npath='main.rs'\ncrate-type=['cdylib']\n[dependencies]\nclusterflux={package='clusterflux-sdk',version='=0.1.0'}\n[workspace]\nresolver='3'\n"
+                    b"[package]\nname='compiler-test'\nversion='0.0.0'\nedition='2024'\npublish=false\n[lib]\npath='main.rs'\ncrate-type=['cdylib']\n[dependencies]\nclusterflux={package='clusterflux-sdk',version='=0.1.1'}\n[workspace]\nresolver='3'\n"
                         .to_vec(),
                 )
                 .unwrap(),
@@ -1099,6 +1099,7 @@ mod tests {
             public_key: None,
             control_poll_ms: 0,
             assignment_poll_ms: 100,
+            coordinator_reconnect_max_seconds: 0,
             task_cpus: 2,
             task_memory_gib: 2,
             task_pids_limit: 256,
