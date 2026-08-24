@@ -83,6 +83,8 @@ fn authenticated_envelope_derives_user_scope_from_cli_session() {
         project,
         actor,
         authenticated,
+        coordinator_version,
+        workflow_sdk_version,
         ..
     } = service
         .handle_request(CoordinatorRequest::Authenticated {
@@ -97,6 +99,11 @@ fn authenticated_envelope_derives_user_scope_from_cli_session() {
     assert_eq!(project, ProjectId::from("project-a"));
     assert_eq!(actor, UserId::from("user-a"));
     assert!(authenticated);
+    assert_eq!(coordinator_version, env!("CARGO_PKG_VERSION"));
+    assert_eq!(
+        workflow_sdk_version,
+        clusterflux_core::SUPPORTED_WORKFLOW_SDK_VERSION
+    );
 
     let CoordinatorResponse::ProjectCreated { project, actor } = service
         .handle_request(CoordinatorRequest::Authenticated {

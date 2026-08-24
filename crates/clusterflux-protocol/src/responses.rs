@@ -11,6 +11,10 @@ pub enum CoordinatorResponse {
         project: ProjectId,
         actor: UserId,
         authenticated: bool,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        coordinator_version: String,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        workflow_sdk_version: String,
         account_status: String,
         suspended: bool,
         disabled: bool,

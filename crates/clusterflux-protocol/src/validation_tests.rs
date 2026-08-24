@@ -1,5 +1,37 @@
 use super::*;
 
+#[test]
+fn auth_status_from_an_older_coordinator_has_empty_release_capabilities() {
+    let response: CoordinatorResponse = serde_json::from_value(serde_json::json!({
+        "type": "auth_status",
+        "tenant": "tenant",
+        "project": "project",
+        "actor": "user",
+        "authenticated": true,
+        "account_status": "active",
+        "suspended": false,
+        "disabled": false,
+        "deleted": false,
+        "manual_review": false,
+        "sanitized_reason": null,
+        "next_actions": [],
+        "sensitive_moderation_details_exposed": false,
+        "signup_failure_details_exposed": false
+    }))
+    .unwrap();
+
+    let CoordinatorResponse::AuthStatus {
+        coordinator_version,
+        workflow_sdk_version,
+        ..
+    } = response
+    else {
+        panic!("expected auth status");
+    };
+    assert!(coordinator_version.is_empty());
+    assert!(workflow_sdk_version.is_empty());
+}
+
 #[cfg(test)]
 mod external_identifier_tests {
     use super::*;

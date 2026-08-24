@@ -360,6 +360,8 @@ fn coordinator_auth_status_summary(
         deleted,
         manual_review,
         account_status,
+        coordinator_version,
+        workflow_sdk_version,
         sanitized_reason,
         next_actions,
         ..
@@ -380,6 +382,8 @@ fn coordinator_auth_status_summary(
         "reachable": true,
         "source": "public_coordinator_api",
         "used_cli_session_credential": stored_session_for_coordinator(coordinator, stored_session).is_some(),
+        "coordinator_version": coordinator_version,
+        "workflow_sdk_version": workflow_sdk_version,
         "account_status": account_status,
         "suspension_known": true,
         "account_state_known": true,

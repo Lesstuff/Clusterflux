@@ -39,6 +39,9 @@ impl CoordinatorService {
                     project,
                     actor,
                     authenticated: true,
+                    coordinator_version: env!("CARGO_PKG_VERSION").to_owned(),
+                    workflow_sdk_version: clusterflux_core::SUPPORTED_WORKFLOW_SDK_VERSION
+                        .to_owned(),
                     account_status: account_state.account_status,
                     suspended: account_state.suspended,
                     disabled: account_state.disabled,
@@ -625,6 +628,9 @@ impl CoordinatorService {
                     project: context.project,
                     actor,
                     authenticated: true,
+                    coordinator_version: env!("CARGO_PKG_VERSION").to_owned(),
+                    workflow_sdk_version: clusterflux_core::SUPPORTED_WORKFLOW_SDK_VERSION
+                        .to_owned(),
                     account_status: account_state.account_status,
                     suspended: account_state.suspended,
                     disabled: account_state.disabled,
