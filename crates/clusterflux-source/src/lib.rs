@@ -809,12 +809,22 @@ fn workspace_size(root: &Path, limit: u64) -> Result<u64, String> {
     let mut total = 0_u64;
     let mut pending = vec![root.to_path_buf()];
     while let Some(directory) = pending.pop() {
-        for entry in fs::read_dir(&directory)
-            .map_err(|error| format!("inspect Git workspace disk use: {error}"))?
-        {
-            let entry = entry.map_err(|error| format!("inspect Git workspace entry: {error}"))?;
-            let metadata = fs::symlink_metadata(entry.path())
-                .map_err(|error| format!("inspect Git workspace metadata: {error}"))?;
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && directory != root => {
+                continue;
+            }
+            Err(error) => return Err(format!("inspect Git workspace disk use: {error}")),
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(format!("inspect Git workspace entry: {error}")),
+            };
+            let Some(metadata) = workspace_entry_metadata(&entry.path())? else {
+                continue;
+            };
             if metadata.is_dir() {
                 pending.push(entry.path());
             } else if metadata.is_file() {
@@ -826,6 +836,14 @@ fn workspace_size(root: &Path, limit: u64) -> Result<u64, String> {
         }
     }
     Ok(total)
+}
+
+fn workspace_entry_metadata(path: &Path) -> Result<Option<fs::Metadata>, String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("inspect Git workspace metadata: {error}")),
+    }
 }
 
 fn finish_git_output(
@@ -1339,6 +1357,17 @@ mod tests {
 
     fn local_repository_url(path: &Path) -> String {
         format!("{}{}", concat!("file:", "//"), path.display())
+    }
+
+    #[test]
+    fn workspace_disk_scan_ignores_entries_removed_by_git() {
+        let temp = tempfile::tempdir().unwrap();
+        let vanished = temp.path().join("vanished.lock");
+        fs::write(&vanished, "temporary Git state").unwrap();
+        fs::remove_file(&vanished).unwrap();
+
+        assert!(workspace_entry_metadata(&vanished).unwrap().is_none());
+        assert_eq!(workspace_size(temp.path(), 1024).unwrap(), 0);
     }
 
     #[test]
