@@ -3,7 +3,8 @@ use std::collections::{BTreeMap, VecDeque};
 use clusterflux_core::{
     AgentId, AutomatedRunRecord, CommitTrigger, CompiledWorkflowBundle, CredentialKind, Digest,
     NodeId, ProcessId, ProjectId, RepositoryRevision, RunId, SourceProviderKind, TaskInstanceId,
-    TenantId, TriggerContext, TriggerId, UserId, WorkflowCompilationRequest, WorkflowSource,
+    TenantId, TriggerContext, TriggerId, UserId, VfsPath, WorkflowCompilationRequest,
+    WorkflowSource,
 };
 use serde::{Deserialize, Serialize};
 
@@ -137,6 +138,50 @@ pub struct AccountPolicyState {
     pub next_actions: Vec<String>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TenantQuotaOverrideValues {
+    pub max_projects: Option<u64>,
+    pub max_nodes: Option<u64>,
+    pub max_active_processes: Option<u64>,
+}
+
+impl TenantQuotaOverrideValues {
+    pub fn is_empty(&self) -> bool {
+        self.max_projects.is_none()
+            && self.max_nodes.is_none()
+            && self.max_active_processes.is_none()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TenantQuotaOverrideRecord {
+    pub tenant: TenantId,
+    pub values: TenantQuotaOverrideValues,
+    pub updated_at_epoch_seconds: u64,
+    pub operator: UserId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostedAdminAuditRecord {
+    pub sequence: u64,
+    pub tenant: TenantId,
+    pub action: String,
+    pub old_quota_override: Option<TenantQuotaOverrideValues>,
+    pub new_quota_override: Option<TenantQuotaOverrideValues>,
+    pub operator: UserId,
+    pub occurred_at_epoch_seconds: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct HostedAdminDurableState {
+    #[serde(default)]
+    pub tenant_quota_overrides: BTreeMap<TenantId, TenantQuotaOverrideRecord>,
+    #[serde(default)]
+    pub audit: VecDeque<HostedAdminAuditRecord>,
+    #[serde(default)]
+    pub next_audit_sequence: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectPermissionRecord {
     pub tenant: TenantId,
@@ -202,6 +247,89 @@ pub struct ActiveAssignmentRecord {
     pub offered_at: u64,
     pub acknowledged_at: Option<u64>,
     pub lease_expires_at: u64,
+    #[serde(default)]
+    pub terminal_mutations: VecDeque<AssignmentMutationRecord>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum AssignmentMutationResponse {
+    VfsMetadataRecorded {
+        process: ProcessId,
+        task: TaskInstanceId,
+        artifact_path: Option<VfsPath>,
+        large_bytes_uploaded: bool,
+    },
+    TaskRecorded {
+        process: ProcessId,
+        task: TaskInstanceId,
+        events_recorded: usize,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AssignmentMutationRecord {
+    pub process: ProcessId,
+    pub task: TaskInstanceId,
+    pub operation_id: String,
+    pub payload_digest: Digest,
+    pub response: AssignmentMutationResponse,
+}
+
+impl AssignmentMutationResponse {
+    pub(crate) fn from_coordinator_response(
+        response: &clusterflux_protocol::CoordinatorResponse,
+    ) -> Option<Self> {
+        match response {
+            clusterflux_protocol::CoordinatorResponse::VfsMetadataRecorded {
+                process,
+                task,
+                artifact_path,
+                large_bytes_uploaded,
+            } => Some(Self::VfsMetadataRecorded {
+                process: process.clone(),
+                task: task.clone(),
+                artifact_path: artifact_path.clone(),
+                large_bytes_uploaded: *large_bytes_uploaded,
+            }),
+            clusterflux_protocol::CoordinatorResponse::TaskRecorded {
+                process,
+                task,
+                events_recorded,
+            } => Some(Self::TaskRecorded {
+                process: process.clone(),
+                task: task.clone(),
+                events_recorded: *events_recorded,
+            }),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn coordinator_response(&self) -> clusterflux_protocol::CoordinatorResponse {
+        match self {
+            Self::VfsMetadataRecorded {
+                process,
+                task,
+                artifact_path,
+                large_bytes_uploaded,
+            } => clusterflux_protocol::CoordinatorResponse::VfsMetadataRecorded {
+                process: process.clone(),
+                task: task.clone(),
+                artifact_path: artifact_path.clone(),
+                large_bytes_uploaded: *large_bytes_uploaded,
+            },
+            Self::TaskRecorded {
+                process,
+                task,
+                events_recorded,
+            } => clusterflux_protocol::CoordinatorResponse::TaskRecorded {
+                process: process.clone(),
+                task: task.clone(),
+                events_recorded: *events_recorded,
+            },
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -216,6 +344,8 @@ pub struct TerminalAssignmentRecord {
     pub terminal_at: u64,
     #[serde(default)]
     pub replay_allowed: bool,
+    #[serde(default)]
+    pub terminal_mutations: VecDeque<AssignmentMutationRecord>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -340,6 +470,8 @@ pub struct DurableState {
     pub active_assignments: BTreeMap<String, ActiveAssignmentRecord>,
     #[serde(default)]
     pub terminal_assignment_history: VecDeque<TerminalAssignmentRecord>,
+    #[serde(default)]
+    pub hosted_admin: HostedAdminDurableState,
 }
 
 #[cfg(test)]

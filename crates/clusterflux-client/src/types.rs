@@ -91,8 +91,12 @@ pub struct QuotaStatus {
     pub window_seconds: BTreeMap<LimitKind, u64>,
     pub usage: BTreeMap<LimitKind, u64>,
     pub window_started_epoch_seconds: BTreeMap<LimitKind, u64>,
+    pub projects_current: u64,
+    pub projects_maximum: u64,
     pub node_identities_current: u64,
     pub node_identities_maximum: u64,
+    pub active_processes_current: u64,
+    pub active_processes_maximum: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

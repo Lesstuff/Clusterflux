@@ -1,16 +1,22 @@
 # syntax=docker/dockerfile:1
 ARG RUST_IMAGE=docker.io/library/rust@sha256:8322627e69ba7780b54f39e9f4d3758c006a3ae0123ea01d63b91f0626169891
 ARG CLUSTERFLUX_ENVIRONMENT_DIGEST
+ARG CLUSTERFLUX_RUST_RELEASE
+ARG CLUSTERFLUX_WASM_TARGET
 FROM ${RUST_IMAGE} AS builder
-ENV RUSTUP_TOOLCHAIN=1.91.1
+ARG CLUSTERFLUX_RUST_RELEASE
+ARG CLUSTERFLUX_WASM_TARGET
+ENV RUSTUP_TOOLCHAIN=${CLUSTERFLUX_RUST_RELEASE}
 WORKDIR /src
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml Cargo.lock compiler-toolchain.json ./
 COPY crates ./crates
 COPY system-bundles/workflow-compiler/driver ./system-bundles/workflow-compiler/driver
 COPY system-bundles/workflow-compiler/envs ./system-bundles/workflow-compiler/envs
 COPY system-bundles/workflow-compiler/package.js ./system-bundles/workflow-compiler/package.js
-RUN rustup target add wasm32-unknown-unknown \
- && rustc --version | grep -F '1.91.1' \
+RUN rustup target add ${CLUSTERFLUX_WASM_TARGET} \
+ && test "$(rustc --version --verbose | sed -n 's/^release: //p')" = "${CLUSTERFLUX_RUST_RELEASE}" \
+ && rustc --version --verbose | grep -Eq '^host: (x86_64|aarch64)-unknown-linux-gnu$' \
+ && rustc --print target-list | grep -Fx "${CLUSTERFLUX_WASM_TARGET}" \
  && cargo build --locked --release -p clusterflux-system-compiler-driver --target-dir /compiler-driver-target \
  && cargo build --locked --release --target wasm32-unknown-unknown -p clusterflux-sdk \
  && mkdir -p /appliance/sdk/deps /appliance/bin /appliance/rust \
@@ -19,7 +25,7 @@ RUN rustup target add wasm32-unknown-unknown \
  && cp target/wasm32-unknown-unknown/release/deps/libserde-*.rlib /appliance/sdk/libserde.rlib \
  && cp target/wasm32-unknown-unknown/release/deps/* /appliance/sdk/deps/ \
  && cp target/release/deps/*.so /appliance/sdk/deps/ \
- && printf 'format=clusterflux-compiler-sdk-v1\nrust_toolchain=1.91.1\ntarget=wasm32-unknown-unknown\nclusterflux_task_abi=1\nserde_version=1.0.228\nserde_features=derive\n' > /appliance/sdk/MANIFEST \
+ && printf 'format=clusterflux-compiler-sdk-v1\nrust_toolchain=%s\ntarget=%s\nclusterflux_task_abi=1\nserde_version=1.0.228\nserde_features=derive\n' "${CLUSTERFLUX_RUST_RELEASE}" "${CLUSTERFLUX_WASM_TARGET}" > /appliance/sdk/MANIFEST \
  && (cd /appliance/sdk && find . -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS) \
  && cp -a "$(rustc --print sysroot)/." /appliance/rust/ \
  && rust_lld="$(find /appliance/rust/lib/rustlib -path '*/bin/rust-lld' -type f -print -quit)" \

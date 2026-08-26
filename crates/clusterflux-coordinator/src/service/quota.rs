@@ -1,6 +1,16 @@
 use std::collections::BTreeMap;
 
 use clusterflux_core::{LimitError, LimitKind, ProjectId, ResourceLimits, ResourceMeter, TenantId};
+use serde::{Deserialize, Serialize};
+
+use crate::TenantQuotaOverrideValues;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdmissionQuotaLimits {
+    pub max_projects: u64,
+    pub max_nodes: u64,
+    pub max_active_processes: u64,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CoordinatorQuotaConfiguration {
@@ -121,14 +131,18 @@ impl CoordinatorQuota {
 
     pub(super) fn ensure_project_admission(
         &self,
-        tenant: &TenantId,
+        _tenant: &TenantId,
         current: usize,
+        tenant_override: Option<&TenantQuotaOverrideValues>,
     ) -> Result<(), super::CoordinatorServiceError> {
-        let maximum = self.configuration.max_projects_per_tenant;
-        if current >= maximum {
-            return Err(super::CoordinatorServiceError::Protocol(format!(
-                "admission.project_limit: tenant {tenant} already has the maximum of {maximum} projects"
-            )));
+        let maximum = self
+            .effective_admission_limits(tenant_override)
+            .max_projects;
+        if u64::try_from(current).unwrap_or(u64::MAX) >= maximum {
+            return Err(super::CoordinatorServiceError::ProjectQuota {
+                current: u64::try_from(current).unwrap_or(u64::MAX),
+                maximum,
+            });
         }
         Ok(())
     }
@@ -137,33 +151,62 @@ impl CoordinatorQuota {
         &self,
         _tenant: &TenantId,
         current: usize,
+        tenant_override: Option<&TenantQuotaOverrideValues>,
     ) -> Result<(), super::CoordinatorServiceError> {
-        let maximum = self.configuration.max_nodes_per_tenant;
-        if current >= maximum {
+        let maximum = self.effective_admission_limits(tenant_override).max_nodes;
+        if u64::try_from(current).unwrap_or(u64::MAX) >= maximum {
             return Err(super::CoordinatorServiceError::NodeIdentityQuota {
                 current: u64::try_from(current).unwrap_or(u64::MAX),
-                maximum: u64::try_from(maximum).unwrap_or(u64::MAX),
+                maximum,
             });
         }
         Ok(())
     }
 
-    pub(super) fn maximum_node_identities(&self) -> u64 {
-        u64::try_from(self.configuration.max_nodes_per_tenant).unwrap_or(u64::MAX)
-    }
-
     pub(super) fn ensure_process_admission(
         &self,
-        tenant: &TenantId,
+        _tenant: &TenantId,
         current: usize,
+        tenant_override: Option<&TenantQuotaOverrideValues>,
     ) -> Result<(), super::CoordinatorServiceError> {
-        let maximum = self.configuration.max_active_processes_per_tenant;
-        if current >= maximum {
-            return Err(super::CoordinatorServiceError::Protocol(format!(
-                "admission.active_process_limit: tenant {tenant} already has the maximum of {maximum} active processes"
-            )));
+        let maximum = self
+            .effective_admission_limits(tenant_override)
+            .max_active_processes;
+        if u64::try_from(current).unwrap_or(u64::MAX) >= maximum {
+            return Err(super::CoordinatorServiceError::ActiveProcessQuota {
+                current: u64::try_from(current).unwrap_or(u64::MAX),
+                maximum,
+            });
         }
         Ok(())
+    }
+
+    pub fn default_admission_limits(&self) -> AdmissionQuotaLimits {
+        AdmissionQuotaLimits {
+            max_projects: u64::try_from(self.configuration.max_projects_per_tenant)
+                .unwrap_or(u64::MAX),
+            max_nodes: u64::try_from(self.configuration.max_nodes_per_tenant).unwrap_or(u64::MAX),
+            max_active_processes: u64::try_from(self.configuration.max_active_processes_per_tenant)
+                .unwrap_or(u64::MAX),
+        }
+    }
+
+    pub fn effective_admission_limits(
+        &self,
+        tenant_override: Option<&TenantQuotaOverrideValues>,
+    ) -> AdmissionQuotaLimits {
+        let defaults = self.default_admission_limits();
+        AdmissionQuotaLimits {
+            max_projects: tenant_override
+                .and_then(|values| values.max_projects)
+                .unwrap_or(defaults.max_projects),
+            max_nodes: tenant_override
+                .and_then(|values| values.max_nodes)
+                .unwrap_or(defaults.max_nodes),
+            max_active_processes: tenant_override
+                .and_then(|values| values.max_active_processes)
+                .unwrap_or(defaults.max_active_processes),
+        }
     }
 
     fn key(

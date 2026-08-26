@@ -702,6 +702,9 @@ impl CoordinatorService {
             self.quota.ensure_process_admission(
                 &tenant,
                 self.coordinator.active_process_count_for_tenant(&tenant),
+                self.coordinator
+                    .tenant_quota_override(&tenant)
+                    .map(|record| &record.values),
             )?;
         }
         let now_epoch_seconds = self.current_epoch_seconds()?;
@@ -876,6 +879,25 @@ impl CoordinatorService {
         process: String,
         launch_attempt: Option<String>,
     ) -> Result<CoordinatorResponse, CoordinatorServiceError> {
+        self.handle_abort_process_with_reason(
+            tenant,
+            project,
+            actor_user,
+            process,
+            launch_attempt,
+            "virtual process aborted",
+        )
+    }
+
+    pub(super) fn handle_abort_process_with_reason(
+        &mut self,
+        tenant: String,
+        project: String,
+        actor_user: String,
+        process: String,
+        launch_attempt: Option<String>,
+        reason: &str,
+    ) -> Result<CoordinatorResponse, CoordinatorServiceError> {
         let tenant = TenantId::new(tenant);
         let project = ProjectId::new(project);
         let process = ProcessId::new(process);
@@ -910,7 +932,7 @@ impl CoordinatorService {
             .clear_cancellations_for_process(&tenant, &project, &process);
         self.process_registry.request_abort(process_key);
         self.main_runtime
-            .interrupt_process(&tenant, &project, &process, "virtual process aborted");
+            .interrupt_process(&tenant, &project, &process, reason);
         self.main_runtime
             .controls
             .remove(&process_control_key(&tenant, &project, &process));

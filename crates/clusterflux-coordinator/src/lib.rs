@@ -13,24 +13,26 @@ pub mod service;
 mod sessions;
 pub use durable::{
     AcceptedCommitTriggerRecord, AccountPolicyState, ActiveAssignmentRecord, AgentPublicKeyRecord,
-    AssignmentKind, AssignmentState, AutomatedRunStageRecord, AutomationDurableState,
-    CliSessionRecord, CredentialRecord, DurableState, DurableStore, EncryptedProjectSecretRecord,
-    FallibleDurableStore, InMemoryDurableStore, NodeIdentityRecord, NodeScopeKey,
-    ProjectEnvironmentRecord, ProjectPermissionRecord, ProjectRecord, SecretAuditRecord,
-    ServicePolicyRecord, SourceProviderConfigRecord, TenantRecord, TerminalAssignmentRecord,
-    UserRecord,
+    AssignmentKind, AssignmentMutationRecord, AssignmentMutationResponse, AssignmentState,
+    AutomatedRunStageRecord, AutomationDurableState, CliSessionRecord, CredentialRecord,
+    DurableState, DurableStore, EncryptedProjectSecretRecord, FallibleDurableStore,
+    HostedAdminAuditRecord, HostedAdminDurableState, InMemoryDurableStore, NodeIdentityRecord,
+    NodeScopeKey, ProjectEnvironmentRecord, ProjectPermissionRecord, ProjectRecord,
+    SecretAuditRecord, ServicePolicyRecord, SourceProviderConfigRecord, TenantQuotaOverrideRecord,
+    TenantQuotaOverrideValues, TenantRecord, TerminalAssignmentRecord, UserRecord,
 };
 pub use postgres_store::{
     PostgresDurableStore, PostgresStoreError, PostgresTable, POSTGRES_DURABLE_TABLES,
 };
 pub use service::{
-    CoordinatorAdmission, CoordinatorArtifactInterchangeConfiguration,
+    AdmissionQuotaLimits, CoordinatorAdmission, CoordinatorArtifactInterchangeConfiguration,
     CoordinatorMainRuntimeConfiguration, CoordinatorRequest, CoordinatorResponse,
     CoordinatorService, CoordinatorServiceError, CoordinatorServiceStartupConfiguration,
     DebugAcknowledgementState, DebugAuditEvent, DebugParticipantAcknowledgement,
-    SourcePreparationDisposition, SourcePreparationStatus, TaskAssignment, TaskAttemptSnapshot,
-    TaskAttemptState, TaskCancellationTarget, TaskCompletionEvent, TaskExecutor,
-    TaskFailureResolution, TaskTerminalState, MAX_COORDINATOR_MAINS,
+    HostedAccountMutationResult, HostedTenantAdminStatus, SourcePreparationDisposition,
+    SourcePreparationStatus, TaskAssignment, TaskAttemptSnapshot, TaskAttemptState,
+    TaskCancellationTarget, TaskCompletionEvent, TaskExecutor, TaskFailureResolution,
+    TaskTerminalState, MAX_COORDINATOR_MAINS,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -49,6 +51,9 @@ pub struct Coordinator {
     active_processes: BTreeMap<(TenantId, ProjectId, ProcessId), ActiveProcess>,
     coordinator_epoch: u64,
 }
+
+const MAX_TENANT_QUOTA_OVERRIDES: usize = 100_000;
+const MAX_HOSTED_ADMIN_AUDIT_RECORDS: usize = 10_000;
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum CoordinatorError {
@@ -258,6 +263,92 @@ impl Coordinator {
         self.service_policy_record(&tenant, &name)
             .expect("tenant suspension record was just inserted")
             .clone()
+    }
+
+    pub fn resume_tenant(&mut self, tenant: &TenantId) -> bool {
+        self.durable
+            .service_policy_records
+            .remove(&(tenant.clone(), "tenant:suspended".to_owned()))
+            .is_some()
+    }
+
+    pub fn tenant_quota_override(&self, tenant: &TenantId) -> Option<&TenantQuotaOverrideRecord> {
+        self.durable.hosted_admin.tenant_quota_overrides.get(tenant)
+    }
+
+    pub fn replace_tenant_quota_override(
+        &mut self,
+        tenant: TenantId,
+        values: Option<TenantQuotaOverrideValues>,
+        operator: UserId,
+        action: impl Into<String>,
+        occurred_at_epoch_seconds: u64,
+    ) -> Result<HostedAdminAuditRecord, String> {
+        let old_quota_override = self
+            .tenant_quota_override(&tenant)
+            .map(|record| record.values.clone());
+        let values = values.filter(|values| !values.is_empty());
+        if values.is_some()
+            && old_quota_override.is_none()
+            && self.durable.hosted_admin.tenant_quota_overrides.len() >= MAX_TENANT_QUOTA_OVERRIDES
+        {
+            return Err("hosted tenant quota override capacity is full".to_owned());
+        }
+        match values.clone() {
+            Some(values) => {
+                self.upsert_tenant(tenant.clone());
+                self.durable.hosted_admin.tenant_quota_overrides.insert(
+                    tenant.clone(),
+                    TenantQuotaOverrideRecord {
+                        tenant: tenant.clone(),
+                        values,
+                        updated_at_epoch_seconds: occurred_at_epoch_seconds,
+                        operator: operator.clone(),
+                    },
+                );
+            }
+            None => {
+                self.durable
+                    .hosted_admin
+                    .tenant_quota_overrides
+                    .remove(&tenant);
+            }
+        }
+        Ok(self.record_hosted_admin_audit(
+            tenant,
+            action,
+            old_quota_override,
+            values,
+            operator,
+            occurred_at_epoch_seconds,
+        ))
+    }
+
+    pub fn record_hosted_admin_audit(
+        &mut self,
+        tenant: TenantId,
+        action: impl Into<String>,
+        old_quota_override: Option<TenantQuotaOverrideValues>,
+        new_quota_override: Option<TenantQuotaOverrideValues>,
+        operator: UserId,
+        occurred_at_epoch_seconds: u64,
+    ) -> HostedAdminAuditRecord {
+        let sequence = self.durable.hosted_admin.next_audit_sequence;
+        self.durable.hosted_admin.next_audit_sequence = sequence.saturating_add(1);
+        let record = HostedAdminAuditRecord {
+            sequence,
+            tenant,
+            action: action.into(),
+            old_quota_override,
+            new_quota_override,
+            operator,
+            occurred_at_epoch_seconds,
+        };
+        while self.durable.hosted_admin.audit.len() >= MAX_HOSTED_ADMIN_AUDIT_RECORDS {
+            self.durable.hosted_admin.audit.pop_front();
+        }
+        self.durable.hosted_admin.audit.push_back(record.clone());
+        record
     }
 
     pub fn tenant_suspended(&self, tenant: &TenantId) -> bool {
@@ -595,6 +686,17 @@ impl Coordinator {
             .values()
             .filter(|process| &process.tenant == tenant)
             .count()
+    }
+
+    pub fn active_process_scopes_for_tenant(
+        &self,
+        tenant: &TenantId,
+    ) -> Vec<(ProjectId, ProcessId)> {
+        self.active_processes
+            .values()
+            .filter(|process| &process.tenant == tenant)
+            .map(|process| (process.project.clone(), process.id.clone()))
+            .collect()
     }
 
     pub fn tenant_count(&self) -> usize {
@@ -1141,6 +1243,86 @@ mod tests {
             .next_actions
             .iter()
             .any(|action| action.contains("hosted operator")));
+    }
+
+    #[test]
+    fn hosted_account_and_quota_policy_survive_restart_and_resume_is_reversible() {
+        let mut store = InMemoryDurableStore::default();
+        let tenant = TenantId::from("tenant");
+        let operator = UserId::from("hosted-admin");
+        let mut first = Coordinator::boot(&store, 1);
+        first.upsert_project(tenant.clone(), ProjectId::from("project"), "Project");
+        first.issue_cli_session(
+            tenant.clone(),
+            ProjectId::from("project"),
+            UserId::from("user"),
+            "session-secret",
+            None,
+        );
+        first
+            .replace_tenant_quota_override(
+                tenant.clone(),
+                Some(TenantQuotaOverrideValues {
+                    max_projects: Some(1_000),
+                    max_nodes: Some(32),
+                    max_active_processes: Some(8),
+                }),
+                operator.clone(),
+                "quota_set",
+                10,
+            )
+            .unwrap();
+        first.suspend_tenant(tenant.clone(), operator.clone());
+        assert_eq!(first.revoke_cli_sessions_for_tenant(&tenant), 1);
+        first.record_hosted_admin_audit(
+            tenant.clone(),
+            "account_suspend",
+            None,
+            None,
+            operator.clone(),
+            11,
+        );
+        first.persist(&mut store);
+
+        let mut restarted = Coordinator::boot(&store, 2);
+        assert!(restarted.tenant_suspended(&tenant));
+        assert_eq!(
+            restarted
+                .tenant_quota_override(&tenant)
+                .unwrap()
+                .values
+                .max_projects,
+            Some(1_000)
+        );
+        assert!(restarted
+            .authenticate_cli_session_for_status("session-secret")
+            .unwrap_err()
+            .to_string()
+            .contains("revoked"));
+        assert_eq!(restarted.durable.hosted_admin.audit.len(), 2);
+
+        assert!(restarted.resume_tenant(&tenant));
+        assert!(!restarted.resume_tenant(&tenant));
+        restarted.record_hosted_admin_audit(
+            tenant.clone(),
+            "account_resume",
+            None,
+            None,
+            operator,
+            12,
+        );
+        restarted.persist(&mut store);
+        let resumed = Coordinator::boot(&store, 3);
+        assert_eq!(
+            resumed.account_policy_state(&tenant).account_status,
+            "active"
+        );
+        assert!(resumed
+            .authenticate_cli_session_for_status("session-secret")
+            .unwrap_err()
+            .to_string()
+            .contains("revoked"));
+        assert!(resumed.project(&ProjectId::from("project")).is_some());
     }
 
     #[test]

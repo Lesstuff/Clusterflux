@@ -202,6 +202,9 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
     let worker_shutdown = CancellationToken::new();
 
     let compiler_profile = if args.no_workflow_compilation {
+        eprintln!(
+            "Automatic workflow compilation disabled by --no-workflow-compilation; compiler image inspection and import were skipped."
+        );
         None
     } else {
         match crate::system_compiler::self_check(&mut args) {
@@ -685,6 +688,11 @@ async fn worker_loop(
                     "process": &runtime_task.process,
                     "virtual_thread": &runtime_task.task,
                     "task_spec": &runtime_task.task_spec,
+                    "assignment_authority": {
+                        "assignment_id": &assignment_id,
+                        "attempt_id": &attempt_id,
+                        "offer_epoch": lease_epoch,
+                    },
                     "required_artifact_count": required_artifact_count,
                     "locally_ready_artifact_count": locally_ready_artifact_count,
                 }))?

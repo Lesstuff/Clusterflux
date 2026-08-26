@@ -2,8 +2,8 @@ use std::path::{Path, PathBuf};
 
 use clusterflux_core::{
     generate_ed25519_private_key, node_ed25519_public_key_from_private_key,
-    sign_node_assignment_request, sign_node_request, signed_request_payload_digest,
-    AssignmentAuthority, NodeId,
+    sign_node_assignment_operation_request, sign_node_assignment_request, sign_node_request,
+    signed_request_payload_digest, AssignmentAuthority, NodeAssignmentOperation, NodeId,
 };
 use clusterflux_protocol::{CoordinatorRequest, CoordinatorResponse};
 use serde::{Deserialize, Serialize};
@@ -397,6 +397,35 @@ pub(crate) fn signed_node_assignment_request(
         node_nonce(request_kind),
         unix_timestamp_seconds(),
         authority.clone(),
+    )
+    .map_err(invalid_key_error)?;
+    Ok(CoordinatorRequest::SignedNode {
+        node: args.node.clone(),
+        node_signature,
+        request: Box::new(request),
+    })
+}
+
+pub(crate) fn signed_node_assignment_operation_request(
+    args: &Args,
+    node_private_key: &str,
+    authority: &AssignmentAuthority,
+    request_kind: &str,
+    operation_id: &str,
+    request: CoordinatorRequest,
+) -> Result<CoordinatorRequest, Box<dyn std::error::Error>> {
+    let payload_digest = signed_request_payload_digest(&serde_json::to_value(&request)?);
+    let node_signature = sign_node_assignment_operation_request(
+        node_private_key,
+        &NodeId::from(args.node.as_str()),
+        request_kind,
+        &payload_digest,
+        node_nonce(request_kind),
+        unix_timestamp_seconds(),
+        NodeAssignmentOperation {
+            assignment_authority: authority.clone(),
+            operation_id: operation_id.to_owned(),
+        },
     )
     .map_err(invalid_key_error)?;
     Ok(CoordinatorRequest::SignedNode {

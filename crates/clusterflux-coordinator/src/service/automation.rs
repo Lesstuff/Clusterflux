@@ -168,6 +168,19 @@ impl CoordinatorService {
             .collect()
     }
 
+    pub fn automated_run_scope(&self, run_id: &RunId) -> Option<(TenantId, ProjectId)> {
+        let record = self
+            .coordinator
+            .durable_state()
+            .automated_runs
+            .get(run_id)?;
+        self.coordinator
+            .durable_state()
+            .accepted_commit_triggers
+            .get(&record.run.primary_trigger_id)
+            .map(|trigger| (trigger.tenant.clone(), trigger.project.clone()))
+    }
+
     pub fn fail_automated_run_stage(
         &mut self,
         run_id: &RunId,
@@ -732,6 +745,7 @@ impl CoordinatorService {
                             && request.compiler_image == release_manifest.environment_digest
                             && request.compiler_sdk == release_manifest.sdk_digest
                             && request.rust_toolchain == release_manifest.rust_toolchain
+                            && system_bundle.rust_toolchain == request.rust_toolchain
                             && request.source.total_bytes() <= system_bundle.max_source_bytes
                             && request.resource_policy.max_output_bytes
                                 <= system_bundle.max_output_bytes

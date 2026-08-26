@@ -1,4 +1,4 @@
-use clusterflux_core::{TaskBoundaryValue, TaskInstanceId, VfsManifest};
+use clusterflux_core::{AssignmentAuthority, TaskBoundaryValue, TaskInstanceId, VfsManifest};
 use clusterflux_node::CommandOutput;
 use clusterflux_protocol::{CoordinatorRequest, CoordinatorResponse, TaskTerminalState};
 use serde_json::{json, Value};
@@ -7,8 +7,10 @@ use std::time::Duration;
 use crate::assignment_runner::NativeCommandLogSnapshot;
 use crate::daemon::RuntimeTask;
 use crate::{
-    coordinator_session::CoordinatorSession, daemon::Args,
-    node_identity::signed_node_assignment_request, task_artifacts::RetainedArtifact,
+    coordinator_session::CoordinatorSession,
+    daemon::Args,
+    node_identity::{signed_node_assignment_operation_request, signed_node_assignment_request},
+    task_artifacts::RetainedArtifact,
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -70,7 +72,8 @@ pub(crate) fn record_completed_task(
     }
     let mut vfs_metadata = Vec::with_capacity(metadata.len());
     for (path, digest, size_bytes) in metadata {
-        let response = session.request(signed_node_assignment_request(
+        let response = request_terminal_mutation(
+            session,
             args,
             node_private_key,
             &task.assignment_authority,
@@ -86,7 +89,7 @@ pub(crate) fn record_completed_task(
                 artifact_size_bytes: size_bytes,
                 large_bytes_uploaded: manifest.large_bytes_uploaded,
             },
-        )?)?;
+        )?;
         match response {
             response @ CoordinatorResponse::VfsMetadataRecorded { .. } => {
                 vfs_metadata.push(serde_json::to_value(response)?);
@@ -101,7 +104,8 @@ pub(crate) fn record_completed_task(
     } else {
         Value::Array(vfs_metadata)
     };
-    let recorded = session.request(signed_node_assignment_request(
+    let recorded = request_terminal_mutation(
+        session,
         args,
         node_private_key,
         &task.assignment_authority,
@@ -125,7 +129,7 @@ pub(crate) fn record_completed_task(
             artifact_size_bytes,
             result,
         },
-    )?)?;
+    )?;
     let recorded = match recorded {
         response @ CoordinatorResponse::TaskRecorded { .. } => serde_json::to_value(response)?,
         _ => return Err("coordinator returned an unexpected task-completion response".into()),
@@ -176,7 +180,8 @@ pub(crate) fn record_failed_task(
         report_final_log_best_effort(args, task, node_private_key, &output);
     output.stdout_truncated |= final_log_failed;
     output.stderr_truncated |= final_log_failed;
-    let vfs_metadata = session.request(signed_node_assignment_request(
+    let vfs_metadata = request_terminal_mutation(
+        session,
         args,
         node_private_key,
         &task.assignment_authority,
@@ -192,14 +197,15 @@ pub(crate) fn record_failed_task(
             artifact_size_bytes: None,
             large_bytes_uploaded: false,
         },
-    )?)?;
+    )?;
     let vfs_metadata = match vfs_metadata {
         response @ CoordinatorResponse::VfsMetadataRecorded { .. } => {
             serde_json::to_value(response)?
         }
         _ => return Err("coordinator returned an unexpected VFS metadata response".into()),
     };
-    let recorded = session.request(signed_node_assignment_request(
+    let recorded = request_terminal_mutation(
+        session,
         args,
         node_private_key,
         &task.assignment_authority,
@@ -223,7 +229,7 @@ pub(crate) fn record_failed_task(
             artifact_size_bytes: None,
             result: None,
         },
-    )?)?;
+    )?;
     let recorded = match recorded {
         response @ CoordinatorResponse::TaskRecorded { .. } => serde_json::to_value(response)?,
         _ => return Err("coordinator returned an unexpected task-completion response".into()),
@@ -324,7 +330,8 @@ pub(crate) fn record_cancelled_task(
         report_final_log_best_effort(args, task, node_private_key, &command_output);
     output.stdout_truncated |= final_log_failed;
     output.stderr_truncated |= final_log_failed;
-    let recorded = session.request(signed_node_assignment_request(
+    let recorded = request_terminal_mutation(
+        session,
         args,
         node_private_key,
         &task.assignment_authority,
@@ -348,7 +355,7 @@ pub(crate) fn record_cancelled_task(
             artifact_size_bytes: None,
             result: None,
         },
-    )?)?;
+    )?;
     let recorded = match recorded {
         response @ CoordinatorResponse::TaskRecorded { .. } => serde_json::to_value(response)?,
         _ => return Err("coordinator returned an unexpected task-completion response".into()),
@@ -364,6 +371,27 @@ pub(crate) fn record_cancelled_task(
         recorded,
         session.requests(),
     ))
+}
+
+fn request_terminal_mutation(
+    session: &mut CoordinatorSession,
+    args: &Args,
+    node_private_key: &str,
+    authority: &AssignmentAuthority,
+    request_kind: &str,
+    request: CoordinatorRequest,
+) -> Result<CoordinatorResponse, Box<dyn std::error::Error>> {
+    let operation_id = clusterflux_core::generate_opaque_token("node_operation")?;
+    session.request_with(|| {
+        signed_node_assignment_operation_request(
+            args,
+            node_private_key,
+            authority,
+            request_kind,
+            &operation_id,
+            request.clone(),
+        )
+    })
 }
 
 fn bounded_runtime_error(error: &str) -> String {

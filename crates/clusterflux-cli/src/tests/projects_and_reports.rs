@@ -744,7 +744,7 @@ fn quota_status_queries_public_coordinator_usage() {
             } else if line.contains("\"type\":\"quota_status\"") {
                 stream
                     .write_all(
-                        br#"{"type":"quota_status","tenant":"tenant-live","project":"project-live","actor":"user","policy_label":"community tier","limits":{"limits":{"Spawn":64}},"window_seconds":{"Spawn":60},"usage":{"Spawn":2},"window_started_epoch_seconds":{"Spawn":120},"node_identities_current":2,"node_identities_maximum":4}"#,
+                        br#"{"type":"quota_status","tenant":"tenant-live","project":"project-live","actor":"user","policy_label":"community tier","limits":{"limits":{"Spawn":64}},"window_seconds":{"Spawn":60},"usage":{"Spawn":2},"window_started_epoch_seconds":{"Spawn":120},"projects_current":1,"projects_maximum":1,"node_identities_current":2,"node_identities_maximum":4,"active_processes_current":0,"active_processes_maximum":1}"#,
                     )
                     .unwrap();
                 stream.write_all(b"\n").unwrap();
@@ -786,10 +786,12 @@ fn quota_status_queries_public_coordinator_usage() {
     assert_eq!(status["current_usage"]["online_nodes"], 1);
     assert_eq!(status["current_usage"]["observed_task_events"], 2);
     assert_eq!(status["current_usage"]["scoped_resource_usage"]["Spawn"], 2);
+    assert_eq!(status["current_usage"]["projects"], 1);
     assert_eq!(status["current_usage"]["node_identities"], 2);
+    assert_eq!(status["current_usage"]["active_processes"], 0);
     assert_eq!(
         status["limits"],
-        json!({ "Spawn": 64, "node_identities": 4 })
+        json!({ "Spawn": 64, "projects": 1, "node_identities": 4, "active_processes": 1 })
     );
     assert_eq!(status["window_seconds"]["Spawn"], 60);
     assert_eq!(status["quota_configuration_source"], "coordinator");

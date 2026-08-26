@@ -3,17 +3,18 @@ use crate::{
 };
 
 pub(super) enum RuntimeDurableStore {
-    InMemory(InMemoryDurableStore),
-    Postgres(PostgresDurableStore),
+    InMemory(Box<InMemoryDurableStore>),
+    Postgres(Box<PostgresDurableStore>),
 }
 
 impl RuntimeDurableStore {
     pub(super) fn from_database_url(database_url: Option<&str>) -> Result<Self, String> {
         match database_url.map(str::trim).filter(|url| !url.is_empty()) {
             Some(url) => PostgresDurableStore::connect(url)
+                .map(Box::new)
                 .map(Self::Postgres)
                 .map_err(|error| error.to_string()),
-            None => Ok(Self::InMemory(InMemoryDurableStore::default())),
+            None => Ok(Self::InMemory(Box::default())),
         }
     }
 

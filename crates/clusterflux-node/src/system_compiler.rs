@@ -1,7 +1,8 @@
 //! Release-owned workflow compilation as an ordinary node system task.
 
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek};
+use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -346,6 +347,7 @@ pub(crate) fn self_check(args: &mut Args) -> Result<SystemBundleCapability, Stri
         bundle_digest: manifest.bundle_digest,
         sdk_abi_version: manifest.sdk_abi_version,
         wasm_target: manifest.wasm_target,
+        rust_toolchain: manifest.rust_toolchain,
         environment_digest: manifest.environment_digest,
         sandbox,
         max_source_bytes: manifest.max_source_bytes,
@@ -355,16 +357,33 @@ pub(crate) fn self_check(args: &mut Args) -> Result<SystemBundleCapability, Stri
 }
 
 fn materialize_packaged_compiler_image(args: &mut Args) -> Result<(), String> {
-    if let Some(configured_image) = args.system_compiler_image.as_deref() {
-        if let Ok(package) = installed_system_compiler_package() {
-            if configured_image == package.image_reference {
-                args.system_compiler_package_verified = true;
-                args.system_compiler_package_dir = Some(package.share_dir);
-            }
-        }
+    let package = match installed_system_compiler_package(false) {
+        Ok(package) => package,
+        Err(_) if args.system_compiler_image.is_some() => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if args
+        .system_compiler_image
+        .as_deref()
+        .is_some_and(|configured| configured != package.image_reference)
+    {
         return Ok(());
     }
-    let package = installed_system_compiler_package()?;
+    let _import_lock = CompilerImageImportLock::acquire(&package.image_digest)?;
+    if packaged_compiler_image_matches(
+        compiler_image_identity(args, &package.image_reference)?.as_ref(),
+        &package,
+    ) {
+        eprintln!(
+            "Automatic workflow compiler image already present: {} ({})",
+            package.image_reference, package.environment_digest
+        );
+        args.system_compiler_image = Some(package.image_reference);
+        args.system_compiler_package_verified = true;
+        args.system_compiler_package_dir = Some(package.share_dir);
+        return Ok(());
+    }
+    let package = installed_system_compiler_package(true)?;
     let loaded = Command::new(&args.system_compiler_podman)
         .args(["load", "--input"])
         .arg(&package.archive)
@@ -376,36 +395,24 @@ fn materialize_packaged_compiler_image(args: &mut Args) -> Result<(), String> {
             String::from_utf8_lossy(&loaded.stderr).trim()
         ));
     }
-    let image_id = Command::new(&args.system_compiler_podman)
-        .args([
-            "image",
-            "inspect",
-            "--format",
-            "{{.Id}}",
-            &package.image_reference,
-        ])
-        .output()
-        .map_err(|error| format!("inspect packaged compiler environment: {error}"))?;
-    if !image_id.status.success() {
-        return Err("packaged compiler environment did not load its release tag".to_owned());
-    }
-    let image_id = String::from_utf8_lossy(&image_id.stdout).trim().to_owned();
-    let image_id = if image_id.starts_with("sha256:") {
-        image_id
-    } else {
-        format!("sha256:{image_id}")
+    let Some(identity) = compiler_image_identity(args, &package.image_reference)? else {
+        return Err("packaged compiler environment did not load its release identity".to_owned());
     };
-    let loaded_digest = Digest::from_sha256_hex(
-        image_id
-            .strip_prefix("sha256:")
-            .ok_or("packaged compiler environment returned an invalid image id")?,
-    )?;
-    if loaded_digest != package.image_digest {
+    if identity.image_digest != package.image_digest
+        || identity.environment_digest != package.environment_digest
+    {
         return Err(format!(
-            "loaded compiler image digest {loaded_digest} does not match packaged digest {}",
-            package.image_digest
+            "imported compiler image identity mismatch: expected {} / {}, got {} / {}",
+            package.image_digest,
+            package.environment_digest,
+            identity.image_digest,
+            identity.environment_digest,
         ));
     }
+    eprintln!(
+        "Automatic workflow compiler image imported: {} ({})",
+        package.image_reference, package.environment_digest
+    );
     args.system_compiler_image = Some(package.image_reference);
     args.system_compiler_package_verified = true;
     args.system_compiler_package_dir = Some(package.share_dir);
@@ -413,6 +420,7 @@ fn materialize_packaged_compiler_image(args: &mut Args) -> Result<(), String> {
 }
 
 fn installed_system_compiler_package(
+    verify_archive: bool,
 ) -> Result<clusterflux_node::system_package::VerifiedSystemCompilerPackage, String> {
     let executable = std::env::current_exe()
         .map_err(|error| format!("locate clusterflux-node executable: {error}"))?;
@@ -421,13 +429,131 @@ fn installed_system_compiler_package(
         .and_then(Path::parent)
         .ok_or("clusterflux-node executable has no install root")?;
     let share_dir = install_root.join("share").join("clusterflux");
-    clusterflux_node::system_package::verify_system_compiler_package(&share_dir)
+    let package = if verify_archive {
+        clusterflux_node::system_package::verify_system_compiler_package(&share_dir)
+    } else {
+        clusterflux_node::system_package::inspect_system_compiler_package(&share_dir)
+    };
+    package
         .map_err(|error| {
             format!(
                 "installed compiler package at {} is unavailable: {error}; reinstall clusterflux-node or provide --system-compiler-image",
                 share_dir.display()
             )
         })
+}
+
+struct CompilerImageIdentity {
+    image_digest: Digest,
+    environment_digest: Digest,
+}
+
+fn packaged_compiler_image_matches(
+    identity: Option<&CompilerImageIdentity>,
+    package: &clusterflux_node::system_package::VerifiedSystemCompilerPackage,
+) -> bool {
+    identity.is_some_and(|identity| {
+        identity.image_digest == package.image_digest
+            && identity.environment_digest == package.environment_digest
+    })
+}
+
+fn compiler_image_identity(
+    args: &Args,
+    image: &str,
+) -> Result<Option<CompilerImageIdentity>, String> {
+    let exists = Command::new(&args.system_compiler_podman)
+        .args(["image", "exists", image])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|error| format!("inspect packaged compiler image presence: {error}"))?;
+    if !exists.success() {
+        if exists.code() == Some(1) {
+            return Ok(None);
+        }
+        return Err(format!(
+            "inspect packaged compiler image presence failed with status {:?}",
+            exists.code()
+        ));
+    }
+    let inspected = Command::new(&args.system_compiler_podman)
+        .args([
+            "image",
+            "inspect",
+            "--format",
+            "{{.Id}}\n{{ index .Config.Labels \"org.clusterflux.environment-digest\" }}",
+            image,
+        ])
+        .output()
+        .map_err(|error| format!("inspect packaged compiler image identity: {error}"))?;
+    if !inspected.status.success() {
+        return Err(format!(
+            "inspect packaged compiler image identity failed: {}",
+            String::from_utf8_lossy(&inspected.stderr).trim()
+        ));
+    }
+    let output = String::from_utf8_lossy(&inspected.stdout);
+    let mut lines = output.lines();
+    let image_id = lines.next().unwrap_or_default().trim();
+    let image_id = image_id.strip_prefix("sha256:").unwrap_or(image_id);
+    let image_digest = Digest::from_sha256_hex(image_id)
+        .map_err(|error| format!("inspect packaged compiler image digest: {error}"))?;
+    let environment = lines.next().unwrap_or_default().trim();
+    let environment_digest = Digest::from_sha256_hex(
+        environment
+            .strip_prefix("sha256:")
+            .ok_or("inspect packaged compiler environment digest omitted sha256 prefix")?,
+    )
+    .map_err(|error| format!("inspect packaged compiler environment digest: {error}"))?;
+    Ok(Some(CompilerImageIdentity {
+        image_digest,
+        environment_digest,
+    }))
+}
+
+struct CompilerImageImportLock(fs::File);
+
+impl CompilerImageImportLock {
+    fn acquire(image_digest: &Digest) -> Result<Self, String> {
+        let directory = std::env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+            .join("clusterflux");
+        Self::acquire_in(&directory, image_digest)
+    }
+
+    fn acquire_in(directory: &Path, image_digest: &Digest) -> Result<Self, String> {
+        fs::create_dir_all(directory)
+            .map_err(|error| format!("create compiler image import lock directory: {error}"))?;
+        let lock_name = format!(
+            "compiler-image-{}.lock",
+            image_digest.as_str().trim_start_matches("sha256:")
+        );
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(directory.join(lock_name))
+            .map_err(|error| format!("open compiler image import lock: {error}"))?;
+        let status = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        if status != 0 {
+            return Err(format!(
+                "acquire compiler image import lock: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(Self(file))
+    }
+}
+
+impl Drop for CompilerImageImportLock {
+    fn drop(&mut self) {
+        unsafe {
+            libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
 }
 
 fn runsc_version_matches(expected: &str, version: &str, resolved_path: &Path) -> bool {
@@ -1046,6 +1172,64 @@ mod tests {
             .windows(2)
             .any(|pair| pair == ["--network", "none"]));
         assert!(rendered.contains("--read-only"));
+    }
+
+    #[test]
+    fn compiler_image_decision_imports_absent_or_mismatched_and_skips_exact_identity() {
+        let image_digest = Digest::sha256("image");
+        let environment_digest = Digest::sha256("environment");
+        let package = clusterflux_node::system_package::VerifiedSystemCompilerPackage {
+            share_dir: PathBuf::from("/package"),
+            archive: PathBuf::from("/package/image.oci.tar"),
+            image_reference: image_digest.to_string(),
+            image_digest: image_digest.clone(),
+            environment_digest: environment_digest.clone(),
+            archive_digest: Digest::sha256("archive"),
+        };
+        assert!(!packaged_compiler_image_matches(None, &package));
+        assert!(!packaged_compiler_image_matches(
+            Some(&CompilerImageIdentity {
+                image_digest: Digest::sha256("wrong"),
+                environment_digest: environment_digest.clone(),
+            }),
+            &package,
+        ));
+        assert!(!packaged_compiler_image_matches(
+            Some(&CompilerImageIdentity {
+                image_digest: image_digest.clone(),
+                environment_digest: Digest::sha256("wrong-environment"),
+            }),
+            &package,
+        ));
+        assert!(packaged_compiler_image_matches(
+            Some(&CompilerImageIdentity {
+                image_digest,
+                environment_digest,
+            }),
+            &package,
+        ));
+    }
+
+    #[test]
+    fn compiler_image_import_lock_serializes_concurrent_startup() {
+        let directory = tempfile::tempdir().unwrap();
+        let digest = Digest::sha256("image");
+        let first = CompilerImageImportLock::acquire_in(directory.path(), &digest).unwrap();
+        let path = directory.path().to_owned();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            sender.send("waiting").unwrap();
+            let _second = CompilerImageImportLock::acquire_in(&path, &digest).unwrap();
+            sender.send("acquired").unwrap();
+        });
+        assert_eq!(receiver.recv().unwrap(), "waiting");
+        assert!(receiver.recv_timeout(Duration::from_millis(50)).is_err());
+        drop(first);
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(1)).unwrap(),
+            "acquired"
+        );
+        thread.join().unwrap();
     }
 
     #[test]

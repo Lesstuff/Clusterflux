@@ -11,7 +11,8 @@ pub const WORKFLOW_COMPILER_SYSTEM_TASK_NAME: &str = "clusterflux.system.compile
 /// Release-owned Wasm bytes shared by coordinator and node distributions.
 pub static WORKFLOW_COMPILER_SYSTEM_BUNDLE_BYTES: &[u8] =
     include_bytes!("../assets/workflow-compiler-system-bundle.wasm");
-pub const WORKFLOW_COMPILER_RUST_TOOLCHAIN: &str = "1.91.1";
+pub const WORKFLOW_COMPILER_RUST_TOOLCHAIN: &str = env!("CLUSTERFLUX_COMPILER_RUST_RELEASE");
+pub const WORKFLOW_COMPILER_WASM_TARGET: &str = env!("CLUSTERFLUX_COMPILER_WASM_TARGET");
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SystemCompilerBundleManifest {
@@ -51,7 +52,7 @@ pub fn workflow_compiler_system_manifest() -> SystemCompilerBundleManifest {
         ]),
         rust_toolchain: WORKFLOW_COMPILER_RUST_TOOLCHAIN.to_owned(),
         sdk_abi_version: WASM_TASK_ABI_VERSION,
-        wasm_target: "wasm32-unknown-unknown".to_owned(),
+        wasm_target: WORKFLOW_COMPILER_WASM_TARGET.to_owned(),
         supported_os: std::env::consts::OS.to_owned(),
         supported_arch: std::env::consts::ARCH.to_owned(),
         max_source_bytes: MAX_WORKFLOW_SOURCE_BYTES,

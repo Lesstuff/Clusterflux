@@ -8,18 +8,19 @@ use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use clusterflux_core::{
     admin_request_proof, agent_ed25519_public_key_from_private_key,
     derive_ed25519_private_key_from_seed, node_ed25519_public_key_from_private_key,
-    sign_agent_workflow_request, sign_node_assignment_request, sign_node_request,
-    signed_request_payload_digest, AgentSignedRequest, AgentWorkflowScope, ArtifactFlush,
-    ArtifactHandle, ArtifactId, ArtifactTransferState, AssignmentAuthority, Capability,
-    ClusterfluxPathKind, Digest, EnvironmentBackend, EnvironmentRequirements,
-    IrohEndpointAdvertisement, LimitKind, NodeCapabilities, NodeSignedRequest, Os, PanelState,
-    ResourceLimits, SourceProviderKind, TaskBoundaryValue, TaskDefinitionId, TaskDispatch,
-    TaskInstanceId, TaskJoinState, TaskSpec, VfsPath, WasmExportAbi, WasmTaskResult,
+    sign_agent_workflow_request, sign_node_assignment_operation_request,
+    sign_node_assignment_request, sign_node_request, signed_request_payload_digest,
+    AgentSignedRequest, AgentWorkflowScope, ArtifactFlush, ArtifactHandle, ArtifactId,
+    ArtifactTransferState, AssignmentAuthority, Capability, ClusterfluxPathKind, Digest,
+    EnvironmentBackend, EnvironmentRequirements, IrohEndpointAdvertisement, LimitKind,
+    NodeAssignmentOperation, NodeCapabilities, NodeSignedRequest, Os, PanelState, ResourceLimits,
+    SourceProviderKind, TaskBoundaryValue, TaskDefinitionId, TaskDispatch, TaskInstanceId,
+    TaskJoinState, TaskSpec, VfsPath, WasmExportAbi, WasmTaskResult,
 };
 use clusterflux_protocol::coordinator_wire_request;
 use serde_json::json;
 
-use crate::{AssignmentKind, AssignmentState, FallibleDurableStore};
+use crate::{AssignmentKind, AssignmentState, FallibleDurableStore, TenantQuotaOverrideValues};
 
 use super::keys::{process_control_key, task_control_key};
 use super::*;
@@ -552,6 +553,7 @@ fn register_test_task_assignment(
                 offered_at: 0,
                 acknowledged_at: Some(0),
                 lease_expires_at: u64::MAX,
+                terminal_mutations: Default::default(),
             },
         );
     service
@@ -677,6 +679,7 @@ fn service_with_completed_main_and_final_child(
                 offered_at: 0,
                 acknowledged_at: Some(0),
                 lease_expires_at: u64::MAX,
+                terminal_mutations: Default::default(),
             },
         );
     service
@@ -987,17 +990,38 @@ fn signed_node_request_auto_with_private_key_and_authority(
         .to_string();
     let nonce = format!("node-request-{nonce}");
     let issued_at_epoch_seconds = unix_timestamp_seconds_for_tests();
+    let operation_id = matches!(
+        &request,
+        CoordinatorRequest::ReportVfsMetadata { .. } | CoordinatorRequest::TaskCompleted { .. }
+    )
+    .then(|| format!("test-operation-{nonce}"));
     let node_signature = if let Some(authority) = assignment_authority {
-        sign_node_assignment_request(
-            private_key,
-            &NodeId::from(node.as_str()),
-            request_kind,
-            &payload_digest,
-            nonce,
-            issued_at_epoch_seconds,
-            authority,
-        )
-        .unwrap()
+        if let Some(operation_id) = operation_id {
+            sign_node_assignment_operation_request(
+                private_key,
+                &NodeId::from(node.as_str()),
+                request_kind,
+                &payload_digest,
+                nonce,
+                issued_at_epoch_seconds,
+                NodeAssignmentOperation {
+                    assignment_authority: authority,
+                    operation_id,
+                },
+            )
+            .unwrap()
+        } else {
+            sign_node_assignment_request(
+                private_key,
+                &NodeId::from(node.as_str()),
+                request_kind,
+                &payload_digest,
+                nonce,
+                issued_at_epoch_seconds,
+                authority,
+            )
+            .unwrap()
+        }
     } else {
         signed_node_request_with_private_key(
             &node,
@@ -1009,6 +1033,35 @@ fn signed_node_request_auto_with_private_key_and_authority(
     };
     CoordinatorRequest::SignedNode {
         node: node.clone(),
+        node_signature,
+        request: Box::new(request),
+    }
+}
+
+fn signed_assignment_operation_for_test(
+    request: CoordinatorRequest,
+    node: &str,
+    request_kind: &str,
+    authority: AssignmentAuthority,
+    operation_id: &str,
+) -> CoordinatorRequest {
+    let payload_digest = signed_request_payload_digest(&serde_json::to_value(&request).unwrap());
+    let nonce = TEST_NODE_REQUEST_NONCE.fetch_add(1, Ordering::Relaxed);
+    let node_signature = sign_node_assignment_operation_request(
+        &test_node_private_key(node),
+        &NodeId::from(node),
+        request_kind,
+        &payload_digest,
+        format!("node-operation-request-{nonce}"),
+        unix_timestamp_seconds_for_tests(),
+        NodeAssignmentOperation {
+            assignment_authority: authority,
+            operation_id: operation_id.to_owned(),
+        },
+    )
+    .unwrap();
+    CoordinatorRequest::SignedNode {
+        node: node.to_owned(),
         node_signature,
         request: Box::new(request),
     }

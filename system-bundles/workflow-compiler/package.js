@@ -17,6 +17,7 @@ const tag =
 const environmentInputRoots = [
   "Cargo.toml",
   "Cargo.lock",
+  "compiler-toolchain.json",
   "crates/clusterflux-core/Cargo.toml",
   "crates/clusterflux-core/build.rs",
   "crates/clusterflux-core/src",
@@ -59,6 +60,9 @@ const environmentDigest = digestParts([
     fs.readFileSync(path.join(repo, input)),
   ]),
 ]);
+const compilerToolchain = JSON.parse(
+  fs.readFileSync(path.join(repo, "compiler-toolchain.json"), "utf8")
+);
 
 if (process.argv.includes("--print-environment-digest")) {
   process.stdout.write(`${environmentDigest}\n`);
@@ -117,6 +121,10 @@ function buildAndSaveWithPodman(output, exactEnvironmentDigest) {
       "build",
       "--build-arg",
       `CLUSTERFLUX_ENVIRONMENT_DIGEST=${exactEnvironmentDigest}`,
+      "--build-arg",
+      `CLUSTERFLUX_RUST_RELEASE=${compilerToolchain.rust_release}`,
+      "--build-arg",
+      `CLUSTERFLUX_WASM_TARGET=${compilerToolchain.wasm_target}`,
       "--tag",
       tag,
       "--file",

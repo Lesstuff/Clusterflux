@@ -59,6 +59,7 @@ mod tests {
                     issued_at_epoch_seconds: 1,
                     signature: "ed25519:sig".to_owned(),
                     assignment_authority: None,
+                    operation_id: None,
                 },
                 request: Box::new(CoordinatorRequest::PollNodeAssignment {
                     tenant: "tenant-a".to_owned(),

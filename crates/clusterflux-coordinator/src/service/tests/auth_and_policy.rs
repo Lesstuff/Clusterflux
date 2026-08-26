@@ -1455,6 +1455,223 @@ fn authenticated_api_calls_are_metered_per_tenant_and_project_before_dispatch() 
 }
 
 #[test]
+fn hosted_quota_overrides_are_partial_tenant_scoped_effective_and_clear_immediately() {
+    let quota = CoordinatorQuotaConfiguration::unlimited().with_admission_limits(1, 4, 1);
+    let mut service = CoordinatorService::new_with_admin_token_database_url_and_quota(
+        7,
+        "admin-token",
+        None,
+        quota,
+    )
+    .unwrap();
+    let tenant_a = TenantId::from("tenant-a");
+    let tenant_b = TenantId::from("tenant-b");
+    let operator = UserId::from("hosted-admin");
+
+    service
+        .configure_hosted_tenant_quota(
+            tenant_a.clone(),
+            Some(TenantQuotaOverrideValues {
+                max_projects: Some(2),
+                max_nodes: None,
+                max_active_processes: None,
+            }),
+            operator.clone(),
+            "quota_set",
+            10,
+            1_000_000,
+        )
+        .unwrap();
+    for project in ["a-one", "a-two"] {
+        service
+            .handle_request(CoordinatorRequest::CreateProject {
+                tenant: tenant_a.to_string(),
+                actor_user: "user-a".to_owned(),
+                project: project.to_owned(),
+                name: project.to_owned(),
+            })
+            .unwrap();
+    }
+    let third = service
+        .handle_request(CoordinatorRequest::CreateProject {
+            tenant: tenant_a.to_string(),
+            actor_user: "user-a".to_owned(),
+            project: "a-three".to_owned(),
+            name: "A three".to_owned(),
+        })
+        .unwrap_err();
+    assert!(third
+        .to_string()
+        .contains("project quota exceeded (2 of 2)"));
+    let project_quota_error = third.api_error("quota-project");
+    assert_eq!(project_quota_error.code, ApiErrorCode::QuotaExceeded);
+    assert_eq!(project_quota_error.resource.as_deref(), Some("project"));
+    assert_eq!(project_quota_error.current, Some(2));
+    assert_eq!(project_quota_error.maximum, Some(2));
+
+    service
+        .handle_request(CoordinatorRequest::CreateProject {
+            tenant: tenant_b.to_string(),
+            actor_user: "user-b".to_owned(),
+            project: "b-one".to_owned(),
+            name: "B one".to_owned(),
+        })
+        .unwrap();
+    let tenant_b_second = service
+        .handle_request(CoordinatorRequest::CreateProject {
+            tenant: tenant_b.to_string(),
+            actor_user: "user-b".to_owned(),
+            project: "b-two".to_owned(),
+            name: "B two".to_owned(),
+        })
+        .unwrap_err();
+    assert!(tenant_b_second
+        .to_string()
+        .contains("project quota exceeded (1 of 1)"));
+
+    let CoordinatorResponse::QuotaStatus {
+        projects_current,
+        projects_maximum,
+        node_identities_maximum,
+        active_processes_maximum,
+        ..
+    } = service
+        .handle_request(CoordinatorRequest::QuotaStatus {
+            tenant: tenant_a.to_string(),
+            project: "a-one".to_owned(),
+            actor_user: "user-a".to_owned(),
+        })
+        .unwrap()
+    else {
+        panic!("expected quota status");
+    };
+    assert_eq!(projects_current, 2);
+    assert_eq!(projects_maximum, 2);
+    assert_eq!(node_identities_maximum, 4);
+    assert_eq!(active_processes_maximum, 1);
+
+    service
+        .configure_hosted_tenant_quota(
+            tenant_a.clone(),
+            None,
+            operator,
+            "quota_clear",
+            11,
+            1_000_000,
+        )
+        .unwrap();
+    let status = service.hosted_tenant_admin_status(&tenant_a);
+    assert!(status.quota_override.is_none());
+    assert_eq!(status.effective_quota.max_projects, 1);
+    assert_eq!(status.projects_current, 2);
+    let admission_after_lowering = service
+        .handle_request(CoordinatorRequest::CreateProject {
+            tenant: tenant_a.to_string(),
+            actor_user: "user-a".to_owned(),
+            project: "a-after-clear".to_owned(),
+            name: "A after clear".to_owned(),
+        })
+        .unwrap_err();
+    assert!(admission_after_lowering
+        .to_string()
+        .contains("project quota exceeded (2 of 1)"));
+    assert_eq!(service.coordinator.durable.hosted_admin.audit.len(), 2);
+    let set_audit = &service.coordinator.durable.hosted_admin.audit[0];
+    assert_eq!(set_audit.action, "quota_set");
+    assert!(set_audit.old_quota_override.is_none());
+    assert_eq!(
+        set_audit
+            .new_quota_override
+            .as_ref()
+            .and_then(|values| values.max_projects),
+        Some(2)
+    );
+    let clear_audit = &service.coordinator.durable.hosted_admin.audit[1];
+    assert_eq!(clear_audit.action, "quota_clear");
+    assert!(clear_audit.new_quota_override.is_none());
+    assert_eq!(clear_audit.operator, UserId::from("hosted-admin"));
+    assert_eq!(clear_audit.occurred_at_epoch_seconds, 11);
+}
+
+#[test]
+fn hosted_account_suspend_revokes_sessions_aborts_execution_preserves_data_and_resumes_fresh() {
+    let mut service = CoordinatorService::new_with_admin_token(7, "admin-token");
+    let tenant = TenantId::from("tenant");
+    let other_tenant = TenantId::from("other-tenant");
+    let project = ProjectId::from("project");
+    let process = ProcessId::from("process");
+    service
+        .issue_cli_session(
+            tenant.clone(),
+            project.clone(),
+            UserId::from("user"),
+            "tenant-session",
+            None,
+        )
+        .unwrap();
+    service
+        .issue_cli_session(
+            other_tenant.clone(),
+            ProjectId::from("other-project"),
+            UserId::from("other-user"),
+            "other-session",
+            None,
+        )
+        .unwrap();
+    service
+        .handle_request(CoordinatorRequest::AttachNode {
+            tenant: tenant.to_string(),
+            project: project.to_string(),
+            node: "node".to_owned(),
+            public_key: test_node_public_key("hosted-account-node"),
+        })
+        .unwrap();
+    service
+        .coordinator
+        .start_process(tenant.clone(), project.clone(), process);
+
+    let suspended = service
+        .suspend_hosted_account(tenant.clone(), UserId::from("hosted-admin"), 20)
+        .unwrap();
+    assert_eq!(suspended.status.account.account_status, "suspended");
+    assert_eq!(suspended.revoked_sessions, 1);
+    assert_eq!(suspended.aborted_processes, 1);
+    assert_eq!(suspended.status.active_processes_current, 0);
+    assert!(service.coordinator.project(&project).is_some());
+    assert!(service
+        .coordinator
+        .node_identity(&tenant, &project, &NodeId::from("node"))
+        .is_some());
+    assert!(service
+        .authenticate_cli_session_status_context("tenant-session")
+        .unwrap_err()
+        .to_string()
+        .contains("revoked"));
+    service
+        .authenticate_cli_session_context("other-session")
+        .expect("suspending one tenant must not revoke another tenant's session");
+
+    let repeated = service
+        .suspend_hosted_account(tenant.clone(), UserId::from("hosted-admin"), 21)
+        .unwrap();
+    assert_eq!(repeated.revoked_sessions, 0);
+    assert_eq!(repeated.aborted_processes, 0);
+
+    let resumed = service
+        .resume_hosted_account(tenant.clone(), UserId::from("hosted-admin"), 22)
+        .unwrap();
+    assert_eq!(resumed.status.account.account_status, "active");
+    assert!(service
+        .authenticate_cli_session_status_context("tenant-session")
+        .unwrap_err()
+        .to_string()
+        .contains("revoked"));
+    service
+        .issue_cli_session(tenant, project, UserId::from("user"), "fresh-session", None)
+        .expect("resumed account may create a fresh session");
+}
+
+#[test]
 fn signed_node_log_ingestion_truncates_at_scoped_quota_without_failing_reports() {
     let mut limits = ResourceLimits::unlimited();
     limits.limits.insert(LimitKind::LogBytes, 4);

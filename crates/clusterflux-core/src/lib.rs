@@ -46,11 +46,12 @@ pub use auth::{
     agent_ed25519_public_key_from_private_key, agent_workflow_request_scope_from_payload,
     derive_ed25519_private_key_from_seed, node_capability_policy_digest,
     node_ed25519_public_key_from_private_key, sign_agent_workflow_request,
-    sign_node_assignment_request, sign_node_request, signed_request_payload_digest,
-    verify_agent_workflow_signature, verify_node_request_signature, Action, Actor,
-    AgentSignedRequest, AgentWorkflowRequestScope, AgentWorkflowScope, AssignmentAuthority,
-    AuthContext, Authorization, BrowserLoginFlow, CredentialKind, EnrollmentError, EnrollmentGrant,
-    IdentityKind, NodeCredential, NodeSignedRequest, PublicKeyIdentity, Scope,
+    sign_node_assignment_operation_request, sign_node_assignment_request, sign_node_request,
+    signed_request_payload_digest, verify_agent_workflow_signature, verify_node_request_signature,
+    Action, Actor, AgentSignedRequest, AgentWorkflowRequestScope, AgentWorkflowScope,
+    AssignmentAuthority, AuthContext, Authorization, BrowserLoginFlow, CredentialKind,
+    EnrollmentError, EnrollmentGrant, IdentityKind, NodeAssignmentOperation, NodeCredential,
+    NodeSignedRequest, PublicKeyIdentity, Scope,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use auth::{generate_ed25519_private_key, generate_opaque_token};

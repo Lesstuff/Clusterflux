@@ -144,6 +144,8 @@ pub struct NodeSignedRequest {
     pub signature: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assignment_authority: Option<AssignmentAuthority>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
 }
 
 /// Exact assignment ownership carried by task-related signed node requests.
@@ -153,6 +155,13 @@ pub struct AssignmentAuthority {
     pub assignment_id: String,
     pub attempt_id: String,
     pub offer_epoch: u64,
+}
+
+/// Assignment ownership and stable identity for a retryable terminal operation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NodeAssignmentOperation {
+    pub assignment_authority: AssignmentAuthority,
+    pub operation_id: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -466,7 +475,7 @@ pub fn sign_node_request(
         payload_digest,
         nonce,
         issued_at_epoch_seconds,
-        None,
+        NodeRequestAuthority::default(),
     )
 }
 
@@ -486,8 +495,40 @@ pub fn sign_node_assignment_request(
         payload_digest,
         nonce,
         issued_at_epoch_seconds,
-        Some(assignment_authority),
+        NodeRequestAuthority {
+            assignment_authority: Some(assignment_authority),
+            operation_id: None,
+        },
     )
+}
+
+pub fn sign_node_assignment_operation_request(
+    private_key: &str,
+    node: &NodeId,
+    request_kind: &str,
+    payload_digest: &Digest,
+    nonce: String,
+    issued_at_epoch_seconds: u64,
+    operation: NodeAssignmentOperation,
+) -> Result<NodeSignedRequest, String> {
+    sign_node_request_with_assignment(
+        private_key,
+        node,
+        request_kind,
+        payload_digest,
+        nonce,
+        issued_at_epoch_seconds,
+        NodeRequestAuthority {
+            assignment_authority: Some(operation.assignment_authority),
+            operation_id: Some(operation.operation_id),
+        },
+    )
+}
+
+#[derive(Default)]
+struct NodeRequestAuthority {
+    assignment_authority: Option<AssignmentAuthority>,
+    operation_id: Option<String>,
 }
 
 fn sign_node_request_with_assignment(
@@ -497,7 +538,7 @@ fn sign_node_request_with_assignment(
     payload_digest: &Digest,
     nonce: String,
     issued_at_epoch_seconds: u64,
-    assignment_authority: Option<AssignmentAuthority>,
+    authority: NodeRequestAuthority,
 ) -> Result<NodeSignedRequest, String> {
     let private_key = decode_ed25519_key(private_key, 32, "node private key")?;
     let private_key: [u8; 32] = private_key
@@ -510,14 +551,16 @@ fn sign_node_request_with_assignment(
         payload_digest,
         &nonce,
         issued_at_epoch_seconds,
-        assignment_authority.as_ref(),
+        authority.assignment_authority.as_ref(),
+        authority.operation_id.as_deref(),
     );
     let signature: Signature = signing_key.sign(&message);
     Ok(NodeSignedRequest {
         nonce,
         issued_at_epoch_seconds,
         signature: format!("ed25519:{}", STANDARD.encode(signature.to_bytes())),
-        assignment_authority,
+        assignment_authority: authority.assignment_authority,
+        operation_id: authority.operation_id,
     })
 }
 
@@ -546,6 +589,7 @@ pub fn verify_node_request_signature(
         &signed_request.nonce,
         signed_request.issued_at_epoch_seconds,
         signed_request.assignment_authority.as_ref(),
+        signed_request.operation_id.as_deref(),
     );
     verifying_key
         .verify(&message, &signature)
@@ -602,11 +646,14 @@ fn node_request_signature_message(
     nonce: &str,
     issued_at_epoch_seconds: u64,
     assignment_authority: Option<&AssignmentAuthority>,
+    operation_id: Option<&str>,
 ) -> Vec<u8> {
     let issued_at = issued_at_epoch_seconds.to_string();
     let offer_epoch = assignment_authority.map(|authority| authority.offer_epoch.to_string());
     let mut parts = vec![
-        if assignment_authority.is_some() {
+        if operation_id.is_some() {
+            "clusterflux-node-request-signature:v4"
+        } else if assignment_authority.is_some() {
             "clusterflux-node-request-signature:v3"
         } else {
             "clusterflux-node-request-signature:v2"
@@ -625,6 +672,9 @@ fn node_request_signature_message(
                 .as_deref()
                 .expect("assignment offer epoch was formatted"),
         ]);
+    }
+    if let Some(operation_id) = operation_id {
+        parts.push(operation_id);
     }
     let mut message = Vec::new();
     for part in parts {
@@ -843,6 +893,52 @@ mod tests {
         assert!(first
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')));
+    }
+
+    #[test]
+    fn assignment_operation_signature_binds_stable_operation_and_fresh_nonce() {
+        let private_key = derive_ed25519_private_key_from_seed("operation-signature-test");
+        let public_key = node_ed25519_public_key_from_private_key(&private_key).unwrap();
+        let node = NodeId::from("node");
+        let digest = Digest::sha256("payload");
+        let authority = AssignmentAuthority {
+            assignment_id: "assignment".to_owned(),
+            attempt_id: "attempt".to_owned(),
+            offer_epoch: 7,
+        };
+        let first = sign_node_assignment_operation_request(
+            &private_key,
+            &node,
+            "task_completed",
+            &digest,
+            "nonce-one".to_owned(),
+            10,
+            NodeAssignmentOperation {
+                assignment_authority: authority.clone(),
+                operation_id: "operation-one".to_owned(),
+            },
+        )
+        .unwrap();
+        let second = sign_node_assignment_operation_request(
+            &private_key,
+            &node,
+            "task_completed",
+            &digest,
+            "nonce-two".to_owned(),
+            10,
+            NodeAssignmentOperation {
+                assignment_authority: authority,
+                operation_id: "operation-one".to_owned(),
+            },
+        )
+        .unwrap();
+        assert_eq!(first.operation_id, second.operation_id);
+        assert_ne!(first.nonce, second.nonce);
+        assert_ne!(first.signature, second.signature);
+        verify_node_request_signature(&public_key, &node, "task_completed", &digest, &first)
+            .unwrap();
+        verify_node_request_signature(&public_key, &node, "task_completed", &digest, &second)
+            .unwrap();
     }
 
     #[test]

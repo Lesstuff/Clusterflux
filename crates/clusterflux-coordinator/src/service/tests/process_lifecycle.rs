@@ -100,6 +100,9 @@ fn assignment_authority(assignment: &TaskAssignment) -> AssignmentAuthority {
     }
 }
 
+#[path = "process_lifecycle_terminal_idempotency.rs"]
+mod terminal_idempotency;
+
 #[test]
 fn unacknowledged_process_offer_expires_and_is_safely_redelivered_with_a_new_fence() {
     let mut service = CoordinatorService::new(7);

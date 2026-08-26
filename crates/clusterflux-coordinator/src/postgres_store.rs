@@ -4,8 +4,9 @@ use thiserror::Error;
 
 use crate::{
     AgentPublicKeyRecord, AutomationDurableState, CliSessionRecord, CredentialRecord, DurableState,
-    FallibleDurableStore, NodeIdentityRecord, NodeScopeKey, ProjectPermissionRecord, ProjectRecord,
-    ServicePolicyRecord, SourceProviderConfigRecord, TenantRecord, UserRecord,
+    FallibleDurableStore, HostedAdminDurableState, NodeIdentityRecord, NodeScopeKey,
+    ProjectPermissionRecord, ProjectRecord, ServicePolicyRecord, SourceProviderConfigRecord,
+    TenantRecord, UserRecord,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -69,6 +70,11 @@ pub const POSTGRES_DURABLE_TABLES: &[PostgresTable] = &[
     PostgresTable {
         name: "clusterflux_automation_state",
         durable_record: "trigger, run, environment, and encrypted secret state",
+        restart_surviving: true,
+    },
+    PostgresTable {
+        name: "clusterflux_hosted_admin_state",
+        durable_record: "bounded tenant quota overrides and hosted admin audit",
         restart_surviving: true,
     },
 ];
@@ -226,6 +232,15 @@ impl FallibleDurableStore for PostgresDurableStore {
         {
             state.replace_automation(automation);
         }
+        if let Some(hosted_admin) = self
+            .query_records::<HostedAdminDurableState>(
+                "SELECT record FROM clusterflux_hosted_admin_state WHERE state_name = 'primary'",
+            )?
+            .into_iter()
+            .next()
+        {
+            state.hosted_admin = hosted_admin;
+        }
 
         Ok(state)
     }
@@ -235,6 +250,7 @@ impl FallibleDurableStore for PostgresDurableStore {
         tx.batch_execute(
             "
             DELETE FROM clusterflux_project_permissions;
+            DELETE FROM clusterflux_hosted_admin_state;
             DELETE FROM clusterflux_automation_state;
             DELETE FROM clusterflux_service_policy_records;
             DELETE FROM clusterflux_source_provider_configs;
@@ -350,6 +366,11 @@ impl FallibleDurableStore for PostgresDurableStore {
         tx.execute(
             "INSERT INTO clusterflux_automation_state (state_name, record) VALUES ('primary', $1)",
             &[&automation],
+        )?;
+        let hosted_admin = Self::record_value(&state.hosted_admin)?;
+        tx.execute(
+            "INSERT INTO clusterflux_hosted_admin_state (state_name, record) VALUES ('primary', $1)",
+            &[&hosted_admin],
         )?;
 
         tx.commit()?;
@@ -548,6 +569,11 @@ CREATE TABLE IF NOT EXISTS clusterflux_automation_state (
     state_name TEXT PRIMARY KEY,
     record JSONB NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS clusterflux_hosted_admin_state (
+    state_name TEXT PRIMARY KEY,
+    record JSONB NOT NULL
+);
 "#;
 
 #[cfg(test)]
@@ -566,7 +592,7 @@ mod tests {
             .map(|table| table.name)
             .collect::<Vec<_>>();
 
-        assert_eq!(names.len(), 11);
+        assert_eq!(names.len(), 12);
         assert!(names.contains(&"clusterflux_tenants"));
         assert!(names.contains(&"clusterflux_users"));
         assert!(names.contains(&"clusterflux_projects"));
@@ -578,6 +604,7 @@ mod tests {
         assert!(names.contains(&"clusterflux_service_policy_records"));
         assert!(names.contains(&"clusterflux_project_permissions"));
         assert!(names.contains(&"clusterflux_automation_state"));
+        assert!(names.contains(&"clusterflux_hosted_admin_state"));
         assert!(PostgresDurableStore::durable_tables()
             .iter()
             .all(|table| table.restart_surviving));

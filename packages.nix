@@ -1,6 +1,12 @@
 { pkgs, self }:
 let
-  compiler-artifacts = pkgs.rustPlatform.buildRustPackage {
+  compilerToolchain = builtins.fromJSON (builtins.readFile ./compiler-toolchain.json);
+  checkedRust = pkgs.rust-bin.stable.${compilerToolchain.rust_release}.default.override {
+    targets = [ compilerToolchain.wasm_target ];
+  };
+  checkedRustc = assert checkedRust.version == compilerToolchain.rust_release; checkedRust;
+  checkedRustPlatform = pkgs.makeRustPlatform { cargo = checkedRust; rustc = checkedRust; };
+  compiler-artifacts = checkedRustPlatform.buildRustPackage {
     pname = "clusterflux-system-compiler-artifacts";
     version = "0.1.2";
     src = self;
@@ -32,8 +38,8 @@ let
       cp target/compiler-wasm/release/deps/*.so "$out/sdk/deps/"
       printf '%s\n' \
         'format=clusterflux-compiler-sdk-v1' \
-        'rust_toolchain=1.91.1' \
-        'target=wasm32-unknown-unknown' \
+        'rust_toolchain=${compilerToolchain.rust_release}' \
+        'target=${compilerToolchain.wasm_target}' \
         'clusterflux_task_abi=1' \
         'serde_version=1.0.228' \
         'serde_features=derive' \
@@ -47,7 +53,7 @@ let
     mkdir -p "$out/opt/clusterflux/bin" "$out/opt/clusterflux/sdk" "$out/opt/rust/bin"
     cp ${compiler-artifacts}/bin/compile-workflow "$out/opt/clusterflux/bin/compile-workflow"
     cp -a ${compiler-artifacts}/sdk/. "$out/opt/clusterflux/sdk/"
-    ln -s ${pkgs.rustc}/bin/rustc "$out/opt/rust/bin/rustc"
+    ln -s ${checkedRustc}/bin/rustc "$out/opt/rust/bin/rustc"
     ln -s ${pkgs.lld}/bin/wasm-ld "$out/opt/rust/bin/rust-lld"
   '';
 
@@ -63,7 +69,7 @@ let
       paths = [
         compiler-root
         pkgs.lld
-        pkgs.rustc
+        checkedRustc
         pkgs.stdenv.cc.cc.lib
         pkgs.glibc
       ];
@@ -85,11 +91,12 @@ let
     gzip --test "$out"
   '';
 
-  clusterflux-tools = pkgs.rustPlatform.buildRustPackage {
+  clusterflux-tools = checkedRustPlatform.buildRustPackage {
     pname = "clusterflux-tools";
     version = "0.1.2";
     src = self;
     cargoLock.lockFile = ./Cargo.lock;
+    doCheck = false;
     # Nix's default `strip -S` keeps the ELF symbol table. These are standalone
     # release tools, so remove symbols as well as debug sections.
     stripAllList = [ "bin" ];
@@ -184,7 +191,7 @@ let
   };
 in
 {
-  inherit clusterflux-tools;
+  inherit clusterflux-tools compiler-artifacts compiler-image;
   clusterflux = clusterflux-tools;
   default = clusterflux-tools;
 }

@@ -62,6 +62,7 @@ pub struct VerifiedSystemCompilerPackage {
     pub image_reference: String,
     pub image_digest: Digest,
     pub environment_digest: Digest,
+    pub archive_digest: Digest,
 }
 
 pub fn write_system_compiler_manifests(
@@ -118,7 +119,7 @@ pub fn write_system_compiler_manifests(
     verify_system_compiler_package(share_dir)
 }
 
-pub fn verify_system_compiler_package(
+pub fn inspect_system_compiler_package(
     share_dir: &Path,
 ) -> Result<VerifiedSystemCompilerPackage, String> {
     let bundles: InstalledSystemBundlesManifest = read_json(
@@ -194,20 +195,28 @@ pub fn verify_system_compiler_package(
         return Err("compiler image digest file disagrees with package manifests".to_owned());
     }
     let archive = share_dir.join(&environment.compiler_image_archive);
-    let actual_archive_digest = sha256_file(&archive)?;
-    if actual_archive_digest != environment.compiler_image_archive_digest {
-        return Err(format!(
-            "compiler image archive digest verification failed: expected {}, got {}",
-            environment.compiler_image_archive_digest, actual_archive_digest
-        ));
-    }
     Ok(VerifiedSystemCompilerPackage {
         share_dir: share_dir.to_owned(),
         archive,
         image_reference: environment.compiler_image_reference,
         image_digest: environment.compiler_image_digest,
         environment_digest: environment.environment_digest,
+        archive_digest: environment.compiler_image_archive_digest,
     })
+}
+
+pub fn verify_system_compiler_package(
+    share_dir: &Path,
+) -> Result<VerifiedSystemCompilerPackage, String> {
+    let package = inspect_system_compiler_package(share_dir)?;
+    let actual_archive_digest = sha256_file(&package.archive)?;
+    if actual_archive_digest != package.archive_digest {
+        return Err(format!(
+            "compiler image archive digest verification failed: expected {}, got {}",
+            package.archive_digest, actual_archive_digest
+        ));
+    }
+    Ok(package)
 }
 
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path, label: &str) -> Result<T, String> {
@@ -263,5 +272,40 @@ mod tests {
         assert!(error.contains("archive digest"));
         assert!(error.contains("expected sha256:"));
         assert!(error.contains("got sha256:"));
+    }
+
+    #[test]
+    fn metadata_inspection_does_not_read_the_compiler_archive() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive = directory.path().join(SYSTEM_COMPILER_IMAGE_ARCHIVE);
+        fs::write(&archive, b"image").unwrap();
+        let expected =
+            write_system_compiler_manifests(directory.path(), Digest::sha256("image-id")).unwrap();
+        fs::remove_file(&archive).unwrap();
+        assert_eq!(
+            inspect_system_compiler_package(directory.path()).unwrap(),
+            expected
+        );
+        assert!(verify_system_compiler_package(directory.path()).is_err());
+    }
+
+    #[test]
+    fn metadata_inspection_rejects_a_mismatched_rust_toolchain() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join(SYSTEM_COMPILER_IMAGE_ARCHIVE),
+            b"image",
+        )
+        .unwrap();
+        write_system_compiler_manifests(directory.path(), Digest::sha256("image-id")).unwrap();
+        let environment_path = directory.path().join(COMPILER_ENVIRONMENT_MANIFEST);
+        let mut environment: InstalledCompilerEnvironmentManifest =
+            read_json(&environment_path, "compiler environment manifest").unwrap();
+        environment.rust_toolchain = "0.0.0-mismatch".to_owned();
+        write_json(&environment_path, &environment).unwrap();
+
+        let error = inspect_system_compiler_package(directory.path()).unwrap_err();
+        assert!(error.contains("compiler environment manifest"));
+        assert!(error.contains("does not match this Clusterflux release"));
     }
 }

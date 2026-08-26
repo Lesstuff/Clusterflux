@@ -544,6 +544,9 @@ impl CoordinatorService {
             self.quota.ensure_node_admission(
                 &tenant,
                 self.coordinator.node_identity_count_for_tenant(&tenant),
+                self.coordinator
+                    .tenant_quota_override(&tenant)
+                    .map(|record| &record.values),
             )?;
         }
         self.coordinator.enroll_node(
@@ -641,6 +644,9 @@ impl CoordinatorService {
             self.quota.ensure_node_admission(
                 &tenant,
                 self.coordinator.node_identity_count_for_tenant(&tenant),
+                self.coordinator
+                    .tenant_quota_override(&tenant)
+                    .map(|record| &record.values),
             )?;
         }
         let grant_key = enrollment_grant_key(&tenant, &project, &enrollment_grant);

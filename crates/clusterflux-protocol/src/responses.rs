@@ -263,8 +263,12 @@ pub enum CoordinatorResponse {
         window_seconds: BTreeMap<LimitKind, u64>,
         usage: BTreeMap<LimitKind, u64>,
         window_started_epoch_seconds: BTreeMap<LimitKind, u64>,
+        projects_current: u64,
+        projects_maximum: u64,
         node_identities_current: u64,
         node_identities_maximum: u64,
+        active_processes_current: u64,
+        active_processes_maximum: u64,
     },
     TaskControl {
         process: ProcessId,

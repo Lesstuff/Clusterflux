@@ -4,6 +4,7 @@ use clusterflux_core::{
 
 use crate::{AssignmentKind, CoordinatorError, NodeScopeKey};
 
+use super::task_registry::AssignmentMutationReplay;
 use super::{CoordinatorRequest, CoordinatorResponse, CoordinatorService, CoordinatorServiceError};
 
 impl CoordinatorService {
@@ -16,6 +17,20 @@ impl CoordinatorService {
         let request_kind = signed_node_request_kind(&request)?;
         let request_scope = signed_node_request_scope(&request)?;
         let assignment_authority = node_signature.assignment_authority.clone();
+        let mutation_context = match &request {
+            CoordinatorRequest::ReportVfsMetadata { process, task, .. } => Some((
+                ProcessId::new(process.clone()),
+                TaskInstanceId::new(task.clone()),
+                false,
+            )),
+            CoordinatorRequest::TaskCompleted { process, task, .. } => Some((
+                ProcessId::new(process.clone()),
+                TaskInstanceId::new(task.clone()),
+                true,
+            )),
+            _ => None,
+        };
+        let operation_id = node_signature.operation_id.clone();
         let request_payload = serde_json::to_value(&request).map_err(|error| {
             CoordinatorServiceError::Protocol(format!(
                 "failed to canonicalize signed node request: {error}"
@@ -37,6 +52,39 @@ impl CoordinatorService {
             request_kind,
             &payload_digest,
         )?;
+        if mutation_context.is_some() {
+            let operation_id = operation_id.as_deref().ok_or_else(|| {
+                CoordinatorServiceError::Protocol(
+                    "terminal node mutation omitted its stable operation identifier".to_owned(),
+                )
+            })?;
+            clusterflux_core::validate_opaque_token(operation_id, 128).map_err(|error| {
+                CoordinatorServiceError::Protocol(format!(
+                    "invalid terminal node operation identifier: {error}"
+                ))
+            })?;
+        }
+        if let (Some((process, task, _)), Some(operation_id), Some(authority)) = (
+            mutation_context.as_ref(),
+            operation_id.as_deref(),
+            assignment_authority.as_ref(),
+        ) {
+            match super::TaskRegistry::assignment_mutation_replay(
+                self.coordinator.durable_state(),
+                &request_scope,
+                authority,
+                process,
+                task,
+                operation_id,
+                &payload_digest,
+            ) {
+                AssignmentMutationReplay::Exact(response) => return Ok(*response),
+                AssignmentMutationReplay::Conflict => {
+                    return Err(CoordinatorServiceError::TerminalOperationConflict)
+                }
+                AssignmentMutationReplay::Missing => {}
+            }
+        }
         if self
             .node_registry
             .descriptor(&request_scope)
@@ -114,7 +162,7 @@ impl CoordinatorService {
                 node,
                 assignment_id,
                 lease_epoch,
-                assignment_authority,
+                assignment_authority.clone(),
             ),
             CoordinatorRequest::ReportSystemTask {
                 tenant,
@@ -480,8 +528,37 @@ impl CoordinatorService {
             ),
             _ => self.reject_unsigned_node_request(),
         };
-        if response.is_ok() {
-            if let Some(authority) = terminal_process_authority {
+        if let Ok(committed_response) = &response {
+            if let (Some((process, task, terminal)), Some(operation_id), Some(authority)) = (
+                mutation_context,
+                operation_id,
+                assignment_authority.as_ref(),
+            ) {
+                if !super::TaskRegistry::record_assignment_mutation(
+                    self.coordinator.durable_state_mut(),
+                    authority,
+                    process,
+                    task,
+                    operation_id,
+                    payload_digest,
+                    committed_response,
+                ) {
+                    return Err(CoordinatorServiceError::Protocol(
+                        "terminal node mutation could not be recorded against its active assignment"
+                            .to_owned(),
+                    ));
+                }
+                if terminal {
+                    let now = self.current_epoch_seconds()?;
+                    super::TaskRegistry::terminalize_active_assignment(
+                        self.coordinator.durable_state_mut(),
+                        authority,
+                        now,
+                        true,
+                    );
+                }
+                self.persist_durable_state()?;
+            } else if let Some(authority) = terminal_process_authority {
                 let now = self.current_epoch_seconds()?;
                 super::TaskRegistry::terminalize_active_assignment(
                     self.coordinator.durable_state_mut(),

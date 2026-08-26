@@ -6,6 +6,7 @@ use sha2::{Digest as _, Sha256};
 const INPUT_ROOTS: &[&str] = &[
     "Cargo.toml",
     "Cargo.lock",
+    "compiler-toolchain.json",
     "crates/clusterflux-core/Cargo.toml",
     "crates/clusterflux-core/build.rs",
     "crates/clusterflux-core/src",
@@ -19,6 +20,19 @@ const INPUT_ROOTS: &[&str] = &[
 fn main() {
     let manifest = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let repository = manifest.parent().unwrap().parent().unwrap();
+    let toolchain: serde_json::Value = serde_json::from_slice(
+        &fs::read(repository.join("compiler-toolchain.json"))
+            .expect("read compiler-toolchain.json"),
+    )
+    .expect("parse compiler-toolchain.json");
+    let rust_release = toolchain["rust_release"]
+        .as_str()
+        .expect("compiler toolchain rust_release is a string");
+    let wasm_target = toolchain["wasm_target"]
+        .as_str()
+        .expect("compiler toolchain wasm_target is a string");
+    println!("cargo:rustc-env=CLUSTERFLUX_COMPILER_RUST_RELEASE={rust_release}");
+    println!("cargo:rustc-env=CLUSTERFLUX_COMPILER_WASM_TARGET={wasm_target}");
     let mut files = Vec::new();
     for input in INPUT_ROOTS {
         collect_files(&repository.join(input), &mut files);

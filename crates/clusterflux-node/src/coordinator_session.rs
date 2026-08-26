@@ -86,15 +86,25 @@ impl CoordinatorSession {
         &mut self,
         request: CoordinatorRequest,
     ) -> Result<CoordinatorResponse, Box<dyn std::error::Error>> {
+        self.request_with(|| Ok(request.clone()))
+    }
+
+    pub(crate) fn request_with<F>(
+        &mut self,
+        mut request: F,
+    ) -> Result<CoordinatorResponse, Box<dyn std::error::Error>>
+    where
+        F: FnMut() -> Result<CoordinatorRequest, Box<dyn std::error::Error>>,
+    {
         let Some(max_delay) = self.reconnect_max_delay else {
-            let response = self.inner.request(&request)?;
+            let response = self.inner.request(&request()?)?;
             self.requests = self.requests.saturating_add(1);
             return Ok(response);
         };
         let mut base_delay = Duration::from_secs(1).min(max_delay);
         let mut attempt = 0_u64;
         loop {
-            match self.inner.request(&request) {
+            match self.inner.request(&request()?) {
                 Ok(response) => {
                     self.requests = self.requests.saturating_add(1);
                     return Ok(response);
@@ -176,7 +186,7 @@ mod tests {
     use std::net::TcpListener;
     use std::thread;
 
-    fn read_http_request(stream: &mut std::net::TcpStream) {
+    fn read_http_request(stream: &mut std::net::TcpStream) -> Vec<u8> {
         let mut reader = BufReader::new(stream.try_clone().unwrap());
         let mut content_length = 0_usize;
         loop {
@@ -194,6 +204,7 @@ mod tests {
         }
         let mut body = vec![0; content_length];
         reader.read_exact(&mut body).unwrap();
+        body
     }
 
     #[test]
@@ -229,7 +240,7 @@ mod tests {
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let server = thread::spawn(move || {
             let (mut first, _) = listener.accept().unwrap();
-            read_http_request(&mut first);
+            let _ = read_http_request(&mut first);
             first
                 .write_all(
                     b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
@@ -237,7 +248,7 @@ mod tests {
                 .unwrap();
 
             let (mut second, _) = listener.accept().unwrap();
-            read_http_request(&mut second);
+            let _ = read_http_request(&mut second);
             let body = br#"{"type":"node_heartbeat","node":"node","epoch":1}"#;
             write!(
                 second,
@@ -266,5 +277,47 @@ mod tests {
             CoordinatorResponse::NodeHeartbeat { .. }
         ));
         assert_eq!(session.requests(), 2);
+    }
+
+    #[test]
+    fn retry_factory_rebuilds_a_request_after_response_loss() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut first, _) = listener.accept().unwrap();
+            let _ = read_http_request(&mut first);
+            first
+                .write_all(
+                    b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+            let (mut second, _) = listener.accept().unwrap();
+            let _ = read_http_request(&mut second);
+            let body = br#"{"type":"node_heartbeat","node":"node","epoch":1}"#;
+            write!(
+                second,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            second.write_all(body).unwrap();
+        });
+        let mut session =
+            CoordinatorSession::connect_with_retries(&endpoint, Some(Duration::from_millis(1)))
+                .unwrap();
+        let builds = std::cell::Cell::new(0_u8);
+        session
+            .request_with(|| {
+                builds.set(builds.get().saturating_add(1));
+                Ok(CoordinatorRequest::NodeHeartbeat {
+                    tenant: "tenant".to_owned(),
+                    project: "project".to_owned(),
+                    node: "node".to_owned(),
+                    node_signature: None,
+                })
+            })
+            .unwrap();
+        server.join().unwrap();
+        assert_eq!(builds.get(), 2);
     }
 }

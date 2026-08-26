@@ -46,6 +46,7 @@ mod signed_nodes;
 mod summaries;
 mod task_registry;
 mod tcp;
+pub use admin::{HostedAccountMutationResult, HostedTenantAdminStatus};
 use artifact_registry::ArtifactRegistry;
 use authorization::authorize_authenticated_user_operation;
 use debug_registry::DebugRegistry;
@@ -66,7 +67,7 @@ pub use protocol::{
     TaskExecutor, TaskFailureResolution, TaskLogStream, TaskReplacementBundle, TaskTerminalState,
     VirtualProcessStatus, WorkflowActor,
 };
-pub use quota::CoordinatorQuotaConfiguration;
+pub use quota::{AdmissionQuotaLimits, CoordinatorQuotaConfiguration};
 use recent_log_store::RecentLogStore;
 use replay_registry::{ReplayAdmissionError, ReplayRegistry};
 use secrets::SecretCipher;
@@ -250,8 +251,14 @@ pub enum CoordinatorServiceError {
     InvalidArtifactPath(String),
     #[error("invalid task log tail reported by node: {0}")]
     InvalidTaskLogTail(String),
+    #[error("terminal node operation conflicts with its previously committed payload")]
+    TerminalOperationConflict,
     #[error("node identity quota exceeded ({current} of {maximum})")]
     NodeIdentityQuota { current: u64, maximum: u64 },
+    #[error("project quota exceeded ({current} of {maximum})")]
+    ProjectQuota { current: u64, maximum: u64 },
+    #[error("active process quota exceeded ({current} of {maximum})")]
+    ActiveProcessQuota { current: u64, maximum: u64 },
     #[error("durable coordinator state failed: {0}")]
     Durable(String),
 }
@@ -287,6 +294,9 @@ impl CoordinatorServiceError {
             ),
             Self::Coordinator(CoordinatorError::StaleProcessEpoch { .. }) => {
                 (ApiErrorCode::Conflict, ApiErrorCategory::State, true)
+            }
+            Self::TerminalOperationConflict => {
+                (ApiErrorCode::Conflict, ApiErrorCategory::State, false)
             }
             Self::Download(DownloadError::NotFound) => {
                 (ApiErrorCode::NotFound, ApiErrorCategory::State, false)
@@ -331,7 +341,9 @@ impl CoordinatorServiceError {
                 ApiErrorCategory::Authorization,
                 false,
             ),
-            Self::NodeIdentityQuota { .. } => (
+            Self::NodeIdentityQuota { .. }
+            | Self::ProjectQuota { .. }
+            | Self::ActiveProcessQuota { .. } => (
                 ApiErrorCode::QuotaExceeded,
                 ApiErrorCategory::Resource,
                 false,
@@ -352,6 +364,22 @@ impl CoordinatorServiceError {
                     "clusterflux node list".to_owned(),
                     "clusterflux node revoke <node-id> --yes".to_owned(),
                 ],
+            );
+        }
+        if let Self::ProjectQuota { current, maximum } = self {
+            return error.with_quota_details(
+                "project",
+                *current,
+                *maximum,
+                ["clusterflux project list".to_owned()],
+            );
+        }
+        if let Self::ActiveProcessQuota { current, maximum } = self {
+            return error.with_quota_details(
+                "active_process",
+                *current,
+                *maximum,
+                ["clusterflux process list".to_owned()],
             );
         }
         error
@@ -755,6 +783,11 @@ impl CoordinatorService {
         let status = self
             .quota
             .project_status(&tenant, &project, now_epoch_seconds);
+        let admission_limits = self.quota.effective_admission_limits(
+            self.coordinator
+                .tenant_quota_override(&tenant)
+                .map(|record| &record.values),
+        );
         Ok(CoordinatorResponse::QuotaStatus {
             tenant: tenant.clone(),
             project,
@@ -764,11 +797,19 @@ impl CoordinatorService {
             window_seconds: status.window_seconds,
             usage: status.usage,
             window_started_epoch_seconds: status.window_started_epoch_seconds,
+            projects_current: u64::try_from(self.coordinator.project_count_for_tenant(&tenant))
+                .unwrap_or(u64::MAX),
+            projects_maximum: admission_limits.max_projects,
             node_identities_current: u64::try_from(
                 self.coordinator.node_identity_count_for_tenant(&tenant),
             )
             .unwrap_or(u64::MAX),
-            node_identities_maximum: self.quota.maximum_node_identities(),
+            node_identities_maximum: admission_limits.max_nodes,
+            active_processes_current: u64::try_from(
+                self.coordinator.active_process_count_for_tenant(&tenant),
+            )
+            .unwrap_or(u64::MAX),
+            active_processes_maximum: admission_limits.max_active_processes,
         })
     }
 
@@ -785,6 +826,7 @@ impl CoordinatorService {
         session_secret: &str,
         expires_at_epoch_seconds: Option<u64>,
     ) -> Result<crate::CliSessionRecord, CoordinatorServiceError> {
+        self.coordinator.ensure_tenant_active(&tenant)?;
         if let Some(existing) = self.coordinator.project(&project) {
             if existing.tenant != tenant {
                 return Err(CoordinatorError::Unauthorized(

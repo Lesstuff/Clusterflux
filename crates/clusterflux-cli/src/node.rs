@@ -788,6 +788,9 @@ fn persist_node_credential_scope(
     use std::io::Write;
 
     let file = local_node_credential_file(project_root, node);
+    if !credential_file_exists_without_symlink(&file)? {
+        return Ok(());
+    }
     let bytes =
         std::fs::read(&file).with_context(|| format!("failed to read {}", file.display()))?;
     let mut credential: StoredNodeCredential = serde_json::from_slice(&bytes)

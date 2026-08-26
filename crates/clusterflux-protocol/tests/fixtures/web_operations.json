@@ -177,7 +177,7 @@
     "operation": "quota_status",
     "boundary": "control",
     "request": { "type": "quota_status" },
-    "response": { "type": "quota_status", "tenant": "tenant-one", "project": "project-one", "actor": "user-one", "policy_label": "community tier", "limits": { "limits": { "ApiCall": 10000 } }, "window_seconds": { "ApiCall": 60 }, "usage": { "ApiCall": 12 }, "window_started_epoch_seconds": { "ApiCall": 900 }, "node_identities_current": 2, "node_identities_maximum": 4 }
+    "response": { "type": "quota_status", "tenant": "tenant-one", "project": "project-one", "actor": "user-one", "policy_label": "community tier", "limits": { "limits": { "ApiCall": 10000 } }, "window_seconds": { "ApiCall": 60 }, "usage": { "ApiCall": 12 }, "window_started_epoch_seconds": { "ApiCall": 900 }, "projects_current": 1, "projects_maximum": 1, "node_identities_current": 2, "node_identities_maximum": 4, "active_processes_current": 1, "active_processes_maximum": 1 }
   },
   {
     "operation": "list_task_events",

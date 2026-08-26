@@ -64,7 +64,9 @@ pub(crate) fn quota_status_report(args: QuotaStatusArgs, cwd: PathBuf) -> Result
         let CoordinatorResponse::QuotaStatus {
             usage,
             window_started_epoch_seconds,
+            projects_current,
             node_identities_current,
+            active_processes_current,
             ..
         } = status
         else {
@@ -82,13 +84,23 @@ pub(crate) fn quota_status_report(args: QuotaStatusArgs, cwd: PathBuf) -> Result
             "node_identities".to_owned(),
             serde_json::to_value(node_identities_current)?,
         );
+        object.insert(
+            "projects".to_owned(),
+            serde_json::to_value(projects_current)?,
+        );
+        object.insert(
+            "active_processes".to_owned(),
+            serde_json::to_value(active_processes_current)?,
+        );
     }
     let (limits, window_seconds, quota_tier) = match quota_status.as_ref() {
         Some(CoordinatorResponse::QuotaStatus {
             limits,
             window_seconds,
             policy_label,
+            projects_maximum,
             node_identities_maximum,
+            active_processes_maximum,
             ..
         }) => (
             {
@@ -97,6 +109,14 @@ pub(crate) fn quota_status_report(args: QuotaStatusArgs, cwd: PathBuf) -> Result
                     object.insert(
                         "node_identities".to_owned(),
                         serde_json::to_value(node_identities_maximum)?,
+                    );
+                    object.insert(
+                        "projects".to_owned(),
+                        serde_json::to_value(projects_maximum)?,
+                    );
+                    object.insert(
+                        "active_processes".to_owned(),
+                        serde_json::to_value(active_processes_maximum)?,
                     );
                 }
                 limits

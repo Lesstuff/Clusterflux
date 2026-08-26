@@ -140,6 +140,20 @@ impl Coordinator {
         record.revoked = true;
         Ok(record.clone())
     }
+
+    pub fn revoke_cli_sessions_for_tenant(&mut self, tenant: &TenantId) -> usize {
+        let mut revoked = 0_usize;
+        for record in self
+            .durable
+            .cli_sessions
+            .values_mut()
+            .filter(|record| &record.tenant == tenant && !record.revoked)
+        {
+            record.revoked = true;
+            revoked = revoked.saturating_add(1);
+        }
+        revoked
+    }
 }
 
 fn unix_timestamp_seconds() -> u64 {

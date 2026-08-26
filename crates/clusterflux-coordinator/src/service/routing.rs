@@ -103,6 +103,9 @@ impl CoordinatorService {
                     self.quota.ensure_project_admission(
                         &tenant,
                         self.coordinator.project_count_for_tenant(&tenant),
+                        self.coordinator
+                            .tenant_quota_override(&tenant)
+                            .map(|record| &record.values),
                     )?;
                 }
                 self.coordinator.upsert_tenant(tenant.clone());
@@ -666,6 +669,9 @@ impl CoordinatorService {
                     self.quota.ensure_project_admission(
                         &context.tenant,
                         self.coordinator.project_count_for_tenant(&context.tenant),
+                        self.coordinator
+                            .tenant_quota_override(&context.tenant)
+                            .map(|record| &record.values),
                     )?;
                 }
                 self.coordinator

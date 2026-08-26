@@ -44,6 +44,7 @@ pub struct SystemBundleCapability {
     pub bundle_digest: crate::Digest,
     pub sdk_abi_version: u32,
     pub wasm_target: String,
+    pub rust_toolchain: String,
     pub environment_digest: crate::Digest,
     pub sandbox: SystemTaskSandbox,
     pub max_source_bytes: usize,
@@ -174,6 +175,7 @@ impl NodeCapabilities {
                 || !profile.bundle_digest.is_valid_sha256()
                 || profile.sdk_abi_version == 0
                 || profile.wasm_target != "wasm32-unknown-unknown"
+                || profile.rust_toolchain.trim().is_empty()
                 || !profile.environment_digest.is_valid_sha256()
                 || profile.max_source_bytes == 0
                 || profile.max_output_bytes == 0

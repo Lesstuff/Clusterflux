@@ -11,11 +11,18 @@ use super::protocol::{
     TaskFailureResolution, TaskTerminalState,
 };
 use crate::durable::{
-    ActiveAssignmentRecord, AssignmentKind, AssignmentState, DurableState, NodeScopeKey,
-    TerminalAssignmentRecord,
+    ActiveAssignmentRecord, AssignmentKind, AssignmentMutationRecord, AssignmentMutationResponse,
+    AssignmentState, DurableState, NodeScopeKey, TerminalAssignmentRecord,
 };
 
 const MAX_TERMINAL_ASSIGNMENT_HISTORY: usize = 4_096;
+const MAX_TERMINAL_MUTATIONS_PER_ASSIGNMENT: usize = 256;
+
+pub(super) enum AssignmentMutationReplay {
+    Missing,
+    Exact(Box<clusterflux_protocol::CoordinatorResponse>),
+    Conflict,
+}
 
 /// Owns every remote-task lifecycle collection. The façade may orchestrate
 /// cross-domain work, but admission, indexing, transitions, and cleanup happen
@@ -75,6 +82,7 @@ impl TaskRegistry {
                 offered_at: now,
                 acknowledged_at: None,
                 lease_expires_at: now.saturating_add(offer_seconds),
+                terminal_mutations: VecDeque::new(),
             },
         );
         authority
@@ -195,6 +203,7 @@ impl TaskRegistry {
                 offer_epoch: active.offer_epoch,
                 terminal_at: now,
                 replay_allowed,
+                terminal_mutations: std::mem::take(&mut active.terminal_mutations),
             });
         Some(active)
     }
@@ -246,6 +255,92 @@ impl TaskRegistry {
                     && terminal.attempt_id == authority.attempt_id
                     && terminal.offer_epoch == authority.offer_epoch
             })
+    }
+
+    pub(super) fn assignment_mutation_replay(
+        durable: &DurableState,
+        scope: &NodeScopeKey,
+        authority: &AssignmentAuthority,
+        process: &ProcessId,
+        task: &TaskInstanceId,
+        operation_id: &str,
+        payload_digest: &Digest,
+    ) -> AssignmentMutationReplay {
+        let mutations = durable
+            .active_assignments
+            .get(&authority.assignment_id)
+            .filter(|active| {
+                active.tenant == scope.tenant
+                    && active.project == scope.project
+                    && active.node == scope.node
+                    && active.attempt_id == authority.attempt_id
+                    && active.offer_epoch == authority.offer_epoch
+            })
+            .map(|active| &active.terminal_mutations)
+            .or_else(|| {
+                durable
+                    .terminal_assignment_history
+                    .iter()
+                    .rev()
+                    .find(|terminal| {
+                        terminal.replay_allowed
+                            && terminal.assignment_id == authority.assignment_id
+                            && terminal.tenant == scope.tenant
+                            && terminal.project == scope.project
+                            && terminal.node == scope.node
+                            && terminal.attempt_id == authority.attempt_id
+                            && terminal.offer_epoch == authority.offer_epoch
+                    })
+                    .map(|terminal| &terminal.terminal_mutations)
+            });
+        let Some(record) = mutations.and_then(|mutations| {
+            mutations.iter().rev().find(|record| {
+                record.process == *process
+                    && record.task == *task
+                    && record.operation_id == operation_id
+            })
+        }) else {
+            return AssignmentMutationReplay::Missing;
+        };
+        if record.payload_digest == *payload_digest {
+            AssignmentMutationReplay::Exact(Box::new(record.response.coordinator_response()))
+        } else {
+            AssignmentMutationReplay::Conflict
+        }
+    }
+
+    pub(super) fn record_assignment_mutation(
+        durable: &mut DurableState,
+        authority: &AssignmentAuthority,
+        process: ProcessId,
+        task: TaskInstanceId,
+        operation_id: String,
+        payload_digest: Digest,
+        response: &clusterflux_protocol::CoordinatorResponse,
+    ) -> bool {
+        let Some(active) = durable.active_assignments.get_mut(&authority.assignment_id) else {
+            return false;
+        };
+        if active.attempt_id != authority.attempt_id || active.offer_epoch != authority.offer_epoch
+        {
+            return false;
+        }
+        let Some(response) = AssignmentMutationResponse::from_coordinator_response(response) else {
+            return false;
+        };
+        while active.terminal_mutations.len() >= MAX_TERMINAL_MUTATIONS_PER_ASSIGNMENT {
+            active.terminal_mutations.pop_front();
+        }
+        active
+            .terminal_mutations
+            .push_back(AssignmentMutationRecord {
+                process,
+                task,
+                operation_id,
+                payload_digest,
+                response,
+            });
+        true
     }
 
     pub(super) fn active_task_spec(
@@ -1156,6 +1251,66 @@ mod tests {
             &NodeScopeKey::new(key.0, key.1, key.2),
             &authority,
         ));
+    }
+
+    #[test]
+    fn assignment_terminal_mutation_history_is_bounded_and_moves_to_terminal_history() {
+        let mut durable = DurableState::default();
+        let process = ProcessId::from("process");
+        let task = TaskInstanceId::from("task");
+        let authority = TaskRegistry::offer_active_assignment(
+            &mut durable,
+            AssignmentKind::ProcessTask {
+                process: process.clone(),
+                task: task.clone(),
+            },
+            TenantId::from("tenant"),
+            ProjectId::from("project"),
+            NodeId::from("node"),
+            "attempt".to_owned(),
+            1,
+            1,
+            30,
+            "owner",
+        );
+        let response = clusterflux_protocol::CoordinatorResponse::TaskRecorded {
+            process: process.clone(),
+            task: task.clone(),
+            events_recorded: 1,
+        };
+        for index in 0..=MAX_TERMINAL_MUTATIONS_PER_ASSIGNMENT {
+            assert!(TaskRegistry::record_assignment_mutation(
+                &mut durable,
+                &authority,
+                process.clone(),
+                task.clone(),
+                format!("operation-{index}"),
+                Digest::sha256(index.to_string()),
+                &response,
+            ));
+        }
+        let active = durable
+            .active_assignments
+            .get(&authority.assignment_id)
+            .unwrap();
+        assert_eq!(
+            active.terminal_mutations.len(),
+            MAX_TERMINAL_MUTATIONS_PER_ASSIGNMENT
+        );
+        assert_eq!(
+            active.terminal_mutations.front().unwrap().operation_id,
+            "operation-1"
+        );
+        TaskRegistry::terminalize_active_assignment(&mut durable, &authority, 2, true);
+        assert_eq!(
+            durable
+                .terminal_assignment_history
+                .back()
+                .unwrap()
+                .terminal_mutations
+                .len(),
+            MAX_TERMINAL_MUTATIONS_PER_ASSIGNMENT
+        );
     }
 
     #[test]

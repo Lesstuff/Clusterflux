@@ -164,6 +164,7 @@ mod external_identifier_tests {
                     issued_at_epoch_seconds: 1,
                     signature: "ed25519:syntactically-bounded".to_owned(),
                     assignment_authority: None,
+                    operation_id: None,
                 }),
             },
             CoordinatorRequest::SignedNode {
@@ -173,6 +174,7 @@ mod external_identifier_tests {
                     issued_at_epoch_seconds: 1,
                     signature: "ed25519:syntactically-bounded".to_owned(),
                     assignment_authority: None,
+                    operation_id: None,
                 },
                 request: Box::new(CoordinatorRequest::PollNodeAssignment {
                     tenant: "tenant".to_owned(),
@@ -258,6 +260,7 @@ mod external_identifier_tests {
                 issued_at_epoch_seconds: 1,
                 signature: "ed25519:syntactically-bounded".to_owned(),
                 assignment_authority: None,
+                operation_id: None,
             }),
         };
         let error = node_request.validate_external_identifiers().unwrap_err();
