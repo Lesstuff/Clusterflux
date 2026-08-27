@@ -704,7 +704,6 @@ impl TriggerContext {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct PublicationResult {
     pub tag: String,
     pub release_url: String,
@@ -955,5 +954,25 @@ mod tests {
         policy.validate().unwrap();
         assert_eq!(policy.max_output_bytes, 12 * 1024 * 1024);
         assert!(policy.max_output_bytes > MAX_COMPILED_WORKFLOW_DEBUG_BYTES);
+    }
+
+    #[test]
+    fn publication_result_allows_pipeline_owned_metadata() {
+        let publication = serde_json::from_value::<Option<PublicationResult>>(serde_json::json!({
+            "tag": "build-0123456789ab",
+            "release_url": "https://github.com/example/project/releases/tag/build-0123456789ab",
+            "uploaded_asset_names": ["archive.tar.gz", "SHA256SUMS"],
+            "published_at": 1,
+            "nix_cache": {
+                "attempted": true,
+                "succeeded": false,
+                "failure": "cache service unavailable"
+            }
+        }))
+        .unwrap()
+        .unwrap();
+
+        publication.validate().unwrap();
+        assert_eq!(publication.tag, "build-0123456789ab");
     }
 }
