@@ -422,6 +422,12 @@ pub struct CoordinatorService {
     secret_cipher: Option<SecretCipher>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum TaskCompletionOrigin {
+    SignedNode,
+    ExpiredAssignment,
+}
+
 impl CoordinatorService {
     pub fn project_record(&self, project: &ProjectId) -> Option<&crate::ProjectRecord> {
         self.coordinator.project(project)
@@ -865,6 +871,16 @@ impl CoordinatorService {
         Ok(self
             .coordinator
             .authenticate_cli_session_for_status(session_secret)?)
+    }
+
+    pub fn charge_authenticated_api_call(
+        &mut self,
+        context: &clusterflux_core::AuthContext,
+    ) -> Result<(), CoordinatorServiceError> {
+        let now_epoch_seconds = self.current_epoch_seconds()?;
+        self.quota
+            .charge_api_call(&context.tenant, &context.project, now_epoch_seconds)?;
+        Ok(())
     }
 
     pub fn revoke_cli_session(

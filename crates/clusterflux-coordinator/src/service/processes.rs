@@ -210,6 +210,7 @@ impl CoordinatorService {
                 None,
                 None,
                 None,
+                super::TaskCompletionOrigin::ExpiredAssignment,
             )?;
         }
         self.persist_durable_state()?;
@@ -231,6 +232,12 @@ impl CoordinatorService {
         self.coordinator
             .node_identity(&tenant, &project, &node)
             .ok_or(CoordinatorError::UnknownNode)?;
+        if self.coordinator.tenant_suspended(&tenant) {
+            return Ok(CoordinatorResponse::NodeAssignment {
+                assignment: None,
+                cancel_assignment: active_assignment,
+            });
+        }
         let scope = NodeScopeKey::from_refs(&tenant, &project, &node);
         let descriptor = self
             .node_registry

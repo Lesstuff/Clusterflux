@@ -148,6 +148,7 @@ fn write_constrained_workflow(project: &Path, name: &str, source: &str) {
 }
 
 mod auth_and_doctor;
+mod automation_ops;
 mod bundle_and_node;
 mod command_controls;
 mod projects_and_reports;

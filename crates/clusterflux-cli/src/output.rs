@@ -2,8 +2,11 @@ use anyhow::Result;
 use serde::Serialize;
 use serde_json::{json, Value};
 
+use crate::guidance::{ensure_report_guidance, OperationGuidance};
+
 pub(crate) fn emit_report<T: Serialize>(report: &T, json_output: bool) -> Result<()> {
     let mut value = serde_json::to_value(report)?;
+    ensure_report_guidance(&mut value)?;
     let exit_code = apply_command_report_exit_code(&mut value);
     if json_output {
         println!("{}", serde_json::to_string_pretty(&value)?);
@@ -18,12 +21,13 @@ pub(crate) fn emit_report<T: Serialize>(report: &T, json_output: bool) -> Result
 
 pub(crate) fn human_report(value: &Value) -> String {
     let mut lines = Vec::new();
+    let has_operation_guidance = value.get("guidance").is_some_and(Value::is_object);
     let title = value
         .get("command")
         .and_then(Value::as_str)
         .map(|command| format!("Clusterflux {command}"))
         .or_else(|| {
-            if value.get("human_flow").is_some() {
+            if value.get("human_flow").is_some() || value.pointer("/plan/human_flow").is_some() {
                 Some("Clusterflux login".to_owned())
             } else if value.get("metadata").is_some()
                 && value.get("source_provider_manifest").is_some()
@@ -176,18 +180,40 @@ pub(crate) fn human_report(value: &Value) -> String {
             ));
         }
     }
-    push_machine_error_line(&mut lines, value.get("machine_error"));
-    push_machine_error_line(&mut lines, value.pointer("/run_start/machine_error"));
-    push_machine_error_line(&mut lines, value.pointer("/download_session/machine_error"));
-    push_machine_error_line(&mut lines, value.pointer("/export_plan/machine_error"));
-    push_machine_error_line(&mut lines, value.pointer("/local_export/machine_error"));
+    push_machine_error_line(
+        &mut lines,
+        value.get("machine_error"),
+        !has_operation_guidance,
+    );
+    push_machine_error_line(
+        &mut lines,
+        value.pointer("/run_start/machine_error"),
+        !has_operation_guidance,
+    );
+    push_machine_error_line(
+        &mut lines,
+        value.pointer("/download_session/machine_error"),
+        !has_operation_guidance,
+    );
+    push_machine_error_line(
+        &mut lines,
+        value.pointer("/export_plan/machine_error"),
+        !has_operation_guidance,
+    );
+    push_machine_error_line(
+        &mut lines,
+        value.pointer("/local_export/machine_error"),
+        !has_operation_guidance,
+    );
     push_machine_error_line(
         &mut lines,
         value.pointer("/local_export/download_session/machine_error"),
+        !has_operation_guidance,
     );
     push_machine_error_line(
         &mut lines,
         value.pointer("/local_export/stream/machine_error"),
+        !has_operation_guidance,
     );
     if let Some(flow) = value.get("human_flow") {
         if let Some(browser) = flow.get("Browser") {
@@ -285,13 +311,21 @@ pub(crate) fn human_report(value: &Value) -> String {
     {
         lines.push(format!("external website required: {flag}"));
     }
-    if let Some(next_actions) = value.get("next_actions").and_then(Value::as_array) {
-        let actions = next_actions
-            .iter()
-            .filter_map(Value::as_str)
-            .collect::<Vec<_>>();
-        if !actions.is_empty() {
-            lines.push(format!("next: {}", actions.join("; ")));
+    if let Some(guidance) = value
+        .get("guidance")
+        .filter(|guidance| guidance.is_object())
+    {
+        push_operation_guidance(&mut lines, guidance);
+    }
+    if !has_operation_guidance {
+        if let Some(next_actions) = value.get("next_actions").and_then(Value::as_array) {
+            let actions = next_actions
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>();
+            if !actions.is_empty() {
+                lines.push(format!("next: {}", actions.join("; ")));
+            }
         }
     }
     if let Some(auth) = value.get("auth").or_else(|| value.get("session")) {
@@ -609,7 +643,11 @@ fn push_nested_string_field(lines: &mut Vec<String>, value: &Value, key: &str, l
     }
 }
 
-fn push_machine_error_line(lines: &mut Vec<String>, machine_error: Option<&Value>) {
+fn push_machine_error_line(
+    lines: &mut Vec<String>,
+    machine_error: Option<&Value>,
+    include_legacy_actions: bool,
+) {
     let Some(machine_error) = machine_error else {
         return;
     };
@@ -631,14 +669,54 @@ fn push_machine_error_line(lines: &mut Vec<String>, machine_error: Option<&Value
     {
         lines.push(format!("quota tier: {tier}"));
     }
-    if let Some(next_actions) = machine_error.get("next_actions").and_then(Value::as_array) {
-        let actions = next_actions
-            .iter()
-            .filter_map(Value::as_str)
-            .collect::<Vec<_>>();
-        if !actions.is_empty() {
-            lines.push(format!("error next: {}", actions.join("; ")));
+    if include_legacy_actions {
+        if let Some(next_actions) = machine_error.get("next_actions").and_then(Value::as_array) {
+            let actions = next_actions
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>();
+            if !actions.is_empty() {
+                lines.push(format!("error next: {}", actions.join("; ")));
+            }
         }
+    }
+}
+
+fn push_operation_guidance(lines: &mut Vec<String>, value: &Value) {
+    let Ok(guidance) = serde_json::from_value::<OperationGuidance>(value.clone()) else {
+        lines.push("next: unavailable (invalid operation guidance)".to_owned());
+        return;
+    };
+    if let Some(command) = guidance.recommended {
+        lines.push(format!(
+            "next: {}{}",
+            command.shell_command(),
+            guidance_annotations(command.mutating, command.requires_confirmation)
+        ));
+    } else if let Some(reason) = guidance.no_safe_action_reason {
+        lines.push(format!("next: none ({reason})"));
+    }
+    for command in guidance.alternatives {
+        lines.push(format!(
+            "alternative: {}{}",
+            command.shell_command(),
+            guidance_annotations(command.mutating, command.requires_confirmation)
+        ));
+    }
+}
+
+fn guidance_annotations(mutating: bool, requires_confirmation: bool) -> String {
+    let mut annotations = Vec::new();
+    if mutating {
+        annotations.push("mutating");
+    }
+    if requires_confirmation {
+        annotations.push("confirmation required");
+    }
+    if annotations.is_empty() {
+        String::new()
+    } else {
+        format!(" [{}]", annotations.join(", "))
     }
 }
 
@@ -715,4 +793,80 @@ pub(crate) fn apply_command_report_exit_code(value: &mut Value) -> Option<i32> {
         return Some(exit_code);
     }
     None
+}
+
+#[cfg(test)]
+mod guidance_tests {
+    use super::*;
+    use crate::guidance::{GuidanceKind, GuidedCommand, OperationGuidance};
+
+    #[test]
+    fn human_report_renders_typed_guidance_and_hides_legacy_actions() {
+        let guidance = OperationGuidance::recommended(GuidedCommand::new(
+            GuidanceKind::Authenticate,
+            ["clusterflux", "login", "--browser"],
+            true,
+            false,
+        ))
+        .alternative(GuidedCommand::new(
+            GuidanceKind::Inspect,
+            ["clusterflux", "auth", "status"],
+            false,
+            false,
+        ))
+        .build()
+        .unwrap();
+        let report = json!({
+            "command": "run",
+            "status": "authentication_required",
+            "machine_error": {
+                "category": "authentication",
+                "stable_exit_code": 20,
+                "next_actions": ["legacy error action"]
+            },
+            "next_actions": ["legacy top-level action"],
+            "guidance": guidance,
+        });
+
+        let human = human_report(&report);
+        assert!(human.contains("error category: authentication (exit 20)"));
+        assert!(human.contains("next: clusterflux login --browser [mutating]"));
+        assert!(human.contains("alternative: clusterflux auth status"));
+        assert!(!human.contains("legacy error action"));
+        assert!(!human.contains("legacy top-level action"));
+    }
+
+    #[test]
+    fn human_report_quotes_structured_commands() {
+        let report = json!({
+            "command": "process status",
+            "guidance": {
+                "recommended": {
+                    "kind": "inspect",
+                    "command": ["clusterflux", "process", "status", "--process", "process with spaces"],
+                    "mutating": false,
+                    "requires_confirmation": false
+                },
+                "alternatives": []
+            }
+        });
+
+        assert!(human_report(&report)
+            .contains("next: clusterflux process status --process 'process with spaces'"));
+    }
+
+    #[test]
+    fn human_report_explains_when_no_safe_action_exists() {
+        let report = json!({
+            "command": "logs",
+            "guidance": {
+                "recommended": null,
+                "alternatives": [],
+                "no_safe_action_reason": "operation completed; no follow-up is required"
+            }
+        });
+
+        assert!(human_report(&report)
+            .contains("next: none (operation completed; no follow-up is required)"));
+    }
 }

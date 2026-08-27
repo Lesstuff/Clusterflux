@@ -318,28 +318,43 @@ impl TaskRegistry {
         payload_digest: Digest,
         response: &clusterflux_protocol::CoordinatorResponse,
     ) -> bool {
-        let Some(active) = durable.active_assignments.get_mut(&authority.assignment_id) else {
-            return false;
-        };
-        if active.attempt_id != authority.attempt_id || active.offer_epoch != authority.offer_epoch
-        {
-            return false;
-        }
         let Some(response) = AssignmentMutationResponse::from_coordinator_response(response) else {
             return false;
         };
-        while active.terminal_mutations.len() >= MAX_TERMINAL_MUTATIONS_PER_ASSIGNMENT {
-            active.terminal_mutations.pop_front();
+        let mutations = if let Some(active) = durable
+            .active_assignments
+            .get_mut(&authority.assignment_id)
+            .filter(|active| {
+                active.attempt_id == authority.attempt_id
+                    && active.offer_epoch == authority.offer_epoch
+            }) {
+            &mut active.terminal_mutations
+        } else if let Some(terminal) =
+            durable
+                .terminal_assignment_history
+                .iter_mut()
+                .rev()
+                .find(|terminal| {
+                    terminal.replay_allowed
+                        && terminal.assignment_id == authority.assignment_id
+                        && terminal.attempt_id == authority.attempt_id
+                        && terminal.offer_epoch == authority.offer_epoch
+                })
+        {
+            &mut terminal.terminal_mutations
+        } else {
+            return false;
+        };
+        while mutations.len() >= MAX_TERMINAL_MUTATIONS_PER_ASSIGNMENT {
+            mutations.pop_front();
         }
-        active
-            .terminal_mutations
-            .push_back(AssignmentMutationRecord {
-                process,
-                task,
-                operation_id,
-                payload_digest,
-                response,
-            });
+        mutations.push_back(AssignmentMutationRecord {
+            process,
+            task,
+            operation_id,
+            payload_digest,
+            response,
+        });
         true
     }
 

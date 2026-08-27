@@ -1061,16 +1061,18 @@ impl NodeArtifactDataPlane {
         artifact_store: &NodeArtifactStore,
         shutdown: CancellationToken,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let response = session.request(signed_node_request(
-            args,
-            node_private_key,
-            "get_artifact_data_plane_policy",
-            CoordinatorRequest::GetArtifactDataPlanePolicy {
-                tenant: args.tenant.clone(),
-                project: args.project.clone(),
-                node: args.node.clone(),
-            },
-        )?)?;
+        let response = session.request_signed(|| {
+            signed_node_request(
+                args,
+                node_private_key,
+                "get_artifact_data_plane_policy",
+                CoordinatorRequest::GetArtifactDataPlanePolicy {
+                    tenant: args.tenant.clone(),
+                    project: args.project.clone(),
+                    node: args.node.clone(),
+                },
+            )
+        })?;
         let CoordinatorResponse::ArtifactDataPlanePolicy { policy } = response else {
             return Err("coordinator returned an unexpected artifact-policy response".into());
         };
@@ -1233,16 +1235,18 @@ impl NodeArtifactDataPlane {
         node_private_key: &str,
         artifact_store: &NodeArtifactStore,
     ) -> Result<bool, Box<dyn std::error::Error>> {
-        let response = session.request(signed_node_request(
-            args,
-            node_private_key,
-            "poll_artifact_receiver_assignment",
-            CoordinatorRequest::PollArtifactReceiverAssignment {
-                tenant: args.tenant.clone(),
-                project: args.project.clone(),
-                node: args.node.clone(),
-            },
-        )?)?;
+        let response = session.request_signed(|| {
+            signed_node_request(
+                args,
+                node_private_key,
+                "poll_artifact_receiver_assignment",
+                CoordinatorRequest::PollArtifactReceiverAssignment {
+                    tenant: args.tenant.clone(),
+                    project: args.project.clone(),
+                    node: args.node.clone(),
+                },
+            )
+        })?;
         let CoordinatorResponse::ArtifactReceiverAssignment { authorization } = response else {
             return Err("coordinator returned an unexpected receiver-assignment response".into());
         };
@@ -1878,18 +1882,20 @@ fn acknowledge_assignment(
     authorization: &ArtifactTransferAuthorization,
     role: ArtifactAssignmentRole,
 ) -> Result<Value, Box<dyn std::error::Error>> {
-    let response = session.request(signed_node_request(
-        args,
-        node_private_key,
-        "acknowledge_artifact_assignment",
-        CoordinatorRequest::AcknowledgeArtifactAssignment {
-            tenant: args.tenant.clone(),
-            project: args.project.clone(),
-            node: args.node.clone(),
-            transfer_id: authorization.lease.transfer_id.clone(),
-            role,
-        },
-    )?)?;
+    let response = session.request_signed(|| {
+        signed_node_request(
+            args,
+            node_private_key,
+            "acknowledge_artifact_assignment",
+            CoordinatorRequest::AcknowledgeArtifactAssignment {
+                tenant: args.tenant.clone(),
+                project: args.project.clone(),
+                node: args.node.clone(),
+                transfer_id: authorization.lease.transfer_id.clone(),
+                role,
+            },
+        )
+    })?;
     match response {
         response @ CoordinatorResponse::ArtifactAssignmentAcknowledged { .. } => {
             serde_json::to_value(response).map_err(Into::into)
@@ -1944,17 +1950,19 @@ fn report_endpoint_advertisement(
         policy.generation,
         now.saturating_add(policy.endpoint_advertisement_ttl_seconds),
     )?;
-    let response = session.request(signed_node_request(
-        args,
-        node_private_key,
-        "report_iroh_endpoint_advertisement",
-        CoordinatorRequest::ReportIrohEndpointAdvertisement {
-            tenant: args.tenant.clone(),
-            project: args.project.clone(),
-            node: args.node.clone(),
-            advertisement,
-        },
-    )?)?;
+    let response = session.request_signed(|| {
+        signed_node_request(
+            args,
+            node_private_key,
+            "report_iroh_endpoint_advertisement",
+            CoordinatorRequest::ReportIrohEndpointAdvertisement {
+                tenant: args.tenant.clone(),
+                project: args.project.clone(),
+                node: args.node.clone(),
+                advertisement: advertisement.clone(),
+            },
+        )
+    })?;
     match response {
         CoordinatorResponse::IrohEndpointAdvertisementAccepted { .. } => Ok(()),
         _ => Err("coordinator returned an unexpected endpoint-advertisement response".into()),

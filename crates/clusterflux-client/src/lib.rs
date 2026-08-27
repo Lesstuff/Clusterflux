@@ -18,8 +18,9 @@ pub use clusterflux_core::{
     AgentId, ApiErrorCategory, ApiErrorCode, ArtifactId, Authorization, AutomatedRunRecord,
     AutomatedRunState, Capability, CredentialKind, Digest, DownloadLink, EnvironmentBackend,
     LimitKind, NodeCapabilities, NodeDrainBlocker, NodeDrainBlockerKind, NodeDrainStatus, NodeId,
-    NodeLifecycleState, Os, ProcessId, ProjectId, ResourceLimits, RunId, TaskDefinitionId,
-    TaskFailurePolicy, TaskInstanceId, TenantId, UserId, VfsPath,
+    NodeLifecycleState, Os, ProcessId, ProjectId, RepositoryId, ResourceLimits, RunId,
+    TaskDefinitionId, TaskFailurePolicy, TaskInstanceId, TenantId, UserId, VfsPath,
+    WebhookDeliveryOutcome, WebhookDeliveryRecord,
 };
 pub use clusterflux_protocol::{CONTROL_API_PATH, LOGIN_API_PATH};
 pub use session::{
@@ -451,6 +452,67 @@ impl ClusterfluxClient {
         {
             CoordinatorResponse::AutomatedRun { run, .. } => Ok(run),
             _ => Err(unexpected_response("automated_run")),
+        }
+    }
+
+    pub async fn get_automated_run(&self, run: RunId) -> Result<AutomatedRunRecord, ClientError> {
+        match self
+            .send_authenticated(
+                AuthenticatedCoordinatorRequest::GetAutomatedRun {
+                    run: run.to_string(),
+                },
+                "automated_run",
+            )
+            .await?
+        {
+            CoordinatorResponse::AutomatedRun { run, .. } => Ok(run),
+            _ => Err(unexpected_response("automated_run")),
+        }
+    }
+
+    pub async fn trigger_automated_run(
+        &self,
+        repository: RepositoryId,
+        git_ref: String,
+        commit: Option<String>,
+    ) -> Result<AutomatedRunRecord, ClientError> {
+        match self
+            .send_authenticated(
+                AuthenticatedCoordinatorRequest::TriggerAutomatedRun {
+                    repository: repository.to_string(),
+                    git_ref,
+                    commit,
+                },
+                "automated_run",
+            )
+            .await?
+        {
+            CoordinatorResponse::AutomatedRun { run, .. } => Ok(run),
+            _ => Err(unexpected_response("automated_run")),
+        }
+    }
+
+    pub async fn list_webhook_deliveries_page(
+        &self,
+        cursor: Option<String>,
+        limit: u32,
+    ) -> Result<WebhookDeliveryPage, ClientError> {
+        match self
+            .send_authenticated(
+                AuthenticatedCoordinatorRequest::ListWebhookDeliveries { cursor, limit },
+                "webhook_deliveries",
+            )
+            .await?
+        {
+            CoordinatorResponse::WebhookDeliveries {
+                deliveries,
+                next_cursor,
+                ..
+            } => Ok(WebhookDeliveryPage {
+                deliveries,
+                next_cursor,
+            }),
+            _ => Err(unexpected_response("webhook_deliveries")),
         }
     }
 

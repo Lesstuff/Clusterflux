@@ -14,20 +14,22 @@ pub(crate) async fn poll_task_cancellation(
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let deadline = Instant::now() + Duration::from_millis(args.control_poll_ms);
     loop {
-        let control = session.request(signed_node_assignment_request(
-            args,
-            node_private_key,
-            &task.assignment_authority,
-            "poll_task_control",
-            CoordinatorRequest::PollTaskControl {
-                tenant: args.tenant.clone(),
-                project: args.project.clone(),
-                process: task.process.clone(),
-                node: args.node.clone(),
-                task: task.task.clone(),
-                child_tasks: Vec::new(),
-            },
-        )?)?;
+        let control = session.request_signed(|| {
+            signed_node_assignment_request(
+                args,
+                node_private_key,
+                &task.assignment_authority,
+                "poll_task_control",
+                CoordinatorRequest::PollTaskControl {
+                    tenant: args.tenant.clone(),
+                    project: args.project.clone(),
+                    process: task.process.clone(),
+                    node: args.node.clone(),
+                    task: task.task.clone(),
+                    child_tasks: Vec::new(),
+                },
+            )
+        })?;
         let CoordinatorResponse::TaskControl {
             cancel_requested,
             abort_requested,

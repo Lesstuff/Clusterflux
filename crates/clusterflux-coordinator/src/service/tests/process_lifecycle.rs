@@ -238,6 +238,66 @@ fn acknowledged_process_offer_expires_to_visible_node_offline_without_duplicatio
 }
 
 #[test]
+fn revoked_node_does_not_poison_expired_assignment_reconciliation() {
+    let mut service = CoordinatorService::new(7);
+    service.set_node_stale_after_seconds(60);
+    service.set_server_time(100);
+    attach_live_process_worker(&mut service, "node-a");
+    start_assignment_lifecycle_process(&mut service);
+    launch_assignment_lifecycle_task(&mut service);
+    let assignment = poll_process_assignment(&mut service, "node-a");
+    service
+        .handle_request(signed_node_request_auto_with_private_key_and_authority(
+            CoordinatorRequest::AcknowledgeNodeAssignment {
+                tenant: "tenant".to_owned(),
+                project: "project".to_owned(),
+                node: "node-a".to_owned(),
+                assignment_id: assignment.assignment_id.clone(),
+                lease_epoch: assignment.offer_epoch,
+            },
+            &test_node_private_key("node-a"),
+            Some(assignment_authority(&assignment)),
+        ))
+        .unwrap();
+
+    service
+        .handle_request(CoordinatorRequest::RevokeNodeCredential {
+            tenant: "tenant".to_owned(),
+            project: "project".to_owned(),
+            actor_user: "user".to_owned(),
+            node: "node-a".to_owned(),
+        })
+        .unwrap();
+
+    service.set_server_time(281);
+    assert!(matches!(
+        service.handle_request(CoordinatorRequest::Ping).unwrap(),
+        CoordinatorResponse::Pong { epoch: 7 }
+    ));
+
+    let CoordinatorResponse::TaskJoined { join } = service
+        .handle_request(CoordinatorRequest::JoinTask {
+            tenant: "tenant".to_owned(),
+            project: "project".to_owned(),
+            actor_user: "user".to_owned(),
+            process: "assignment-process".to_owned(),
+            task: "assignment-task".to_owned(),
+        })
+        .unwrap()
+    else {
+        panic!("expected join result");
+    };
+    assert_eq!(join.state, TaskJoinState::Failed);
+    assert!(join.remote_completion_observed);
+    assert!(join.message.contains("node_offline"));
+    assert!(service
+        .coordinator
+        .durable_state()
+        .active_assignments
+        .is_empty());
+}
+
+#[test]
 fn coordinator_restart_recovery_retires_acknowledged_process_authority() {
     let mut service = CoordinatorService::new(7);
     service.set_server_time(100);

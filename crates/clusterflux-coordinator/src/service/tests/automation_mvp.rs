@@ -564,6 +564,87 @@ fn cancelled_system_assignment_is_revoked_through_normal_node_poll() {
 }
 
 #[test]
+fn suspending_tenant_cancels_queued_and_active_automation_without_restarting_it() {
+    let mut service = service_with_project();
+    let queued_trigger = trigger(91, 91);
+    let queued = accept(&mut service, "binding", queued_trigger);
+    let compiling_trigger = trigger(92, 92);
+    let compiling = accept(&mut service, "binding", compiling_trigger.clone());
+    let source = source_for(&compiling_trigger, &compiling_trigger.commit_sha);
+    service
+        .record_automated_run_source(
+            &compiling.run.run_id,
+            source.clone(),
+            revision_for(&compiling_trigger),
+        )
+        .unwrap();
+    service
+        .enqueue_workflow_compilation(compilation_request(compiling.run.run_id.clone(), source))
+        .unwrap();
+    attach_system_bundle_node(&mut service, "ordinary-node");
+    let CoordinatorResponse::NodeAssignment {
+        assignment: Some(offer),
+        ..
+    } = service
+        .handle_poll_node_assignment(
+            "tenant".to_owned(),
+            "project".to_owned(),
+            "ordinary-node".to_owned(),
+            true,
+            false,
+            None,
+        )
+        .unwrap()
+    else {
+        panic!("ordinary node should receive system assignment");
+    };
+    service
+        .handle_acknowledge_node_assignment(
+            "tenant".to_owned(),
+            "project".to_owned(),
+            "ordinary-node".to_owned(),
+            offer.assignment_id.clone(),
+            offer.lease_epoch,
+            Some(offer_authority(&offer)),
+        )
+        .unwrap();
+
+    service
+        .suspend_hosted_account(TenantId::from("tenant"), UserId::from("admin"), 1_100)
+        .unwrap();
+    for run in [&queued.run.run_id, &compiling.run.run_id] {
+        assert_eq!(
+            service.automated_run(run).unwrap().run.state,
+            AutomatedRunState::Cancelled
+        );
+    }
+    assert!(service.launchable_automated_runs(8).is_empty());
+
+    let active = clusterflux_protocol::ActiveNodeAssignment {
+        assignment_id: offer.assignment_id,
+        attempt_id: offer.attempt_id,
+        lease_epoch: offer.lease_epoch,
+    };
+    let CoordinatorResponse::NodeAssignment {
+        assignment: None,
+        cancel_assignment: Some(cancelled),
+    } = service
+        .handle_poll_node_assignment(
+            "tenant".to_owned(),
+            "project".to_owned(),
+            "ordinary-node".to_owned(),
+            true,
+            true,
+            Some(active.clone()),
+        )
+        .unwrap()
+    else {
+        panic!("suspended tenant should only return cancellation for active work");
+    };
+    assert_eq!(cancelled, active);
+}
+
+#[test]
 fn system_assignment_wait_reasons_are_actionable_and_compatible_node_resumes() {
     let mut service = service_with_project();
     let commit = trigger(19, 19);
@@ -807,10 +888,62 @@ fn source_identity_and_system_assignment_lease_ownership_fail_closed() {
     let mut stale = failed_result("system-node");
     stale.lease_epoch = stale.lease_epoch.saturating_add(1);
     assert!(service.report_system_compile_for_test(stale).is_err());
+    let system_result_request =
+        |result: WorkflowCompilationResult| CoordinatorRequest::ReportSystemTask {
+            tenant: "tenant".to_owned(),
+            project: "project".to_owned(),
+            node: "system-node".to_owned(),
+            result: clusterflux_protocol::SystemTaskResult {
+                bundle_id: clusterflux_core::WORKFLOW_COMPILER_SYSTEM_BUNDLE_ID.to_owned(),
+                bundle_digest: clusterflux_core::workflow_compiler_system_bundle_digest(),
+                result: clusterflux_protocol::SystemTaskOutput::CompileWorkflow {
+                    result: Box::new(result),
+                },
+            },
+        };
+    let operation_id = format!("system-result-{}", offer.assignment_id);
+    let request = system_result_request(failed_result("system-node"));
     let failed = service
-        .report_system_compile_for_test(failed_result("system-node"))
+        .handle_request(signed_assignment_operation_for_test(
+            request.clone(),
+            "system-node",
+            "report_system_task",
+            offer_authority(&offer),
+            &operation_id,
+        ))
         .unwrap();
-    assert_eq!(failed.run.state, AutomatedRunState::Failed);
+    let CoordinatorResponse::SystemTaskRecorded { run } = failed else {
+        panic!("expected recorded system-task failure");
+    };
+    assert_eq!(run.state, AutomatedRunState::Failed);
+    let replay = service
+        .handle_request(signed_assignment_operation_for_test(
+            request,
+            "system-node",
+            "report_system_task",
+            offer_authority(&offer),
+            &operation_id,
+        ))
+        .unwrap();
+    assert_eq!(
+        replay,
+        CoordinatorResponse::SystemTaskRecorded { run: run.clone() }
+    );
+    let mut conflicting = failed_result("system-node");
+    conflicting.compiler_transcript = "different compiler result".to_owned();
+    let conflict = service
+        .handle_request(signed_assignment_operation_for_test(
+            system_result_request(conflicting),
+            "system-node",
+            "report_system_task",
+            offer_authority(&offer),
+            &operation_id,
+        ))
+        .unwrap_err();
+    assert!(matches!(
+        conflict,
+        CoordinatorServiceError::TerminalOperationConflict
+    ));
 
     let trigger = trigger(21, 21);
     let accepted = accept(&mut service, "binding", trigger.clone());

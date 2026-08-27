@@ -7,10 +7,9 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
-use clusterflux_core::RunId;
 #[cfg(test)]
 use clusterflux_core::{Capability, Digest, ProjectModel, SourceProviderKind};
-#[cfg(test)]
+use clusterflux_core::{RepositoryId, RunId};
 use serde_json::json;
 use serde_json::Value;
 
@@ -29,6 +28,7 @@ mod debug;
 mod dispatch;
 mod doctor;
 mod errors;
+mod guidance;
 mod key;
 mod logout;
 mod logs;
@@ -41,6 +41,7 @@ mod quota;
 mod run;
 mod task;
 mod tools;
+mod wait;
 
 use admin::{admin_bootstrap_report, admin_status_report, admin_suspend_tenant_report};
 use agent::agent_enrollment_plan;
@@ -52,16 +53,16 @@ use artifact::{
 };
 use auth::{
     auth_status_report, connect_self_hosted_report, execute_interactive_browser_login, login_plan,
-    non_interactive_browser_login_report, print_browser_login_success,
-    read_session_secret_from_stdin,
+    non_interactive_browser_login_report, read_session_secret_from_stdin,
 };
 #[cfg(test)]
 use auth::{contains_provider_token_field, stored_cli_session_from_login_response, LoginFlowPlan};
 #[cfg(test)]
 use auth_scope::login_args_for_project;
 use automation::{
-    run_cancel_report, run_list_report, run_show_report, secret_list_report, secret_revoke_report,
-    secret_set_report,
+    run_cancel_report, run_diagnose_report, run_list_report, run_retry_report, run_show_report,
+    run_trigger_report, secret_list_report, secret_revoke_report, secret_set_report,
+    webhook_deliveries_report,
 };
 use build::{build_report, check_report};
 #[cfg(test)]
@@ -80,9 +81,11 @@ pub(crate) use confirm::confirmation_required_report;
 use debug::debug_attach_report_with_dap;
 use debug::{dap_plan, debug_attach_report_with_dap_and_session, exec_dap};
 use doctor::doctor_report;
+#[cfg(test)]
 use errors::cli_error_summary;
 #[cfg(test)]
 use errors::cli_error_summary_for_category;
+use errors::cli_error_summary_from_error;
 #[cfg(test)]
 use key::{key_add_report, key_list_report, key_revoke_report};
 use key::{
@@ -95,11 +98,10 @@ use logs::logs_report_with_session;
 #[cfg(test)]
 use node::attach_plan;
 use node::{
-    execute_node_attach, node_enroll_report, node_list_report, node_revoke_report,
-    node_status_report,
+    execute_node_attach, node_doctor_report, node_enroll_report, node_list_report,
+    node_revoke_report, node_status_report,
 };
 use output::emit_report;
-#[cfg(test)]
 use output::{apply_command_report_exit_code, human_report};
 use process::{
     process_abort_report_with_session, process_cancel_report, process_cancel_report_with_session,
@@ -128,6 +130,7 @@ use run::{run_report, session_from_sources};
 use task::{task_list_report, task_restart_report};
 use task::{task_list_report_with_session, task_restart_report_with_session};
 use tools::dap_binary_path;
+use wait::WaitCommands;
 
 #[derive(Clone, Debug, Parser)]
 #[command(
@@ -142,7 +145,8 @@ use tools::dap_binary_path;
   4. clusterflux run [entry] --project <path>
   5. Debug with VS Code \"Clusterflux: Launch Virtual Process\" or clusterflux dap
   6. Inspect with clusterflux process list, clusterflux process status, task list, logs, and artifact list
-  7. Request cooperative shutdown with process cancel; force termination with process abort
+  7. Wait without polling with clusterflux wait run/process/node --timeout <duration>
+  8. Request cooperative shutdown with process cancel; force termination with process abort
 
 Use --json on primary commands for scriptable output. Hosted account creation happens in the browser login flow."
 )]
@@ -180,6 +184,10 @@ enum Commands {
         command: BundleCommands,
     },
     Run(RunArgs),
+    Wait {
+        #[command(subcommand)]
+        command: WaitCommands,
+    },
     Runs {
         #[command(subcommand)]
         command: RunsCommands,
@@ -187,6 +195,10 @@ enum Commands {
     Secret {
         #[command(subcommand)]
         command: SecretCommands,
+    },
+    Webhook {
+        #[command(subcommand)]
+        command: WebhookCommands,
     },
     Node {
         #[command(subcommand)]
@@ -225,6 +237,9 @@ enum RunsCommands {
     List(RunListArgs),
     Show(RunShowArgs),
     Cancel(RunCancelArgs),
+    Retry(RunRetryArgs),
+    Trigger(RunTriggerArgs),
+    Diagnose(RunDiagnoseArgs),
 }
 
 #[derive(Clone, Debug, Parser)]
@@ -249,11 +264,50 @@ struct RunCancelArgs {
     scope: CliScopeArgs,
 }
 
+#[derive(Clone, Debug, Parser)]
+struct RunRetryArgs {
+    #[arg(value_parser = parse_run_id)]
+    run: RunId,
+    #[command(flatten)]
+    scope: CliScopeArgs,
+}
+
+#[derive(Clone, Debug, Parser)]
+struct RunTriggerArgs {
+    #[arg(long, value_parser = parse_repository_id)]
+    repository: RepositoryId,
+    #[arg(long = "ref", value_parser = parse_git_ref)]
+    git_ref: String,
+    #[arg(long, value_parser = parse_commit_sha)]
+    commit: Option<String>,
+    #[command(flatten)]
+    scope: CliScopeArgs,
+}
+
+#[derive(Clone, Debug, Parser)]
+struct RunDiagnoseArgs {
+    #[arg(value_parser = parse_run_id)]
+    run: RunId,
+    #[command(flatten)]
+    scope: CliScopeArgs,
+}
+
 #[derive(Clone, Debug, Subcommand)]
 enum SecretCommands {
     Set(SecretSetArgs),
     List(SecretListArgs),
     Revoke(SecretRevokeArgs),
+}
+
+#[derive(Clone, Debug, Subcommand)]
+enum WebhookCommands {
+    Deliveries(WebhookDeliveriesArgs),
+}
+
+#[derive(Clone, Debug, Parser)]
+struct WebhookDeliveriesArgs {
+    #[command(flatten)]
+    scope: CliScopeArgs,
 }
 
 #[derive(Clone, Debug, Parser)]
@@ -280,6 +334,25 @@ struct SecretRevokeArgs {
 
 fn parse_run_id(value: &str) -> Result<RunId, String> {
     RunId::try_new(value).map_err(|error| error.to_string())
+}
+
+fn parse_repository_id(value: &str) -> Result<RepositoryId, String> {
+    RepositoryId::try_new(value).map_err(|error| error.to_string())
+}
+
+fn parse_commit_sha(value: &str) -> Result<String, String> {
+    clusterflux_core::validate_commit_sha(value)?;
+    Ok(value.to_owned())
+}
+
+fn parse_git_ref(value: &str) -> Result<String, String> {
+    if value.len() > 512
+        || !(value.starts_with("refs/heads/") || value.starts_with("refs/tags/"))
+        || value.ends_with('/')
+    {
+        return Err("Git ref must identify a branch or tag".to_owned());
+    }
+    Ok(value.to_owned())
 }
 
 #[derive(Clone, Debug, Parser)]
@@ -315,6 +388,9 @@ enum AuthCommands {
 struct AuthStatusArgs {
     #[command(flatten)]
     scope: CliScopeArgs,
+    /// Fail unless the authenticated session remains valid for at least this long.
+    #[arg(long, value_parser = wait::parse_wait_duration)]
+    require_valid_for: Option<std::time::Duration>,
 }
 
 #[derive(Clone, Debug, Parser)]
@@ -485,6 +561,15 @@ enum NodeCommands {
     List(NodeListArgs),
     Status(NodeStatusArgs),
     Revoke(NodeRevokeArgs),
+    Doctor(NodeDoctorArgs),
+}
+
+#[derive(Clone, Debug, Parser)]
+struct NodeDoctorArgs {
+    #[command(flatten)]
+    scope: CliScopeArgs,
+    #[arg(long)]
+    node: Option<String>,
 }
 
 #[derive(Clone, Debug, Parser)]
@@ -759,8 +844,7 @@ struct CliScopeArgs {
 
 fn main() {
     if let Err(error) = dispatch::run_cli() {
-        let message = error.to_string();
-        let machine_error = cli_error_summary(&message);
+        let machine_error = cli_error_summary_from_error(&error);
         let category = machine_error
             .get("category")
             .and_then(Value::as_str)
@@ -770,7 +854,37 @@ fn main() {
             .and_then(Value::as_i64)
             .and_then(|code| i32::try_from(code).ok())
             .unwrap_or(1);
-        eprintln!("Error ({category}, exit {exit_code}): {error:#}");
+        let mut report = json!({
+            "command": "error",
+            "status": "failed",
+            "machine_error": machine_error,
+        });
+        if let Some(coordinator) = error
+            .downcast_ref::<errors::CliFailure>()
+            .and_then(|failure| failure.coordinator.as_deref())
+        {
+            report
+                .as_object_mut()
+                .expect("fatal report is an object")
+                .insert("coordinator".to_owned(), json!(coordinator));
+        }
+        if let Err(guidance_error) = guidance::ensure_report_guidance(&mut report) {
+            eprintln!("Error ({category}, exit {exit_code}): {error:#}");
+            eprintln!("Unable to render follow-up guidance: {guidance_error}");
+            std::process::exit(exit_code);
+        }
+        apply_command_report_exit_code(&mut report);
+        if std::env::args_os().any(|argument| argument == "--json") {
+            match serde_json::to_string_pretty(&report) {
+                Ok(report) => println!("{report}"),
+                Err(render_error) => {
+                    eprintln!("Error ({category}, exit {exit_code}): {error:#}");
+                    eprintln!("Unable to serialize error report: {render_error}");
+                }
+            }
+        } else {
+            eprintln!("{}", human_report(&report));
+        }
         std::process::exit(exit_code);
     }
 }

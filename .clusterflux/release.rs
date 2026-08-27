@@ -19,11 +19,20 @@ pub struct PublishInput {
 
 #[derive(Clone, Serialize, Deserialize, clusterflux::TaskArg)]
 #[serde(crate = "clusterflux::serde")]
+pub struct NixCachePublication {
+    pub attempted: bool,
+    pub succeeded: bool,
+    pub failure: Option<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize, clusterflux::TaskArg)]
+#[serde(crate = "clusterflux::serde")]
 pub struct PublicationResult {
     pub tag: String,
     pub release_url: String,
     pub uploaded_asset_names: Vec<String>,
     pub published_at: u64,
+    pub nix_cache: NixCachePublication,
 }
 
 #[clusterflux::task(capabilities = "command,network,secrets,vfs_artifacts")]
@@ -183,6 +192,11 @@ fn parse_result(stdout: &str) -> Result<PublicationResult> {
             CHECKSUMS_NAME.to_owned(),
         ],
         published_at,
+        nix_cache: NixCachePublication {
+            attempted: false,
+            succeeded: false,
+            failure: None,
+        },
     })
 }
 

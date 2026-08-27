@@ -265,6 +265,9 @@ pub enum AssignmentMutationResponse {
         task: TaskInstanceId,
         events_recorded: usize,
     },
+    SystemTaskRecorded {
+        run: Box<AutomatedRunRecord>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -302,6 +305,11 @@ impl AssignmentMutationResponse {
                 task: task.clone(),
                 events_recorded: *events_recorded,
             }),
+            clusterflux_protocol::CoordinatorResponse::SystemTaskRecorded { run } => {
+                Some(Self::SystemTaskRecorded {
+                    run: Box::new(run.clone()),
+                })
+            }
             _ => None,
         }
     }
@@ -328,6 +336,11 @@ impl AssignmentMutationResponse {
                 task: task.clone(),
                 events_recorded: *events_recorded,
             },
+            Self::SystemTaskRecorded { run } => {
+                clusterflux_protocol::CoordinatorResponse::SystemTaskRecorded {
+                    run: (**run).clone(),
+                }
+            }
         }
     }
 }

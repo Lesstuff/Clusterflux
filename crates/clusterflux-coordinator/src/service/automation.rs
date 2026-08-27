@@ -29,6 +29,29 @@ const SYSTEM_ASSIGNMENT_OFFER_SECONDS: u64 = 30;
 const MAX_SYSTEM_ASSIGNMENT_ATTEMPTS: u8 = 5;
 
 impl CoordinatorService {
+    pub fn automated_run_for_trigger_delivery(
+        &self,
+        binding_id: &str,
+        delivery_id: &str,
+    ) -> Option<RunId> {
+        let trigger_id = self
+            .coordinator
+            .durable_state()
+            .trigger_deliveries
+            .get(&(binding_id.to_owned(), delivery_id.to_owned()))?;
+        let trigger = self
+            .coordinator
+            .durable_state()
+            .accepted_commit_triggers
+            .get(trigger_id)?;
+        let run_key = trigger.trigger.run_identity(&trigger.project);
+        self.coordinator
+            .durable_state()
+            .automated_run_keys
+            .get(&run_key)
+            .cloned()
+    }
+
     fn terminalize_system_assignment_for_run(&mut self, run_id: &RunId, now: u64) {
         let kind = AssignmentKind::WorkflowCompiler {
             run_id: run_id.clone(),

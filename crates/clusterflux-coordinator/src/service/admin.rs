@@ -126,6 +126,18 @@ impl CoordinatorService {
         );
         self.persist_durable_state()?;
 
+        let automated_runs = self
+            .coordinator
+            .durable_state()
+            .automated_runs
+            .values()
+            .filter(|record| record.run.tenant == tenant && !record.run.state.is_terminal())
+            .map(|record| record.run.run_id.clone())
+            .collect::<Vec<_>>();
+        for run in automated_runs {
+            self.cancel_automated_run(&run)?;
+        }
+
         let process_scopes = self.coordinator.active_process_scopes_for_tenant(&tenant);
         let mut aborted_processes = 0_u64;
         for (project, process) in process_scopes {

@@ -38,20 +38,22 @@ pub async fn main() -> Result<Option<PublicationResult>> {
     .join()
     .await?;
 
-    if stable_release_ref(&trigger.git_ref) {
-        clusterflux::spawn!(cache_nix_package(CacheNixInput {
-            source,
-            commit_sha: trigger.commit_sha.clone(),
-            tag: assets.tag.clone(),
-        }))
-        .on(clusterflux::env!("nix-cache-publish"))
-        .secret("cachix-auth-token")
-        .await?
-        .join()
-        .await?;
-    }
+    let cache_publication = if stable_release_ref(&trigger.git_ref) {
+        Some(
+            clusterflux::spawn!(cache_nix_package(CacheNixInput {
+                source,
+                commit_sha: trigger.commit_sha.clone(),
+                tag: assets.tag.clone(),
+            }))
+            .on(clusterflux::env!("nix-cache-publish"))
+            .secret("cachix-auth-token")
+            .await,
+        )
+    } else {
+        None
+    };
 
-    let publication = clusterflux::spawn!(publish(PublishInput {
+    let mut publication = clusterflux::spawn!(publish(PublishInput {
         repository_id: trigger.repository_id,
         commit_sha: trigger.commit_sha,
         git_ref: trigger.git_ref,
@@ -63,6 +65,31 @@ pub async fn main() -> Result<Option<PublicationResult>> {
     .await?
     .join()
     .await?;
+
+    publication.nix_cache = match cache_publication {
+        None => release::NixCachePublication {
+            attempted: false,
+            succeeded: false,
+            failure: None,
+        },
+        Some(Ok(task)) => match task.join().await {
+            Ok(()) => release::NixCachePublication {
+                attempted: true,
+                succeeded: true,
+                failure: None,
+            },
+            Err(error) => release::NixCachePublication {
+                attempted: true,
+                succeeded: false,
+                failure: Some(error.to_string()),
+            },
+        },
+        Some(Err(error)) => release::NixCachePublication {
+            attempted: true,
+            succeeded: false,
+            failure: Some(error.to_string()),
+        },
+    };
 
     Ok(Some(publication))
 }

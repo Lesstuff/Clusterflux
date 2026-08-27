@@ -141,6 +141,7 @@ pub(crate) struct LoginCompletionBoundaryEvidence {
     pub(crate) provider_tokens_persisted_locally: bool,
     pub(crate) provider_tokens_exposed_to_cli: bool,
     pub(crate) provider_tokens_sent_to_nodes: bool,
+    pub(crate) cli_session_secret_exposed_to_output: bool,
     pub(crate) coordinator_session_requests: u64,
 }
 
@@ -246,7 +247,8 @@ pub(crate) fn auth_status_report(args: AuthStatusArgs, cwd: PathBuf) -> Result<V
                 "signup_failure_details_exposed": false,
             })
         });
-    Ok(json!({
+    let required_valid_for = args.require_valid_for;
+    let mut report = json!({
         "command": "auth status",
         "active_coordinator": active_coordinator,
         "principal": principal,
@@ -257,7 +259,153 @@ pub(crate) fn auth_status_report(args: AuthStatusArgs, cwd: PathBuf) -> Result<V
         "session_scope_mismatch": session_scope_mismatch,
         "coordinator_account_status": coordinator_account_status,
         "project_config": config,
-    }))
+    });
+    apply_validity_requirement(
+        &mut report,
+        stored_session.as_ref(),
+        &active_coordinator,
+        required_valid_for,
+    )?;
+    Ok(report)
+}
+
+fn apply_validity_requirement(
+    report: &mut Value,
+    stored_session: Option<&StoredCliSession>,
+    coordinator: &str,
+    required: Option<Duration>,
+) -> Result<()> {
+    use crate::guidance::{attach_guidance, GuidanceKind, GuidedCommand, OperationGuidance};
+
+    let remote_valid = report
+        .pointer("/coordinator_account_status/coordinator_response_type")
+        .and_then(Value::as_str)
+        == Some("auth_status")
+        && report
+            .pointer("/coordinator_account_status/account_status")
+            .and_then(Value::as_str)
+            == Some("active");
+    let Some(required) = required else {
+        if !remote_valid {
+            if let Some(machine_error) = report
+                .pointer("/coordinator_account_status/machine_error")
+                .cloned()
+            {
+                report
+                    .as_object_mut()
+                    .context("auth status report is not an object")?
+                    .insert("machine_error".to_owned(), machine_error);
+            }
+        }
+        let guidance = if remote_valid {
+            OperationGuidance::no_safe_action("session status checked; no follow-up is required")
+                .build()?
+        } else {
+            let category = report
+                .pointer("/coordinator_account_status/machine_error/category")
+                .and_then(Value::as_str);
+            if category == Some("authentication") {
+                let mut login = vec![
+                    "clusterflux".to_owned(),
+                    "login".to_owned(),
+                    "--browser".to_owned(),
+                    "--coordinator".to_owned(),
+                    coordinator.to_owned(),
+                ];
+                if let Some(project) = report.get("project").and_then(Value::as_str) {
+                    login.extend(["--project-id".to_owned(), project.to_owned()]);
+                }
+                OperationGuidance::recommended(GuidedCommand::new(
+                    GuidanceKind::Authenticate,
+                    login,
+                    true,
+                    false,
+                ))
+                .build()?
+            } else {
+                OperationGuidance::recommended(GuidedCommand::new(
+                    GuidanceKind::Inspect,
+                    ["clusterflux", "doctor", "--coordinator", coordinator],
+                    false,
+                    false,
+                ))
+                .build()?
+            }
+        };
+        attach_guidance(report, guidance)?;
+        return Ok(());
+    };
+    let required_seconds = required
+        .as_secs()
+        .saturating_add(u64::from(required.subsec_nanos() != 0));
+    let expires_at = stored_session_for_coordinator(coordinator, stored_session)
+        .and_then(|session| session.expires_at.as_deref())
+        .and_then(parse_expiry_epoch_seconds);
+    let now = crate::tools::unix_timestamp_seconds();
+    let remaining = expires_at.map(|expiry| expiry.saturating_sub(now));
+    let requirement_met = remote_valid && remaining.is_some_and(|left| left >= required_seconds);
+    let object = report
+        .as_object_mut()
+        .context("auth status report is not an object")?;
+    object.insert(
+        "required_valid_for_seconds".to_owned(),
+        json!(required_seconds),
+    );
+    object.insert("remaining_validity_seconds".to_owned(), json!(remaining));
+    object.insert(
+        "valid_for_requirement_met".to_owned(),
+        json!(requirement_met),
+    );
+    if requirement_met {
+        attach_guidance(
+            report,
+            OperationGuidance::no_safe_action(
+                "session validity requirement is satisfied; no follow-up is required",
+            )
+            .build()?,
+        )?;
+        return Ok(());
+    }
+    let message = if !remote_valid {
+        "the coordinator did not confirm a valid active CLI session"
+    } else if remaining.is_none() {
+        "the CLI session expiry is unknown and cannot satisfy --require-valid-for"
+    } else {
+        "the CLI session expires before the required validity horizon"
+    };
+    report.as_object_mut().expect("report object").insert(
+        "machine_error".to_owned(),
+        crate::errors::cli_error_summary_for_category("authentication", message),
+    );
+    let mut login = vec![
+        "clusterflux".to_owned(),
+        "login".to_owned(),
+        "--browser".to_owned(),
+        "--coordinator".to_owned(),
+        coordinator.to_owned(),
+    ];
+    if let Some(project) = report.get("project").and_then(Value::as_str) {
+        login.extend(["--project-id".to_owned(), project.to_owned()]);
+    }
+    attach_guidance(
+        report,
+        OperationGuidance::recommended(GuidedCommand::new(
+            GuidanceKind::Authenticate,
+            login,
+            true,
+            false,
+        ))
+        .build()?,
+    )?;
+    Ok(())
+}
+
+fn parse_expiry_epoch_seconds(value: &str) -> Option<u64> {
+    value.parse::<u64>().ok().or_else(|| {
+        time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339)
+            .ok()
+            .and_then(|expiry| u64::try_from(expiry.unix_timestamp()).ok())
+    })
 }
 
 fn coordinator_auth_status_summary(
@@ -338,7 +486,6 @@ fn coordinator_auth_status_summary(
     };
     let coordinator_session_requests = session.requests();
     if let CoordinatorResponse::Error { error } = &response {
-        let message = error.message.as_str();
         return json!({
             "checked": true,
             "reachable": true,
@@ -348,7 +495,7 @@ fn coordinator_auth_status_summary(
             "account_state_known": false,
             "sensitive_moderation_details_exposed": false,
             "signup_failure_details_exposed": false,
-            "machine_error": cli_error_summary(message),
+            "machine_error": crate::errors::cli_error_summary_for_api_error(error),
             "coordinator_response_type": "error",
             "next_actions": ["clusterflux doctor", "clusterflux login --browser"],
             "coordinator_session_requests": coordinator_session_requests,
@@ -533,6 +680,7 @@ fn finalize_browser_login(
         false
     };
 
+    let coordinator_response = login_response_for_report(coordinator_response);
     Ok(LoginCompletionReport {
         plan,
         boundary: LoginCompletionBoundaryEvidence {
@@ -543,10 +691,19 @@ fn finalize_browser_login(
             provider_tokens_persisted_locally: false,
             provider_tokens_exposed_to_cli,
             provider_tokens_sent_to_nodes,
+            cli_session_secret_exposed_to_output: false,
             coordinator_session_requests,
         },
         coordinator_response,
     })
+}
+
+fn login_response_for_report(mut response: Value) -> Value {
+    if let Some(session) = response.get_mut("session").and_then(Value::as_object_mut) {
+        session.remove("cli_session_secret");
+        session.remove("session_secret");
+    }
+    response
 }
 
 pub(crate) fn stored_cli_session_from_login_response(
@@ -729,29 +886,6 @@ fn browser_login_request_with_rate_limit_retry(
     }
 }
 
-pub(crate) fn print_browser_login_success(report: &LoginCompletionReport) {
-    let session = report.coordinator_response.get("session");
-    let tenant = session
-        .and_then(|value| value.get("tenant"))
-        .and_then(Value::as_str)
-        .unwrap_or("tenant");
-    let project = session
-        .and_then(|value| value.get("project"))
-        .and_then(Value::as_str)
-        .unwrap_or("project");
-    let user = session
-        .and_then(|value| value.get("user"))
-        .and_then(Value::as_str)
-        .unwrap_or("user");
-    println!(
-        "Signed in to {} as {user} for {tenant}/{project}.",
-        report.plan.coordinator
-    );
-    if report.boundary.scoped_cli_session_received {
-        println!("Received a scoped CLI session from the coordinator.");
-    }
-}
-
 fn open_browser(url: &str) -> Result<()> {
     let mut command = if let Some(command) = std::env::var_os("CLUSTERFLUX_BROWSER_OPEN_COMMAND") {
         Command::new(command)
@@ -822,6 +956,29 @@ mod tests {
     #[test]
     fn browser_login_polling_interval_is_proxy_compatible() {
         assert!(BROWSER_LOGIN_POLL_INTERVAL >= Duration::from_secs(2));
+    }
+
+    #[test]
+    fn completed_login_report_omits_cli_session_credentials() {
+        let response = json!({
+            "type": "oidc_browser_session",
+            "session": {
+                "cli_session_secret": "cli_session_secret_value",
+                "session_secret": "legacy_session_secret_value",
+                "cli_session_secret_digest": "sha256:safe-audit-digest",
+                "tenant": "tenant"
+            }
+        });
+
+        let report = login_response_for_report(response);
+        assert!(report.pointer("/session/cli_session_secret").is_none());
+        assert!(report.pointer("/session/session_secret").is_none());
+        assert_eq!(
+            report
+                .pointer("/session/cli_session_secret_digest")
+                .and_then(Value::as_str),
+            Some("sha256:safe-audit-digest")
+        );
     }
 
     #[test]

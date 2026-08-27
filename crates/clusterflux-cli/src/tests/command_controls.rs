@@ -5,6 +5,13 @@ fn cli_first_mvp_command_surface_parses() {
     for args in [
         &["clusterflux", "doctor"][..],
         &["clusterflux", "auth", "status"],
+        &[
+            "clusterflux",
+            "auth",
+            "status",
+            "--require-valid-for",
+            "30m",
+        ],
         &["clusterflux", "logout", "--yes"],
         &["clusterflux", "auth", "logout", "--yes"],
         &["clusterflux", "login", "--browser", "--non-interactive"],
@@ -26,9 +33,22 @@ fn cli_first_mvp_command_surface_parses() {
         &["clusterflux", "inspect"],
         &["clusterflux", "build"],
         &["clusterflux", "run", "--non-interactive"],
+        &["clusterflux", "runs", "retry", "run-1"],
+        &[
+            "clusterflux",
+            "runs",
+            "trigger",
+            "--repository",
+            "github:owner/repository",
+            "--ref",
+            "refs/heads/main",
+        ],
+        &["clusterflux", "runs", "diagnose", "run-1"],
+        &["clusterflux", "webhook", "deliveries"],
         &["clusterflux", "node", "enroll"],
         &["clusterflux", "node", "list"],
         &["clusterflux", "node", "status"],
+        &["clusterflux", "node", "doctor", "--node", "node"],
         &["clusterflux", "node", "revoke", "--node", "node", "--yes"],
         &["clusterflux", "process", "list"],
         &["clusterflux", "process", "status"],
@@ -1036,5 +1056,43 @@ fn user_control_commands_use_authenticated_envelope_with_stored_cli_session() {
         Some(&session),
     )
     .unwrap();
+    server.join().unwrap();
+}
+
+#[test]
+fn json_line_session_preserves_typed_coordinator_errors() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut request = String::new();
+        reader.read_line(&mut request).unwrap();
+        let request: Value = serde_json::from_str(&request).unwrap();
+        let request_id = request["request_id"].as_str().unwrap();
+        let response = json!({
+            "type": "error",
+            "code": "session_expired",
+            "category": "authentication",
+            "message": "wording is not part of the contract",
+            "retryable": false,
+            "request_id": request_id
+        });
+        writeln!(&stream, "{response}").unwrap();
+    });
+
+    let mut session =
+        crate::client::JsonLineSession::connect(&format!("clusterflux+tcp://{address}")).unwrap();
+    let error = session
+        .request(clusterflux_protocol::CoordinatorRequest::Ping)
+        .unwrap_err();
+    let api_error = error
+        .downcast_ref::<clusterflux_core::ApiError>()
+        .expect("typed API error must survive the CLI transport boundary");
+    assert_eq!(
+        api_error.code,
+        clusterflux_core::ApiErrorCode::SessionExpired
+    );
+    assert_eq!(api_error.message, "wording is not part of the contract");
     server.join().unwrap();
 }

@@ -325,6 +325,51 @@ pub fn load_exact_workflow_source(
     Ok(loaded)
 }
 
+/// Resolve one branch or tag from a public binding without cloning its worktree.
+/// The Git command is non-interactive, time bounded, and output bounded. Annotated
+/// tags resolve to their peeled commit rather than the tag object.
+pub fn resolve_public_git_ref(repository_url: &str, git_ref: &str) -> Result<String, String> {
+    validate_public_clone_url(repository_url)?;
+    if git_ref.len() > 512
+        || !(git_ref.starts_with("refs/heads/") || git_ref.starts_with("refs/tags/"))
+        || git_ref.ends_with('/')
+    {
+        return Err("Git ref must identify a branch or tag".to_owned());
+    }
+    let peeled = format!("{git_ref}^{{}}");
+    let output = run_git(
+        Path::new("."),
+        ["ls-remote", repository_url, git_ref, peeled.as_str()],
+        DEFAULT_GIT_TIMEOUT,
+        4 * 1024,
+    )?;
+    parse_resolved_git_ref(&output, git_ref)
+}
+
+fn parse_resolved_git_ref(output: &[u8], git_ref: &str) -> Result<String, String> {
+    let output = std::str::from_utf8(output)
+        .map_err(|_| "Git returned non-UTF-8 ref metadata".to_owned())?;
+    let peeled_ref = format!("{git_ref}^{{}}");
+    let mut exact = None;
+    let mut peeled = None;
+    for line in output.lines().filter(|line| !line.trim().is_empty()) {
+        let (commit, reference) = line
+            .split_once('\t')
+            .ok_or_else(|| "Git returned malformed ref metadata".to_owned())?;
+        validate_commit_sha(commit)?;
+        if reference == peeled_ref {
+            peeled = Some(commit.to_owned());
+        } else if reference == git_ref {
+            exact = Some(commit.to_owned());
+        } else {
+            return Err("Git returned an unexpected ref while resolving the binding".to_owned());
+        }
+    }
+    peeled
+        .or(exact)
+        .ok_or_else(|| format!("Git ref `{git_ref}` was not found"))
+}
+
 fn load_exact_workflow_source_from_validated_binding(
     trigger: &CommitTrigger,
     configured_clone_url: &str,
@@ -1701,5 +1746,24 @@ mod tests {
         )
         .unwrap_err()
         .contains("file limit"));
+    }
+
+    #[test]
+    fn ref_resolution_prefers_peeled_tag_and_requires_an_exact_ref() {
+        let tag_object = "1111111111111111111111111111111111111111";
+        let commit = "2222222222222222222222222222222222222222";
+        let output = format!("{tag_object}\trefs/tags/v1.0.0\n{commit}\trefs/tags/v1.0.0^{{}}\n");
+        assert_eq!(
+            parse_resolved_git_ref(output.as_bytes(), "refs/tags/v1.0.0").unwrap(),
+            commit
+        );
+        assert!(parse_resolved_git_ref(
+            format!("{commit}\trefs/heads/other\n").as_bytes(),
+            "refs/heads/main"
+        )
+        .is_err());
+        assert!(parse_resolved_git_ref(b"", "refs/heads/main")
+            .unwrap_err()
+            .contains("not found"));
     }
 }

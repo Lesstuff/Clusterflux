@@ -86,6 +86,47 @@ mod external_identifier_tests {
     }
 
     #[test]
+    fn repository_trigger_and_delivery_page_inputs_are_strictly_bounded() {
+        let trigger = |git_ref: &str, commit: Option<&str>| CoordinatorRequest::Authenticated {
+            session_secret: "session-secret".to_owned(),
+            request: AuthenticatedCoordinatorRequest::TriggerAutomatedRun {
+                repository: "github:owner/repository".to_owned(),
+                git_ref: git_ref.to_owned(),
+                commit: commit.map(str::to_owned),
+            },
+        };
+        trigger(
+            "refs/heads/main",
+            Some("0123456789abcdef0123456789abcdef01234567"),
+        )
+        .validate_external_identifiers()
+        .unwrap();
+        assert!(trigger("main", None)
+            .validate_external_identifiers()
+            .unwrap_err()
+            .contains("must identify a branch or tag"));
+        assert!(trigger("refs/heads/main", Some("not-a-sha"))
+            .validate_external_identifiers()
+            .unwrap_err()
+            .contains("commit is invalid"));
+
+        let deliveries = |limit| CoordinatorRequest::Authenticated {
+            session_secret: "session-secret".to_owned(),
+            request: AuthenticatedCoordinatorRequest::ListWebhookDeliveries {
+                cursor: None,
+                limit,
+            },
+        };
+        deliveries(100).validate_external_identifiers().unwrap();
+        for invalid in [0, 101] {
+            assert!(deliveries(invalid)
+                .validate_external_identifiers()
+                .unwrap_err()
+                .contains("pagination limit"));
+        }
+    }
+
+    #[test]
     fn opaque_secrets_are_bounded_as_tokens_instead_of_object_ids() {
         let request = CoordinatorRequest::Authenticated {
             session_secret: "opaque secret/+==".to_owned(),

@@ -18,7 +18,9 @@ clusterflux-client = { path = "../clusterflux-client" }
 clusterflux-core = { path = "../clusterflux-core" }
 clusterflux-protocol = { path = "../clusterflux-protocol" }
 clusterflux-source = { path = "../clusterflux-source" }
+ctrlc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
+time.workspace = true
 url.workspace = true

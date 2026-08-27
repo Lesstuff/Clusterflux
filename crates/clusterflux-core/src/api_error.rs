@@ -137,7 +137,9 @@ impl ApiError {
                 ApiErrorCategory::State,
                 false,
             )
-        } else if normalized.contains("no capable node") {
+        } else if normalized.contains("no capable node")
+            || normalized.contains("node has no capability report")
+        {
             (
                 ApiErrorCode::NoCapableNode,
                 ApiErrorCategory::Availability,
@@ -318,5 +320,13 @@ mod tests {
         assert_eq!(error.category, ApiErrorCategory::Authentication);
         assert_eq!(error.request_id, "request-17");
         assert!(!error.retryable);
+    }
+
+    #[test]
+    fn missing_node_capability_report_is_a_retryable_capability_error() {
+        let error = ApiError::from_message("node-12", "node has no capability report");
+        assert_eq!(error.code, ApiErrorCode::NoCapableNode);
+        assert_eq!(error.category, ApiErrorCategory::Availability);
+        assert!(error.retryable);
     }
 }

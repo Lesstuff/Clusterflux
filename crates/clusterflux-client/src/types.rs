@@ -69,6 +69,12 @@ pub struct AutomatedRunPage {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebhookDeliveryPage {
+    pub deliveries: Vec<clusterflux_core::WebhookDeliveryRecord>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecentLogPage {
     pub entries: Vec<RecentLogEntry>,
     pub next_sequence: Option<u64>,

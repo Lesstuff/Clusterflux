@@ -18,6 +18,15 @@ impl CoordinatorService {
         let request_scope = signed_node_request_scope(&request)?;
         let assignment_authority = node_signature.assignment_authority.clone();
         let mutation_context = match &request {
+            CoordinatorRequest::ReportSystemTask { result, .. } => {
+                let clusterflux_protocol::SystemTaskOutput::CompileWorkflow { result } =
+                    &result.result;
+                Some((
+                    ProcessId::from(result.run_id.as_str()),
+                    TaskInstanceId::from("system-workflow-compiler"),
+                    true,
+                ))
+            }
             CoordinatorRequest::ReportVfsMetadata { process, task, .. } => Some((
                 ProcessId::new(process.clone()),
                 TaskInstanceId::new(task.clone()),
@@ -525,6 +534,7 @@ impl CoordinatorService {
                 artifact_digest,
                 artifact_size_bytes,
                 result,
+                super::TaskCompletionOrigin::SignedNode,
             ),
             _ => self.reject_unsigned_node_request(),
         };

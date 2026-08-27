@@ -141,6 +141,39 @@ impl Coordinator {
         Ok(record.clone())
     }
 
+    pub fn select_cli_session_project(
+        &mut self,
+        session_secret: &str,
+        project: ProjectId,
+    ) -> Result<CliSessionRecord, CoordinatorError> {
+        let context = self.authenticate_cli_session(session_secret)?;
+        let selected = self.project(&project).ok_or_else(|| {
+            CoordinatorError::Unauthorized(
+                "project is not visible to the authenticated user".to_owned(),
+            )
+        })?;
+        if selected.tenant != context.tenant {
+            return Err(CoordinatorError::Unauthorized(
+                "project is outside the authenticated tenant scope".to_owned(),
+            ));
+        }
+        let session_digest = Digest::sha256(session_secret);
+        let record = self
+            .durable
+            .cli_sessions
+            .get_mut(&session_digest)
+            .expect("authenticated session must exist");
+        record.project = project.clone();
+        let credential_subject = format!("cli-session:{}", session_digest.as_str());
+        let credential = self
+            .durable
+            .credentials
+            .get_mut(&credential_subject)
+            .expect("CLI session credential must exist");
+        credential.project = Some(project);
+        Ok(record.clone())
+    }
+
     pub fn revoke_cli_sessions_for_tenant(&mut self, tenant: &TenantId) -> usize {
         let mut revoked = 0_usize;
         for record in self
@@ -204,5 +237,42 @@ mod tests {
         assert!(subjects
             .iter()
             .all(|subject| subject.starts_with("cli-session:sha256:")));
+    }
+
+    #[test]
+    fn project_selection_updates_session_and_credential_scope_across_restart() {
+        let mut store = InMemoryDurableStore::default();
+        let mut coordinator = Coordinator::boot(&store, 1);
+        let tenant = TenantId::from("tenant");
+        let user = UserId::from("user");
+        let first = ProjectId::from("project-one");
+        let second = ProjectId::from("project-two");
+        coordinator.upsert_project(tenant.clone(), first.clone(), "one");
+        coordinator.upsert_project(tenant.clone(), second.clone(), "two");
+        coordinator.issue_cli_session(tenant, first, user, "session", None);
+
+        let selected = coordinator
+            .select_cli_session_project("session", second.clone())
+            .unwrap();
+        assert_eq!(selected.project, second);
+        let credential = coordinator
+            .durable
+            .credentials
+            .get(&format!(
+                "cli-session:{}",
+                Digest::sha256("session").as_str()
+            ))
+            .unwrap();
+        assert_eq!(credential.project.as_ref(), Some(&second));
+
+        coordinator.persist(&mut store);
+        let restarted = Coordinator::boot(&store, 2);
+        assert_eq!(
+            restarted
+                .authenticate_cli_session("session")
+                .unwrap()
+                .project,
+            second
+        );
     }
 }

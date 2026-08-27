@@ -9,8 +9,8 @@ use super::keys::{process_control_key, task_control_key, task_restart_key};
 use super::protocol::TaskAttemptState;
 use super::{
     artifact_id_from_path, CoordinatorResponse, CoordinatorService, CoordinatorServiceError,
-    TaskCompletionEvent, TaskLogStream, TaskTerminalState, MAX_RECENT_LOG_CHUNK_BYTES,
-    MAX_TASK_LOG_TAIL_BYTES,
+    TaskCompletionEvent, TaskCompletionOrigin, TaskLogStream, TaskTerminalState,
+    MAX_RECENT_LOG_CHUNK_BYTES, MAX_TASK_LOG_TAIL_BYTES,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -301,6 +301,7 @@ impl CoordinatorService {
         artifact_digest: Option<Digest>,
         artifact_size_bytes: Option<u64>,
         result: Option<TaskBoundaryValue>,
+        origin: TaskCompletionOrigin,
     ) -> Result<CoordinatorResponse, CoordinatorServiceError> {
         validate_task_log_tail("stdout_tail", &stdout_tail)?;
         validate_task_log_tail("stderr_tail", &stderr_tail)?;
@@ -313,7 +314,9 @@ impl CoordinatorService {
         let process = ProcessId::new(process);
         let node = NodeId::new(node);
         let task = TaskInstanceId::new(task);
-        self.authorize_node_for_process_or_termination(&node, &tenant, &project, &process)?;
+        if origin == TaskCompletionOrigin::SignedNode {
+            self.authorize_node_for_process_or_termination(&node, &tenant, &project, &process)?;
+        }
         let checkpoint = self
             .task_registry
             .checkpoint(&super::keys::task_restart_key(

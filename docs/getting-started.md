@@ -88,7 +88,7 @@ liveness with:
 
 ~~~bash
 clusterflux node list
-clusterflux node status workstation
+clusterflux node status --node workstation
 ~~~
 
 ## 4. Inspect and run a bundle
@@ -164,6 +164,30 @@ two instances of `build_lane`; one completes while the other runs a command that
 exits with status 23. Edit that command to produce the recovering output, then
 restart the failed task. Its original join resolves from the replacement
 attempt.
+
+Commands that start asynchronous work print one exact bounded follow-up command.
+The same waits are available directly for scripts and agents:
+
+~~~bash
+clusterflux wait process --process <process-id> --for terminal --timeout 30m
+clusterflux wait run --run <run-id> --for terminal --timeout 30m
+clusterflux wait run --repository <repository-id> --commit <commit-sha> \
+  --for appeared --timeout 5m
+clusterflux wait node --node workstation --for ready --timeout 5m
+~~~
+
+Every JSON command report includes a `guidance` object: either one validated
+recommended argv array plus optional alternatives, or an explicit reason that
+no follow-up is needed. Human output shell-quotes the same argv. Mutating and
+confirmation-requiring alternatives are marked and are never run automatically.
+
+Before long unattended work, require enough remaining login validity with
+`clusterflux auth status --require-valid-for 45m`. For hosted repository
+automation, `clusterflux runs diagnose <run-id>` returns the bounded relevant
+failure and log tail, `clusterflux runs retry <run-id>` retries the same run,
+and `clusterflux webhook deliveries` shows recent redacted admission results.
+`clusterflux node doctor --node workstation` performs a read-only check of the
+local identity, enrollment, liveness, container backend, and compiler status.
 
 ## 6. Debug in VS Code
 

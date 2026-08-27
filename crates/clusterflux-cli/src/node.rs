@@ -17,8 +17,8 @@ use crate::config::{
 };
 use crate::tools::{command_available, command_nonce, unix_timestamp_seconds};
 use crate::{
-    confirmation_required_report, AttachArgs, CliScopeArgs, NodeEnrollArgs, NodeListArgs,
-    NodeRevokeArgs, NodeStatusArgs,
+    confirmation_required_report, AttachArgs, CliScopeArgs, NodeDoctorArgs, NodeEnrollArgs,
+    NodeListArgs, NodeRevokeArgs, NodeStatusArgs,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -215,6 +215,239 @@ pub(crate) fn node_list_report(args: NodeListArgs, cwd: PathBuf) -> Result<Value
 
 pub(crate) fn node_status_report(args: NodeStatusArgs, cwd: PathBuf) -> Result<Value> {
     node_descriptors_report("node status", args.scope, args.node, cwd)
+}
+
+pub(crate) fn node_doctor_report(args: NodeDoctorArgs, cwd: PathBuf) -> Result<Value> {
+    use crate::guidance::{attach_guidance, GuidanceKind, GuidedCommand, OperationGuidance};
+
+    let stored_session = read_cli_session(&cwd)?;
+    let node = args.node.unwrap_or_else(default_node_id);
+    let coordinator = args.scope.coordinator.clone().or_else(|| {
+        stored_session
+            .as_ref()
+            .map(|session| session.coordinator.clone())
+    });
+    let tenant = session_or_effective_scope_value(
+        stored_session.as_ref(),
+        &args.scope.tenant,
+        |session| session.tenant.as_str(),
+        "tenant",
+    );
+    let project = session_or_effective_scope_value(
+        stored_session.as_ref(),
+        &args.scope.project,
+        |session| session.project.as_str(),
+        "project",
+    );
+    let user = session_or_effective_scope_value(
+        stored_session.as_ref(),
+        &args.scope.user,
+        |session| session.user.as_str(),
+        "user",
+    );
+    let local_identity =
+        inspect_local_node_identity(&cwd, &node, coordinator.as_deref(), &tenant, &project);
+    let remote = node_descriptors_report("node doctor probe", args.scope, Some(node.clone()), cwd);
+    let (remote_report, machine_error) = match remote {
+        Ok(report) => (Some(report), None),
+        Err(error) => {
+            let machine_error = crate::errors::cli_error_summary_from_error(&error);
+            (None, Some(machine_error))
+        }
+    };
+    let summary = remote_report
+        .as_ref()
+        .and_then(|report| report.pointer("/response/nodes"))
+        .and_then(Value::as_array)
+        .and_then(|nodes| {
+            nodes
+                .iter()
+                .find(|candidate| candidate.get("id").and_then(Value::as_str) == Some(&node))
+        })
+        .cloned();
+    let enrolled = summary.is_some();
+    let online = summary
+        .as_ref()
+        .and_then(|summary| summary.get("online"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let container_backend = summary
+        .as_ref()
+        .and_then(|summary| summary.pointer("/capabilities/environment_backends"))
+        .and_then(Value::as_array)
+        .is_some_and(|backends| {
+            backends
+                .iter()
+                .any(|backend| backend.as_str() == Some("Container"))
+        });
+    let compiler_status = summary
+        .as_ref()
+        .and_then(|summary| summary.get("automatic_workflow_compilation"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let mut report = json!({
+        "command": "node doctor",
+        "coordinator": coordinator,
+        "tenant": tenant,
+        "project": project,
+        "user": user,
+        "node": node,
+        "coordinator_reachable": remote_report.is_some(),
+        "coordinator_identity_enrolled": enrolled,
+        "coordinator_node": summary,
+        "node_online": online,
+        "container_backend_reported": container_backend,
+        "automatic_workflow_compilation": compiler_status,
+        "local_identity": local_identity,
+        "local_capabilities": NodeCapabilities::detect_current(),
+        "read_only": true,
+        "machine_error": machine_error,
+    });
+    let guidance = if machine_error.is_some() {
+        let mut command = vec!["clusterflux".to_owned(), "doctor".to_owned()];
+        append_guidance_scope(
+            &mut command,
+            coordinator.as_deref(),
+            &tenant,
+            &project,
+            &user,
+        );
+        OperationGuidance::recommended(GuidedCommand::new(
+            GuidanceKind::Inspect,
+            command,
+            false,
+            false,
+        ))
+        .build()?
+    } else if !enrolled {
+        let mut command = vec![
+            "clusterflux".to_owned(),
+            "node".to_owned(),
+            "enroll".to_owned(),
+        ];
+        append_guidance_scope(
+            &mut command,
+            coordinator.as_deref(),
+            &tenant,
+            &project,
+            &user,
+        );
+        OperationGuidance::recommended(GuidedCommand::new(
+            GuidanceKind::Configure,
+            command,
+            true,
+            false,
+        ))
+        .build()?
+    } else if !online {
+        let mut command = vec![
+            "clusterflux".to_owned(),
+            "wait".to_owned(),
+            "node".to_owned(),
+            "--node".to_owned(),
+            node.clone(),
+            "--for".to_owned(),
+            "ready".to_owned(),
+            "--timeout".to_owned(),
+            "5m".to_owned(),
+        ];
+        append_guidance_scope(
+            &mut command,
+            coordinator.as_deref(),
+            &tenant,
+            &project,
+            &user,
+        );
+        OperationGuidance::recommended(GuidedCommand::new(
+            GuidanceKind::Wait,
+            command,
+            false,
+            false,
+        ))
+        .build()?
+    } else {
+        OperationGuidance::no_safe_action(
+            "node identity and runtime are ready; no follow-up is required",
+        )
+        .build()?
+    };
+    attach_guidance(&mut report, guidance)?;
+    Ok(report)
+}
+
+fn append_guidance_scope(
+    command: &mut Vec<String>,
+    coordinator: Option<&str>,
+    tenant: &str,
+    project: &str,
+    user: &str,
+) {
+    if let Some(coordinator) = coordinator {
+        command.extend(["--coordinator".to_owned(), coordinator.to_owned()]);
+    }
+    command.extend([
+        "--tenant".to_owned(),
+        tenant.to_owned(),
+        "--project-id".to_owned(),
+        project.to_owned(),
+        "--user".to_owned(),
+        user.to_owned(),
+    ]);
+}
+
+fn inspect_local_node_identity(
+    project_root: &Path,
+    node: &str,
+    coordinator: Option<&str>,
+    tenant: &str,
+    project: &str,
+) -> Value {
+    let file = local_node_credential_file(project_root, node);
+    let result = (|| -> Result<Value> {
+        if !credential_file_exists_without_symlink(&file)? {
+            return Ok(json!({
+                "present": false,
+                "valid": false,
+                "file": file,
+                "scope_matches": false,
+            }));
+        }
+        let bytes =
+            std::fs::read(&file).with_context(|| format!("failed to read {}", file.display()))?;
+        let credential: StoredNodeCredential = serde_json::from_slice(&bytes)
+            .with_context(|| format!("failed to parse {}", file.display()))?;
+        if credential.node != node {
+            anyhow::bail!("stored identity belongs to node `{}`", credential.node);
+        }
+        let public_key = node_ed25519_public_key_from_private_key(&credential.private_key)
+            .map_err(anyhow::Error::msg)?;
+        if public_key != credential.public_key {
+            anyhow::bail!("stored identity keypair does not match");
+        }
+        let scope_matches = credential.coordinator.as_deref() == coordinator
+            && credential.tenant.as_deref() == Some(tenant)
+            && credential.project.as_deref() == Some(project);
+        Ok(json!({
+            "present": true,
+            "valid": true,
+            "file": file,
+            "scope_matches": scope_matches,
+            "stored_coordinator": credential.coordinator,
+            "stored_tenant": credential.tenant,
+            "stored_project": credential.project,
+            "private_key_exposed": false,
+        }))
+    })();
+    result.unwrap_or_else(|error| {
+        json!({
+            "present": file.exists(),
+            "valid": false,
+            "file": file,
+            "scope_matches": false,
+            "error": error.to_string(),
+            "private_key_exposed": false,
+        })
+    })
 }
 
 fn node_descriptors_report(

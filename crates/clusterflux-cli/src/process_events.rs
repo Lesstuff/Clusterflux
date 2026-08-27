@@ -363,8 +363,21 @@ pub(crate) fn artifact_response_machine_error(
     fallback: &str,
     default_category: &'static str,
 ) -> Value {
-    let message = response_error_message(response, fallback);
-    cli_error_summary_with_default(&message, default_category)
+    match response {
+        CoordinatorResponse::Error { error } => {
+            crate::errors::cli_error_summary_for_api_error(error)
+        }
+        _ => cli_error_summary_with_default(fallback, default_category),
+    }
+}
+
+fn response_machine_error(response: &CoordinatorResponse, fallback: &str) -> Value {
+    match response {
+        CoordinatorResponse::Error { error } => {
+            crate::errors::cli_error_summary_for_api_error(error)
+        }
+        _ => cli_error_summary(fallback),
+    }
 }
 
 pub(crate) fn process_restart_request_summary(
@@ -383,7 +396,7 @@ pub(crate) fn process_restart_request_summary(
             "requires_confirmation": requires_confirmation,
             "explicit_user_action": true,
             "error": message,
-            "machine_error": cli_error_summary(&message),
+            "machine_error": response_machine_error(response, &message),
         });
     };
     json!({
@@ -421,7 +434,7 @@ pub(crate) fn process_cancel_request_summary(
             "explicit_user_action": true,
             "whole_process_cancel_available": true,
             "error": message,
-            "machine_error": cli_error_summary(&message),
+            "machine_error": response_machine_error(response, &message),
         });
     };
     json!({
@@ -473,7 +486,7 @@ pub(crate) fn task_restart_request_summary(
             "explicit_user_action": true,
             "clean_boundary_required": true,
             "error": message,
-            "machine_error": cli_error_summary(&message),
+            "machine_error": response_machine_error(response, &message),
         });
     };
     json!({
@@ -506,7 +519,7 @@ pub(crate) fn artifact_download_session_summary(response: &CoordinatorResponse) 
             "link_issued": false,
             "explicit_user_action_required": true,
             "error": message.clone(),
-            "machine_error": cli_error_summary_with_default(&message, "connectivity"),
+            "machine_error": artifact_response_machine_error(response, &message, "connectivity"),
         });
     };
     json!({
@@ -584,7 +597,7 @@ pub(crate) fn artifact_export_plan_summary(
             "local_bytes_written_by_cli": false,
             "default_durable_store_assumed": false,
             "error": message.clone(),
-            "machine_error": cli_error_summary_with_default(&message, "connectivity"),
+            "machine_error": artifact_response_machine_error(response, &message, "connectivity"),
         });
     };
     json!({

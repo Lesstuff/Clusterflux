@@ -101,9 +101,13 @@ fn revoke_stored_cli_session_if_possible(stored_session: Option<&StoredCliSessio
             }
         };
     if !matches!(&response, CoordinatorResponse::CliSessionRevoked { .. }) {
-        let message = match &response {
-            CoordinatorResponse::Error { error } => error.message.as_str(),
-            _ => "coordinator returned an unexpected session-revocation response",
+        let machine_error = match &response {
+            CoordinatorResponse::Error { error } => {
+                crate::errors::cli_error_summary_for_api_error(error)
+            }
+            _ => {
+                cli_error_summary("coordinator returned an unexpected session-revocation response")
+            }
         };
         return json!({
             "attempted": true,
@@ -111,7 +115,7 @@ fn revoke_stored_cli_session_if_possible(stored_session: Option<&StoredCliSessio
             "reachable": true,
             "coordinator": coordinator,
             "coordinator_response_type": "unexpected",
-            "machine_error": cli_error_summary(message),
+            "machine_error": machine_error,
             "coordinator_session_requests": coordinator_session.requests(),
             "next_actions": ["clusterflux login --browser"],
         });

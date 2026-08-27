@@ -58,6 +58,12 @@ pub enum CoordinatorResponse {
         run: AutomatedRunRecord,
         actor: UserId,
     },
+    WebhookDeliveries {
+        deliveries: Vec<WebhookDeliveryRecord>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        next_cursor: Option<String>,
+        actor: UserId,
+    },
     SystemTaskRecorded {
         run: AutomatedRunRecord,
     },
@@ -456,6 +462,7 @@ impl CoordinatorResponse {
             Self::Projects { .. } => "projects",
             Self::AutomatedRuns { .. } => "automated_runs",
             Self::AutomatedRun { .. } => "automated_run",
+            Self::WebhookDeliveries { .. } => "webhook_deliveries",
             Self::SystemTaskRecorded { .. } => "system_task_recorded",
             Self::ProjectSecretSet { .. } => "project_secret_set",
             Self::ProjectSecrets { .. } => "project_secrets",

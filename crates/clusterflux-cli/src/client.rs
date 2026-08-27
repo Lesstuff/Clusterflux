@@ -9,7 +9,6 @@ use clusterflux_protocol::{
 use serde_json::{json, Value};
 
 use crate::config::StoredCliSession;
-use crate::errors::cli_error_summary;
 use crate::CliScopeArgs;
 
 pub(crate) struct JsonLineSession {
@@ -29,21 +28,8 @@ impl JsonLineSession {
 
     pub(crate) fn request(&mut self, request: CoordinatorRequest) -> Result<CoordinatorResponse> {
         let response = self.request_allow_error(request)?;
-        if let CoordinatorResponse::Error { error } = &response {
-            let message = error.message.clone();
-            let machine_error = cli_error_summary(&message);
-            let category = machine_error
-                .get("category")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown");
-            let exit_code = machine_error
-                .get("stable_exit_code")
-                .and_then(Value::as_i64)
-                .unwrap_or(1);
-            anyhow::bail!(
-                "coordinator error ({category}, exit {exit_code}): {}",
-                serde_json::to_string(&response)?
-            );
+        if let CoordinatorResponse::Error { error } = response {
+            return Err(anyhow::Error::new(error));
         }
         Ok(response)
     }
@@ -111,9 +97,11 @@ pub(crate) fn authenticated_or_local_trusted_request(
     } else if is_loopback_coordinator(coordinator) {
         Ok(local_trusted_request)
     } else {
-        anyhow::bail!(
-            "no authenticated CLI session matches coordinator {coordinator}; run `clusterflux login --browser` from the current project"
-        )
+        Err(crate::errors::CliFailure::authentication_required(format!(
+            "no authenticated CLI session matches coordinator {coordinator}"
+        ))
+        .with_coordinator(coordinator)
+        .into())
     }
 }
 

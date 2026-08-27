@@ -5,10 +5,10 @@ use clusterflux_core::{
     Authorization, AutomatedRunRecord, Capability, ClusterfluxPathKind, CredentialKind, Digest,
     DownloadLink, EnvironmentRequirements, IrohEndpointAdvertisement, LaunchAttemptId, LimitKind,
     NodeCapabilities, NodeDescriptor, NodeId, NodeSignedRequest, Placement, ProcessId, ProjectId,
-    RepositoryRevision, ResourceLimits, RunId, SourceLocation, SourcePreparation,
+    RepositoryId, RepositoryRevision, ResourceLimits, RunId, SourceLocation, SourcePreparation,
     SourceProviderKind, TaskBoundaryHandle, TaskBoundaryValue, TaskDefinitionId, TaskInstanceId,
-    TaskJoinResult, TaskSpec, TenantId, UserId, VfsPath, WorkflowCompilationRequest,
-    WorkflowCompilationResult,
+    TaskJoinResult, TaskSpec, TenantId, UserId, VfsPath, WebhookDeliveryRecord,
+    WorkflowCompilationRequest, WorkflowCompilationResult,
 };
 use serde::{Deserialize, Serialize};
 

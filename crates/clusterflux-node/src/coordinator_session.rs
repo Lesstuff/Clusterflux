@@ -10,6 +10,7 @@ pub(crate) struct CoordinatorSession {
     endpoint: String,
     reconnect_max_delay: Option<Duration>,
     requests: usize,
+    connection_generation: u64,
 }
 
 #[derive(Clone)]
@@ -49,6 +50,7 @@ impl CoordinatorSession {
             endpoint: addr.to_owned(),
             reconnect_max_delay: None,
             requests: 0,
+            connection_generation: 0,
         })
     }
 
@@ -61,6 +63,7 @@ impl CoordinatorSession {
             endpoint: addr.to_owned(),
             reconnect_max_delay,
             requests: 0,
+            connection_generation: 0,
         })
     }
 
@@ -79,6 +82,7 @@ impl CoordinatorSession {
             endpoint: addr.to_owned(),
             reconnect_max_delay: None,
             requests: 0,
+            connection_generation: 0,
         })
     }
 
@@ -86,10 +90,41 @@ impl CoordinatorSession {
         &mut self,
         request: CoordinatorRequest,
     ) -> Result<CoordinatorResponse, Box<dyn std::error::Error>> {
+        if self.reconnect_max_delay.is_some()
+            && matches!(
+                request,
+                CoordinatorRequest::SignedNode { .. }
+                    | CoordinatorRequest::NodeHeartbeat {
+                        node_signature: Some(_),
+                        ..
+                    }
+            )
+        {
+            return Err(
+                "signed node requests must use request_signed so every retry gets a fresh nonce"
+                    .into(),
+            );
+        }
         self.request_with(|| Ok(request.clone()))
     }
 
-    pub(crate) fn request_with<F>(
+    pub(crate) fn request_signed<F>(
+        &mut self,
+        mut request: F,
+    ) -> Result<CoordinatorResponse, Box<dyn std::error::Error>>
+    where
+        F: FnMut() -> Result<CoordinatorRequest, Box<dyn std::error::Error>>,
+    {
+        self.request_with(|| {
+            let request = request()?;
+            if !matches!(request, CoordinatorRequest::SignedNode { .. }) {
+                return Err("request_signed factory returned an unsigned request".into());
+            }
+            Ok(request)
+        })
+    }
+
+    fn request_with<F>(
         &mut self,
         mut request: F,
     ) -> Result<CoordinatorResponse, Box<dyn std::error::Error>>
@@ -97,14 +132,21 @@ impl CoordinatorSession {
         F: FnMut() -> Result<CoordinatorRequest, Box<dyn std::error::Error>>,
     {
         let Some(max_delay) = self.reconnect_max_delay else {
-            let response = self.inner.request(&request()?)?;
+            let response = self.inner.request_allow_error(&request()?)?;
             self.requests = self.requests.saturating_add(1);
-            return Ok(response);
+            return match response {
+                CoordinatorResponse::Error { error } => Err(Box::new(error)),
+                response => Ok(response),
+            };
         };
         let mut base_delay = Duration::from_secs(1).min(max_delay);
         let mut attempt = 0_u64;
         loop {
-            match self.inner.request(&request()?) {
+            match self.inner.request_allow_error(&request()?) {
+                Ok(CoordinatorResponse::Error { error }) => {
+                    self.requests = self.requests.saturating_add(1);
+                    return Err(Box::new(error));
+                }
                 Ok(response) => {
                     self.requests = self.requests.saturating_add(1);
                     return Ok(response);
@@ -124,6 +166,8 @@ impl CoordinatorSession {
                         match ProtocolSession::connect(&self.endpoint, "node") {
                             Ok(session) => {
                                 self.inner = session;
+                                self.connection_generation =
+                                    self.connection_generation.saturating_add(1);
                                 break;
                             }
                             Err(reconnect_error) if retryable_transport_error(&reconnect_error) => {
@@ -138,8 +182,34 @@ impl CoordinatorSession {
         }
     }
 
+    pub(crate) fn request_signed_heartbeat<F>(
+        &mut self,
+        mut request: F,
+    ) -> Result<CoordinatorResponse, Box<dyn std::error::Error>>
+    where
+        F: FnMut() -> Result<CoordinatorRequest, Box<dyn std::error::Error>>,
+    {
+        self.request_with(|| {
+            let request = request()?;
+            if !matches!(
+                request,
+                CoordinatorRequest::NodeHeartbeat {
+                    node_signature: Some(_),
+                    ..
+                }
+            ) {
+                return Err("signed heartbeat factory returned a non-heartbeat request".into());
+            }
+            Ok(request)
+        })
+    }
+
     pub(crate) fn requests(&self) -> usize {
         self.requests
+    }
+
+    pub(crate) fn connection_generation(&self) -> u64 {
+        self.connection_generation
     }
 }
 
@@ -235,12 +305,42 @@ mod tests {
     }
 
     #[test]
+    fn coordinator_api_errors_remain_typed_for_worker_recovery() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _request = read_http_request(&mut stream);
+            let body = br#"{"type":"error","code":"no_capable_node","category":"availability","message":"node has no capability report","retryable":true,"request_id":"node-1"}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            stream.write_all(body).unwrap();
+        });
+        let mut session = CoordinatorSession::connect(&endpoint).unwrap();
+        let error = session
+            .request(CoordinatorRequest::Ping)
+            .expect_err("coordinator API error must remain an error");
+        let api_error = error
+            .downcast_ref::<clusterflux_core::ApiError>()
+            .unwrap_or_else(|| panic!("coordinator API error lost its typed code: {error:?}"));
+        assert_eq!(
+            api_error.code,
+            clusterflux_core::ApiErrorCode::NoCapableNode
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
     fn bad_gateway_is_retried_without_terminating_the_session() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let server = thread::spawn(move || {
             let (mut first, _) = listener.accept().unwrap();
-            let _ = read_http_request(&mut first);
+            let first_body = read_http_request(&mut first);
             first
                 .write_all(
                     b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
@@ -248,7 +348,7 @@ mod tests {
                 .unwrap();
 
             let (mut second, _) = listener.accept().unwrap();
-            let _ = read_http_request(&mut second);
+            let second_body = read_http_request(&mut second);
             let body = br#"{"type":"node_heartbeat","node":"node","epoch":1}"#;
             write!(
                 second,
@@ -257,26 +357,43 @@ mod tests {
             )
             .unwrap();
             second.write_all(body).unwrap();
+            (first_body, second_body)
         });
         let mut session =
             CoordinatorSession::connect_with_retries(&endpoint, Some(Duration::from_millis(1)))
                 .unwrap();
 
+        let builds = std::cell::Cell::new(0_u8);
         let response = session
-            .request(CoordinatorRequest::NodeHeartbeat {
-                tenant: "tenant".to_owned(),
-                project: "project".to_owned(),
-                node: "node".to_owned(),
-                node_signature: None,
+            .request_signed_heartbeat(|| {
+                let build = builds.get().saturating_add(1);
+                builds.set(build);
+                Ok(CoordinatorRequest::NodeHeartbeat {
+                    tenant: "tenant".to_owned(),
+                    project: "project".to_owned(),
+                    node: "node".to_owned(),
+                    node_signature: Some(clusterflux_core::NodeSignedRequest {
+                        nonce: format!("heartbeat-{build}"),
+                        issued_at_epoch_seconds: 1,
+                        signature: "signature".to_owned(),
+                        assignment_authority: None,
+                        operation_id: None,
+                    }),
+                })
             })
             .unwrap();
 
-        server.join().unwrap();
+        let (first, second) = server.join().unwrap();
         assert!(matches!(
             response,
             CoordinatorResponse::NodeHeartbeat { .. }
         ));
         assert_eq!(session.requests(), 2);
+        assert_eq!(session.connection_generation(), 1);
+        let first: serde_json::Value = serde_json::from_slice(&first).unwrap();
+        let second: serde_json::Value = serde_json::from_slice(&second).unwrap();
+        assert_eq!(first["payload"]["node_signature"]["nonce"], "heartbeat-1");
+        assert_eq!(second["payload"]["node_signature"]["nonce"], "heartbeat-2");
     }
 
     #[test]
@@ -285,14 +402,14 @@ mod tests {
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let server = thread::spawn(move || {
             let (mut first, _) = listener.accept().unwrap();
-            let _ = read_http_request(&mut first);
+            let first_body = read_http_request(&mut first);
             first
                 .write_all(
                     b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
                 )
                 .unwrap();
             let (mut second, _) = listener.accept().unwrap();
-            let _ = read_http_request(&mut second);
+            let second_body = read_http_request(&mut second);
             let body = br#"{"type":"node_heartbeat","node":"node","epoch":1}"#;
             write!(
                 second,
@@ -301,23 +418,65 @@ mod tests {
             )
             .unwrap();
             second.write_all(body).unwrap();
+            (first_body, second_body)
         });
         let mut session =
             CoordinatorSession::connect_with_retries(&endpoint, Some(Duration::from_millis(1)))
                 .unwrap();
         let builds = std::cell::Cell::new(0_u8);
         session
-            .request_with(|| {
-                builds.set(builds.get().saturating_add(1));
-                Ok(CoordinatorRequest::NodeHeartbeat {
-                    tenant: "tenant".to_owned(),
-                    project: "project".to_owned(),
+            .request_signed(|| {
+                let build = builds.get().saturating_add(1);
+                builds.set(build);
+                Ok(CoordinatorRequest::SignedNode {
                     node: "node".to_owned(),
-                    node_signature: None,
+                    node_signature: clusterflux_core::NodeSignedRequest {
+                        nonce: format!("nonce-{build}"),
+                        issued_at_epoch_seconds: 1,
+                        signature: "signature".to_owned(),
+                        assignment_authority: None,
+                        operation_id: None,
+                    },
+                    request: Box::new(CoordinatorRequest::PollNodeAssignment {
+                        tenant: "tenant".to_owned(),
+                        project: "project".to_owned(),
+                        node: "node".to_owned(),
+                        accept_system_tasks: false,
+                        accept_process_tasks: false,
+                        active_assignment: None,
+                    }),
                 })
             })
             .unwrap();
-        server.join().unwrap();
+        let (first, second) = server.join().unwrap();
         assert_eq!(builds.get(), 2);
+        let first: serde_json::Value = serde_json::from_slice(&first).unwrap();
+        let second: serde_json::Value = serde_json::from_slice(&second).unwrap();
+        assert_eq!(first["payload"]["node_signature"]["nonce"], "nonce-1");
+        assert_eq!(second["payload"]["node_signature"]["nonce"], "nonce-2");
+        assert_eq!(first["payload"]["request"], second["payload"]["request"]);
+    }
+
+    #[test]
+    fn reconnecting_session_rejects_pre_signed_requests() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let mut session =
+            CoordinatorSession::connect_with_retries(&endpoint, Some(Duration::from_millis(1)))
+                .unwrap();
+        let error = session
+            .request(CoordinatorRequest::SignedNode {
+                node: "node".to_owned(),
+                request: Box::new(CoordinatorRequest::Ping),
+                node_signature: clusterflux_core::NodeSignedRequest {
+                    nonce: "nonce".to_owned(),
+                    issued_at_epoch_seconds: 1,
+                    signature: "signature".to_owned(),
+                    assignment_authority: None,
+                    operation_id: None,
+                },
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("must use request_signed"));
     }
 }

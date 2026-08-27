@@ -19,11 +19,7 @@ pub(crate) fn run_cli() -> Result<()> {
                 emit_report(&report, json_output)?;
             } else if !args.plan {
                 let report = execute_interactive_browser_login(args)?;
-                if json_output {
-                    emit_report(&report, true)?;
-                } else {
-                    print_browser_login_success(&report);
-                }
+                emit_report(&report, json_output)?;
             } else {
                 let plan = login_plan(args);
                 emit_report(&plan, json_output)?;
@@ -155,6 +151,12 @@ pub(crate) fn run_cli() -> Result<()> {
             let report = run_report(args, cwd, session)?;
             emit_report(&report, json_output)?;
         }
+        Commands::Wait { command } => {
+            let json_output = command.json_output();
+            let cwd = std::env::current_dir()?;
+            let report = crate::wait::wait_report(command, &cwd)?;
+            emit_report(&report, json_output)?;
+        }
         Commands::Runs { command } => {
             let cwd = std::env::current_dir()?;
             let (report, json_output) = match command {
@@ -169,6 +171,18 @@ pub(crate) fn run_cli() -> Result<()> {
                 RunsCommands::Cancel(args) => {
                     let json = args.scope.json;
                     (run_cancel_report(args, &cwd)?, json)
+                }
+                RunsCommands::Retry(args) => {
+                    let json = args.scope.json;
+                    (run_retry_report(args, &cwd)?, json)
+                }
+                RunsCommands::Trigger(args) => {
+                    let json = args.scope.json;
+                    (run_trigger_report(args, &cwd)?, json)
+                }
+                RunsCommands::Diagnose(args) => {
+                    let json = args.scope.json;
+                    (run_diagnose_report(args, &cwd)?, json)
                 }
             };
             emit_report(&report, json_output)?;
@@ -189,6 +203,13 @@ pub(crate) fn run_cli() -> Result<()> {
                     (secret_revoke_report(args, &cwd)?, json)
                 }
             };
+            emit_report(&report, json_output)?;
+        }
+        Commands::Webhook {
+            command: WebhookCommands::Deliveries(args),
+        } => {
+            let json_output = args.scope.json;
+            let report = webhook_deliveries_report(args, &std::env::current_dir()?)?;
             emit_report(&report, json_output)?;
         }
         Commands::Node {
@@ -217,6 +238,10 @@ pub(crate) fn run_cli() -> Result<()> {
                 NodeCommands::Revoke(args) => {
                     let json_output = args.scope.json;
                     (node_revoke_report(args, cwd)?, json_output)
+                }
+                NodeCommands::Doctor(args) => {
+                    let json_output = args.scope.json;
+                    (node_doctor_report(args, cwd)?, json_output)
                 }
                 NodeCommands::Attach(_) => unreachable!("node attach is handled above"),
             };

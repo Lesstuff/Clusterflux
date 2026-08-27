@@ -706,6 +706,14 @@ impl CoordinatorService {
                     )
                     .into());
                 }
+                self.coordinator
+                    .select_cli_session_project(&session_secret, project_id)?;
+                self.coordinator.grant_project_debug(
+                    context.tenant,
+                    project.id.clone(),
+                    actor.clone(),
+                );
+                self.persist_durable_state()?;
                 Ok(CoordinatorResponse::ProjectSelected { project, actor })
             }
             AuthenticatedCoordinatorRequest::ListProjects => Ok(CoordinatorResponse::Projects {
@@ -776,6 +784,12 @@ impl CoordinatorService {
                     run: record.run,
                     actor,
                 })
+            }
+            AuthenticatedCoordinatorRequest::TriggerAutomatedRun { .. }
+            | AuthenticatedCoordinatorRequest::ListWebhookDeliveries { .. } => {
+                Err(CoordinatorServiceError::Protocol(
+                    "hosted repository automation is unavailable on this coordinator".to_owned(),
+                ))
             }
             request @ (AuthenticatedCoordinatorRequest::SetProjectSecret { .. }
             | AuthenticatedCoordinatorRequest::ListProjectSecrets

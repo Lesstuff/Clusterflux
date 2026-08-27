@@ -54,6 +54,18 @@ pub enum AuthenticatedCoordinatorRequest {
     RetryAutomatedRun {
         run: String,
     },
+    TriggerAutomatedRun {
+        repository: String,
+        git_ref: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        commit: Option<String>,
+    },
+    ListWebhookDeliveries {
+        #[serde(default)]
+        cursor: Option<String>,
+        #[serde(default = "default_page_limit")]
+        limit: u32,
+    },
     SetProjectSecret {
         name: String,
         value_base64: String,
@@ -225,6 +237,8 @@ impl AuthenticatedCoordinatorRequest {
             Self::GetAutomatedRun { .. } => "get_automated_run",
             Self::CancelAutomatedRun { .. } => "cancel_automated_run",
             Self::RetryAutomatedRun { .. } => "retry_automated_run",
+            Self::TriggerAutomatedRun { .. } => "trigger_automated_run",
+            Self::ListWebhookDeliveries { .. } => "list_webhook_deliveries",
             Self::SetProjectSecret { .. } => "set_project_secret",
             Self::ListProjectSecrets => "list_project_secrets",
             Self::RevokeProjectSecret { .. } => "revoke_project_secret",

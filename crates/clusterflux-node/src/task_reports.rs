@@ -382,7 +382,7 @@ fn request_terminal_mutation(
     request: CoordinatorRequest,
 ) -> Result<CoordinatorResponse, Box<dyn std::error::Error>> {
     let operation_id = clusterflux_core::generate_opaque_token("node_operation")?;
-    session.request_with(|| {
+    session.request_signed(|| {
         signed_node_assignment_operation_request(
             args,
             node_private_key,

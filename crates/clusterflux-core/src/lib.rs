@@ -60,10 +60,10 @@ pub use automation::{
     workflow_compiler_profile_id, workflow_tree_identity, AutomatedRunRecord, AutomatedRunState,
     CommitTrigger, CompiledWorkflowBundle, CompiledWorkflowSummary, ForgeKind, PublicationResult,
     RepositoryRevision, TriggerContext, TriggerEventKind, WasmHostTriggerContextRequest,
-    WasmHostTriggerContextResult, WorkflowCompilationRequest, WorkflowCompilationResult,
-    WorkflowCompilerResourcePolicy, WorkflowSource, WorkflowSourceFile,
-    MAX_AUTOMATED_RUN_FAILURE_BYTES, MAX_COMPILER_DIAGNOSTIC_BYTES, MAX_WORKFLOW_SOURCE_BYTES,
-    MAX_WORKFLOW_SOURCE_FILES,
+    WasmHostTriggerContextResult, WebhookDeliveryOutcome, WebhookDeliveryRecord,
+    WorkflowCompilationRequest, WorkflowCompilationResult, WorkflowCompilerResourcePolicy,
+    WorkflowSource, WorkflowSourceFile, MAX_AUTOMATED_RUN_FAILURE_BYTES,
+    MAX_COMPILER_DIAGNOSTIC_BYTES, MAX_WORKFLOW_SOURCE_BYTES, MAX_WORKFLOW_SOURCE_FILES,
 };
 pub use bundle::{
     descriptor_records, discover_source_debug_probes, finalize_compiled_workflow,

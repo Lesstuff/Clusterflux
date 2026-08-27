@@ -15,6 +15,8 @@ pub(super) enum PublicUserOperation {
     GetAutomatedRun,
     CancelAutomatedRun,
     RetryAutomatedRun,
+    TriggerAutomatedRun,
+    ListWebhookDeliveries,
     SetProjectSecret,
     ListProjectSecrets,
     RevokeProjectSecret,
@@ -65,6 +67,8 @@ impl PublicUserOperation {
             Self::GetAutomatedRun => "get_automated_run",
             Self::CancelAutomatedRun => "cancel_automated_run",
             Self::RetryAutomatedRun => "retry_automated_run",
+            Self::TriggerAutomatedRun => "trigger_automated_run",
+            Self::ListWebhookDeliveries => "list_webhook_deliveries",
             Self::SetProjectSecret => "set_project_secret",
             Self::ListProjectSecrets => "list_project_secrets",
             Self::RevokeProjectSecret => "revoke_project_secret",
@@ -117,6 +121,12 @@ impl From<&AuthenticatedCoordinatorRequest> for PublicUserOperation {
             AuthenticatedCoordinatorRequest::GetAutomatedRun { .. } => Self::GetAutomatedRun,
             AuthenticatedCoordinatorRequest::CancelAutomatedRun { .. } => Self::CancelAutomatedRun,
             AuthenticatedCoordinatorRequest::RetryAutomatedRun { .. } => Self::RetryAutomatedRun,
+            AuthenticatedCoordinatorRequest::TriggerAutomatedRun { .. } => {
+                Self::TriggerAutomatedRun
+            }
+            AuthenticatedCoordinatorRequest::ListWebhookDeliveries { .. } => {
+                Self::ListWebhookDeliveries
+            }
             AuthenticatedCoordinatorRequest::SetProjectSecret { .. } => Self::SetProjectSecret,
             AuthenticatedCoordinatorRequest::ListProjectSecrets => Self::ListProjectSecrets,
             AuthenticatedCoordinatorRequest::RevokeProjectSecret { .. } => {

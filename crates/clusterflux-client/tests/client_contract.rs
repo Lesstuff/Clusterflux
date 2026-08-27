@@ -3,7 +3,8 @@ use std::time::Duration;
 
 use clusterflux_client::{
     ApiErrorCategory, ApiErrorCode, ArtifactId, ClientError, ClusterfluxClient, ControlTransport,
-    MockTransport, ProjectId, SessionCredential, TenantId, UserId, CLIENT_API_VERSION,
+    MockTransport, ProjectId, RepositoryId, RunId, SessionCredential, TenantId, UserId,
+    CLIENT_API_VERSION,
 };
 use clusterflux_client::{CONTROL_API_PATH, LOGIN_API_PATH};
 use clusterflux_coordinator::service::CoordinatorService;
@@ -61,6 +62,70 @@ async fn structured_errors_retain_machine_fields_and_originating_request_id() {
     assert_eq!(error.category, ApiErrorCategory::Authorization);
     assert_eq!(error.request_id, "client-1");
     assert!(!error.retryable);
+}
+
+#[tokio::test]
+async fn automation_helpers_send_exact_authenticated_request_shapes() {
+    let response = |request_id: &str| {
+        json!({
+            "type": "error",
+            "code": "not_found",
+            "category": "state",
+            "message": "not found",
+            "retryable": false,
+            "request_id": request_id
+        })
+        .to_string()
+    };
+    let transport = MockTransport::from_json_responses([
+        response("client-1"),
+        response("client-2"),
+        response("client-3"),
+    ]);
+    let client = ClusterfluxClient::with_transport(transport.clone())
+        .with_session_credential(&SessionCredential::from_secret("test-session-secret"));
+
+    client
+        .trigger_automated_run(
+            RepositoryId::from("github:owner/repository"),
+            "refs/heads/main".to_owned(),
+            Some("0123456789abcdef0123456789abcdef01234567".to_owned()),
+        )
+        .await
+        .unwrap_err();
+    client
+        .list_webhook_deliveries_page(Some("42".to_owned()), 50)
+        .await
+        .unwrap_err();
+    client
+        .get_automated_run(RunId::from("run-1"))
+        .await
+        .unwrap_err();
+
+    let requests = transport.requests();
+    let payloads = requests
+        .iter()
+        .map(|request| {
+            serde_json::from_slice::<Value>(&request.body).unwrap()["payload"]["request"].clone()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        payloads[0],
+        json!({
+            "type": "trigger_automated_run",
+            "repository": "github:owner/repository",
+            "git_ref": "refs/heads/main",
+            "commit": "0123456789abcdef0123456789abcdef01234567"
+        })
+    );
+    assert_eq!(
+        payloads[1],
+        json!({"type": "list_webhook_deliveries", "cursor": "42", "limit": 50})
+    );
+    assert_eq!(
+        payloads[2],
+        json!({"type": "get_automated_run", "run": "run-1"})
+    );
 }
 
 #[tokio::test]

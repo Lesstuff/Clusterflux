@@ -5,10 +5,10 @@ use std::time::{Duration, Instant};
 
 use clap::Parser;
 use clusterflux_core::{
-    sign_node_request, signed_request_payload_digest, ArtifactId, AssignmentAuthority, Capability,
-    Digest, EnvironmentBackend, NodeCapabilities, NodeDrainStatus, NodeId, NodeLifecycleState,
-    NodeWorkPolicy, ProcessId, ProjectId, SystemBundleCapability, TaskInstanceId, TaskSpec,
-    TenantId,
+    sign_node_request, signed_request_payload_digest, ApiError, ApiErrorCode, ArtifactId,
+    AssignmentAuthority, Capability, Digest, EnvironmentBackend, NodeCapabilities, NodeDrainStatus,
+    NodeId, NodeLifecycleState, NodeWorkPolicy, ProcessId, ProjectId, SystemBundleCapability,
+    TaskInstanceId, TaskSpec, TenantId,
 };
 use clusterflux_protocol::{
     ActiveNodeAssignment, CoordinatorRequest, CoordinatorResponse, NodeAssignmentWork,
@@ -29,8 +29,8 @@ use crate::coordinator_session::CoordinatorSession;
 use crate::debug_agent::poll_task_cancellation;
 use crate::node_identity::{
     establish_node_identity, node_nonce, node_private_key_for_runtime,
-    signed_node_assignment_request, signed_node_request, unix_timestamp_seconds,
-    validate_node_identity_configuration,
+    signed_node_assignment_operation_request, signed_node_assignment_request, signed_node_request,
+    unix_timestamp_seconds, validate_node_identity_configuration,
 };
 #[cfg(test)]
 use crate::node_identity::{load_or_create_local_node_credential, unix_timestamp_nanos};
@@ -225,28 +225,29 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut session =
         CoordinatorSession::connect_with_retries(&args.coordinator, reconnect_max_delay)?;
     let registration = establish_node_identity(&mut session, &args, &node_private_key)?;
-    let heartbeat_request = CoordinatorRequest::NodeHeartbeat {
-        tenant: args.tenant.clone(),
-        project: args.project.clone(),
-        node: args.node.clone(),
-        node_signature: None,
-    };
-    let heartbeat_signature = sign_node_request(
-        &node_private_key,
-        &NodeId::from(args.node.as_str()),
-        "node_heartbeat",
-        &signed_request_payload_digest(&serde_json::to_value(&heartbeat_request)?),
-        node_nonce("node-heartbeat"),
-        unix_timestamp_seconds(),
-    )
-    .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err))?;
-    let heartbeat_request = CoordinatorRequest::NodeHeartbeat {
-        tenant: args.tenant.clone(),
-        project: args.project.clone(),
-        node: args.node.clone(),
-        node_signature: Some(heartbeat_signature),
-    };
-    let heartbeat = match session.request(heartbeat_request)? {
+    let heartbeat = match session.request_signed_heartbeat(|| {
+        let heartbeat_request = CoordinatorRequest::NodeHeartbeat {
+            tenant: args.tenant.clone(),
+            project: args.project.clone(),
+            node: args.node.clone(),
+            node_signature: None,
+        };
+        let heartbeat_signature = sign_node_request(
+            &node_private_key,
+            &NodeId::from(args.node.as_str()),
+            "node_heartbeat",
+            &signed_request_payload_digest(&serde_json::to_value(&heartbeat_request)?),
+            node_nonce("node-heartbeat"),
+            unix_timestamp_seconds(),
+        )
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err))?;
+        Ok(CoordinatorRequest::NodeHeartbeat {
+            tenant: args.tenant.clone(),
+            project: args.project.clone(),
+            node: args.node.clone(),
+            node_signature: Some(heartbeat_signature),
+        })
+    })? {
         response @ CoordinatorResponse::NodeHeartbeat { .. } => serde_json::to_value(response)?,
         _ => return Err("coordinator returned an unexpected node-heartbeat response".into()),
     };
@@ -312,7 +313,7 @@ async fn worker_loop(
     session: &mut CoordinatorSession,
     registration: Value,
     heartbeat: Value,
-    capability_report: Value,
+    mut capability_report: Value,
     node_private_key: &str,
     artifact_data_plane: Option<&NodeArtifactDataPlane>,
     compiler_profile: Option<SystemBundleCapability>,
@@ -332,6 +333,7 @@ async fn worker_loop(
     let mut wasm_execution_service = node_wasm_execution_service()?;
     let mut active_tasks = BTreeMap::<String, ActiveRuntimeTask>::new();
     let mut active_compilation: Option<ActiveWorkflowCompilation> = None;
+    let mut capability_connection_generation = session.connection_generation();
     if args.emit_ready {
         println!(
             "{}",
@@ -401,16 +403,35 @@ async fn worker_loop(
                 tokio::time::sleep(Duration::from_millis(10)).await;
                 continue;
             }
-            report_node_capabilities(
+            if let Err(error) = report_node_capabilities(
                 args,
                 session,
                 node_private_key,
                 &artifact_store,
                 compiler_profile.as_ref(),
                 false,
-            )?;
+            ) {
+                if !is_account_suspended_error(error.as_ref()) {
+                    return Err(error);
+                }
+            }
             wasm_execution_service.shutdown()?;
             return Ok(());
+        }
+        if session.connection_generation() != capability_connection_generation {
+            match report_node_capabilities(
+                args,
+                session,
+                node_private_key,
+                &artifact_store,
+                compiler_profile.as_ref(),
+                true,
+            ) {
+                Ok(report) => capability_report = report,
+                Err(error) if is_account_suspended_error(error.as_ref()) => {}
+                Err(error) => return Err(error),
+            }
+            capability_connection_generation = session.connection_generation();
         }
         let now_epoch_seconds = unix_timestamp_seconds();
         drain_requested |= args
@@ -431,15 +452,24 @@ async fn worker_loop(
             );
         }
         if let Some(artifact_data_plane) = artifact_data_plane {
-            if artifact_data_plane.service_receiver_assignment(
+            match artifact_data_plane.service_receiver_assignment(
                 args,
                 session,
                 node_private_key,
                 &artifact_store,
-            )? {
-                last_activity = Instant::now();
-                idle_poll_backoff = initial_idle_poll_backoff;
-                continue;
+            ) {
+                Ok(true) => {
+                    last_activity = Instant::now();
+                    idle_poll_backoff = initial_idle_poll_backoff;
+                    continue;
+                }
+                Ok(false) => {}
+                // Artifact-transfer admission is deliberately closed while an
+                // account is suspended. Keep the worker alive so its separate
+                // assignment/control polls can observe cancellation and report
+                // terminal task state through the cleanup lane.
+                Err(error) if is_account_suspended_error(error.as_ref()) => {}
+                Err(error) => return Err(error),
             }
         }
         if last_artifact_gc.elapsed() >= ARTIFACT_GC_INTERVAL {
@@ -455,14 +485,19 @@ async fn worker_loop(
                 artifact_data_plane.garbage_collect_partials(current_epoch_seconds())?;
             }
             artifact_store.garbage_collect(retention_limits, &pinned, current_epoch_seconds())?;
-            report_node_capabilities(
+            match report_node_capabilities(
                 args,
                 session,
                 node_private_key,
                 &artifact_store,
                 compiler_profile.as_ref(),
                 true,
-            )?;
+            ) {
+                Ok(report) => capability_report = report,
+                Err(error) if is_account_suspended_error(error.as_ref()) => {}
+                Err(error) => return Err(error),
+            }
+            capability_connection_generation = session.connection_generation();
             last_artifact_gc = Instant::now();
         }
         if drain_requested {
@@ -494,14 +529,18 @@ async fn worker_loop(
             {
                 let released = finalize_node_release(args, session, node_private_key)?;
                 if released.state == NodeLifecycleState::Released {
-                    report_node_capabilities(
+                    if let Err(error) = report_node_capabilities(
                         args,
                         session,
                         node_private_key,
                         &artifact_store,
                         compiler_profile.as_ref(),
                         false,
-                    )?;
+                    ) {
+                        if !is_account_suspended_error(error.as_ref()) {
+                            return Err(error);
+                        }
+                    }
                     wasm_execution_service.shutdown()?;
                     return Ok(());
                 }
@@ -547,25 +586,51 @@ async fn worker_loop(
             idle_poll_backoff = initial_idle_poll_backoff;
             continue;
         }
-        let response = session.request(signed_node_request(
-            args,
-            node_private_key,
-            "poll_node_assignment",
-            CoordinatorRequest::PollNodeAssignment {
-                tenant: args.tenant.clone(),
-                project: args.project.clone(),
-                node: args.node.clone(),
-                accept_system_tasks,
-                accept_process_tasks,
-                active_assignment: active_compilation
-                    .as_ref()
-                    .map(|active| ActiveNodeAssignment {
-                        assignment_id: active.assignment_id.clone(),
-                        attempt_id: active.attempt_id.clone(),
-                        lease_epoch: active.lease_epoch,
-                    }),
-            },
-        )?)?;
+        let active_assignment = active_compilation
+            .as_ref()
+            .map(|active| ActiveNodeAssignment {
+                assignment_id: active.assignment_id.clone(),
+                attempt_id: active.attempt_id.clone(),
+                lease_epoch: active.lease_epoch,
+            });
+        let poll_assignment = |session: &mut CoordinatorSession| {
+            session.request_signed(|| {
+                signed_node_request(
+                    args,
+                    node_private_key,
+                    "poll_node_assignment",
+                    CoordinatorRequest::PollNodeAssignment {
+                        tenant: args.tenant.clone(),
+                        project: args.project.clone(),
+                        node: args.node.clone(),
+                        accept_system_tasks,
+                        accept_process_tasks,
+                        active_assignment: active_assignment.clone(),
+                    },
+                )
+            })
+        };
+        let response = match poll_assignment(session) {
+            Ok(response) => response,
+            Err(error)
+                if session.connection_generation() != capability_connection_generation
+                    || error
+                        .downcast_ref::<ApiError>()
+                        .is_some_and(|error| error.code == ApiErrorCode::NoCapableNode) =>
+            {
+                capability_report = report_node_capabilities(
+                    args,
+                    session,
+                    node_private_key,
+                    &artifact_store,
+                    compiler_profile.as_ref(),
+                    true,
+                )?;
+                capability_connection_generation = session.connection_generation();
+                poll_assignment(session)?
+            }
+            Err(error) => return Err(error),
+        };
         let CoordinatorResponse::NodeAssignment {
             assignment,
             cancel_assignment,
@@ -607,19 +672,21 @@ async fn worker_loop(
             attempt_id: offer.attempt_id.clone(),
             offer_epoch: offer.lease_epoch,
         };
-        let acknowledgement = session.request(signed_node_assignment_request(
-            args,
-            node_private_key,
-            &assignment_authority,
-            "acknowledge_node_assignment",
-            CoordinatorRequest::AcknowledgeNodeAssignment {
-                tenant: args.tenant.clone(),
-                project: args.project.clone(),
-                node: args.node.clone(),
-                assignment_id: offer.assignment_id.clone(),
-                lease_epoch: offer.lease_epoch,
-            },
-        )?)?;
+        let acknowledgement = session.request_signed(|| {
+            signed_node_assignment_request(
+                args,
+                node_private_key,
+                &assignment_authority,
+                "acknowledge_node_assignment",
+                CoordinatorRequest::AcknowledgeNodeAssignment {
+                    tenant: args.tenant.clone(),
+                    project: args.project.clone(),
+                    node: args.node.clone(),
+                    assignment_id: offer.assignment_id.clone(),
+                    lease_epoch: offer.lease_epoch,
+                },
+            )
+        })?;
         if !matches!(
             acknowledgement,
             CoordinatorResponse::NodeAssignmentAcknowledged { .. }
@@ -770,6 +837,12 @@ async fn worker_loop(
     }
 }
 
+fn is_account_suspended_error(error: &(dyn std::error::Error + 'static)) -> bool {
+    error
+        .downcast_ref::<ApiError>()
+        .is_some_and(|error| error.code == ApiErrorCode::AccountSuspended)
+}
+
 fn pin_report_artifacts(
     report: &Value,
     retention_limits: NodeArtifactRetentionLimits,
@@ -801,22 +874,24 @@ fn begin_node_drain(
     session: &mut CoordinatorSession,
     node_private_key: &str,
 ) -> Result<NodeDrainStatus, Box<dyn std::error::Error>> {
-    let response = session.request(signed_node_request(
-        args,
-        node_private_key,
-        "begin_node_drain",
-        CoordinatorRequest::BeginNodeDrain {
-            tenant: args.tenant.clone(),
-            project: args.project.clone(),
-            node: args.node.clone(),
-            ephemeral: args.ephemeral,
-            provider_deadline_epoch_seconds: args.provider_deadline_epoch_seconds,
-            soft_drain_deadline_epoch_seconds: args.soft_drain_deadline_epoch_seconds,
-            hard_drain_deadline_epoch_seconds: args
-                .hard_drain_deadline_epoch_seconds
-                .or(args.provider_deadline_epoch_seconds),
-        },
-    )?)?;
+    let response = session.request_signed(|| {
+        signed_node_request(
+            args,
+            node_private_key,
+            "begin_node_drain",
+            CoordinatorRequest::BeginNodeDrain {
+                tenant: args.tenant.clone(),
+                project: args.project.clone(),
+                node: args.node.clone(),
+                ephemeral: args.ephemeral,
+                provider_deadline_epoch_seconds: args.provider_deadline_epoch_seconds,
+                soft_drain_deadline_epoch_seconds: args.soft_drain_deadline_epoch_seconds,
+                hard_drain_deadline_epoch_seconds: args
+                    .hard_drain_deadline_epoch_seconds
+                    .or(args.provider_deadline_epoch_seconds),
+            },
+        )
+    })?;
     match response {
         CoordinatorResponse::NodeDrainStatus { status } => Ok(status),
         _ => Err("coordinator returned an unexpected node-drain response".into()),
@@ -828,16 +903,18 @@ fn finalize_node_release(
     session: &mut CoordinatorSession,
     node_private_key: &str,
 ) -> Result<NodeDrainStatus, Box<dyn std::error::Error>> {
-    let response = session.request(signed_node_request(
-        args,
-        node_private_key,
-        "finalize_node_release",
-        CoordinatorRequest::FinalizeNodeRelease {
-            tenant: args.tenant.clone(),
-            project: args.project.clone(),
-            node: args.node.clone(),
-        },
-    )?)?;
+    let response = session.request_signed(|| {
+        signed_node_request(
+            args,
+            node_private_key,
+            "finalize_node_release",
+            CoordinatorRequest::FinalizeNodeRelease {
+                tenant: args.tenant.clone(),
+                project: args.project.clone(),
+                node: args.node.clone(),
+            },
+        )
+    })?;
     match response {
         CoordinatorResponse::NodeDrainStatus { status } => Ok(status),
         _ => Err("coordinator returned an unexpected node-release response".into()),
@@ -855,24 +932,28 @@ fn report_system_task_result(
         attempt_id: result.attempt_id.clone(),
         offer_epoch: result.lease_epoch,
     };
-    let response = session.request(signed_node_assignment_request(
-        args,
-        node_private_key,
-        &authority,
-        "report_system_task",
-        CoordinatorRequest::ReportSystemTask {
-            tenant: args.tenant.clone(),
-            project: args.project.clone(),
-            node: args.node.clone(),
-            result: clusterflux_protocol::SystemTaskResult {
-                bundle_id: clusterflux_core::WORKFLOW_COMPILER_SYSTEM_BUNDLE_ID.to_owned(),
-                bundle_digest: clusterflux_core::workflow_compiler_system_bundle_digest(),
-                result: clusterflux_protocol::SystemTaskOutput::CompileWorkflow {
-                    result: Box::new(result),
+    let operation_id = format!("system-result-{}", authority.assignment_id);
+    let response = session.request_signed(|| {
+        signed_node_assignment_operation_request(
+            args,
+            node_private_key,
+            &authority,
+            "report_system_task",
+            &operation_id,
+            CoordinatorRequest::ReportSystemTask {
+                tenant: args.tenant.clone(),
+                project: args.project.clone(),
+                node: args.node.clone(),
+                result: clusterflux_protocol::SystemTaskResult {
+                    bundle_id: clusterflux_core::WORKFLOW_COMPILER_SYSTEM_BUNDLE_ID.to_owned(),
+                    bundle_digest: clusterflux_core::workflow_compiler_system_bundle_digest(),
+                    result: clusterflux_protocol::SystemTaskOutput::CompileWorkflow {
+                        result: Box::new(result.clone()),
+                    },
                 },
             },
-        },
-    )?)?;
+        )
+    })?;
     if matches!(response, CoordinatorResponse::SystemTaskRecorded { .. }) {
         Ok(())
     } else {
@@ -929,26 +1010,29 @@ fn report_node_capabilities(
     if let Some(profile) = compiler_profile {
         capabilities.system_bundles.push(profile.clone());
     }
-    let response = session.request(signed_node_request(
-        args,
-        node_private_key,
-        "report_node_capabilities",
-        CoordinatorRequest::ReportNodeCapabilities {
-            tenant: args.tenant.clone(),
-            project: args.project.clone(),
-            node: args.node.clone(),
-            capabilities,
-            cached_environment_digests: if args.system_tasks_only {
-                Vec::new()
-            } else {
-                cached_environment_digests(args.project_root.as_deref())?
+    let cached_environment_digests = if args.system_tasks_only {
+        Vec::new()
+    } else {
+        cached_environment_digests(args.project_root.as_deref())?
+    };
+    let response = session.request_signed(|| {
+        signed_node_request(
+            args,
+            node_private_key,
+            "report_node_capabilities",
+            CoordinatorRequest::ReportNodeCapabilities {
+                tenant: args.tenant.clone(),
+                project: args.project.clone(),
+                node: args.node.clone(),
+                capabilities: capabilities.clone(),
+                cached_environment_digests: cached_environment_digests.clone(),
+                dependency_cache_digests: Vec::new(),
+                source_snapshots: source_snapshots.clone(),
+                artifact_locations: artifact_locations.clone(),
+                online,
             },
-            dependency_cache_digests: Vec::new(),
-            source_snapshots,
-            artifact_locations,
-            online,
-        },
-    )?)?;
+        )
+    })?;
     match response {
         response @ CoordinatorResponse::NodeCapabilitiesRecorded { .. } => {
             serde_json::to_value(response).map_err(Into::into)
@@ -1044,32 +1128,36 @@ async fn launch_runtime_task(
         }
     };
     task.epoch = Some(epoch);
-    session.request(signed_node_assignment_request(
-        args,
-        node_private_key,
-        &task.assignment_authority,
-        "reconnect_node",
-        CoordinatorRequest::ReconnectNode {
-            tenant: args.tenant.clone(),
-            project: args.project.clone(),
-            node: args.node.clone(),
-            process: task.process.clone(),
-            epoch,
-        },
-    )?)?;
-    let debug_command = session.request(signed_node_assignment_request(
-        args,
-        node_private_key,
-        &task.assignment_authority,
-        "poll_debug_command",
-        CoordinatorRequest::PollDebugCommand {
-            tenant: args.tenant.clone(),
-            project: args.project.clone(),
-            process: task.process.clone(),
-            node: args.node.clone(),
-            task: task.task.clone(),
-        },
-    )?)?;
+    session.request_signed(|| {
+        signed_node_assignment_request(
+            args,
+            node_private_key,
+            &task.assignment_authority,
+            "reconnect_node",
+            CoordinatorRequest::ReconnectNode {
+                tenant: args.tenant.clone(),
+                project: args.project.clone(),
+                node: args.node.clone(),
+                process: task.process.clone(),
+                epoch,
+            },
+        )
+    })?;
+    let debug_command = session.request_signed(|| {
+        signed_node_assignment_request(
+            args,
+            node_private_key,
+            &task.assignment_authority,
+            "poll_debug_command",
+            CoordinatorRequest::PollDebugCommand {
+                tenant: args.tenant.clone(),
+                project: args.project.clone(),
+                process: task.process.clone(),
+                node: args.node.clone(),
+                task: task.task.clone(),
+            },
+        )
+    })?;
     let debug_command = match debug_command {
         response @ CoordinatorResponse::DebugCommand { .. } => serde_json::to_value(response)?,
         _ => return Err("coordinator returned an unexpected debug-command response".into()),
@@ -1515,21 +1603,42 @@ mod tests {
     use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
     use clap::Parser;
     use clusterflux_core::{
-        Capability, Digest, ProcessId, ProjectId, TaskBoundaryValue, TaskDispatch, TaskInstanceId,
-        TaskSpec, TenantId, WasmExportAbi, WasmTaskResult,
+        ApiError, ApiErrorCategory, ApiErrorCode, Capability, Digest, ProcessId, ProjectId,
+        TaskBoundaryValue, TaskDispatch, TaskInstanceId, TaskSpec, TenantId, WasmExportAbi,
+        WasmTaskResult,
     };
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        control_endpoint_identity, ephemeral_drain_due, load_or_create_local_node_credential,
-        next_worker_drain_wait, parse_control_poll_ms, parse_positive_u64,
-        validate_assignment_poll_ms, validate_provider_deadlines, wait_for_worker_poll, Args,
-        ContainerRunPolicy, RuntimeTask, DEFAULT_HOSTED_COORDINATOR_ENDPOINT,
-        MAX_PROVIDER_DEADLINE_HORIZON_SECONDS,
+        control_endpoint_identity, ephemeral_drain_due, is_account_suspended_error,
+        load_or_create_local_node_credential, next_worker_drain_wait, parse_control_poll_ms,
+        parse_positive_u64, validate_assignment_poll_ms, validate_provider_deadlines,
+        wait_for_worker_poll, Args, ContainerRunPolicy, RuntimeTask,
+        DEFAULT_HOSTED_COORDINATOR_ENDPOINT, MAX_PROVIDER_DEADLINE_HORIZON_SECONDS,
     };
     use crate::assignment_runner::{
         node_wasm_execution_service, submit_verified_wasmtime_assignment,
     };
+
+    #[test]
+    fn suspended_account_capability_publication_is_skippable_but_other_errors_are_not() {
+        let suspended = ApiError::new(
+            ApiErrorCode::AccountSuspended,
+            ApiErrorCategory::Authorization,
+            "tenant is suspended",
+            false,
+            "node-1",
+        );
+        let forbidden = ApiError::new(
+            ApiErrorCode::Forbidden,
+            ApiErrorCategory::Authorization,
+            "forbidden",
+            false,
+            "node-2",
+        );
+        assert!(is_account_suspended_error(&suspended));
+        assert!(!is_account_suspended_error(&forbidden));
+    }
 
     #[test]
     fn node_poll_interval_cannot_exhaust_the_bounded_replay_window() {

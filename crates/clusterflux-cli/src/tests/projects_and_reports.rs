@@ -426,6 +426,71 @@ fn project_list_uses_authenticated_envelope_with_stored_cli_session() {
 }
 
 #[test]
+fn project_select_updates_the_authoritative_stored_session_scope() {
+    let temp = tempfile::tempdir().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    write_cli_session(
+        temp.path(),
+        &StoredCliSession {
+            kind: "human".to_owned(),
+            coordinator: addr.clone(),
+            tenant: "tenant-session".to_owned(),
+            project: "project-one".to_owned(),
+            user: "user-session".to_owned(),
+            cli_session_credential_kind: "CliDeviceSession".to_owned(),
+            session_secret: Some("project-select-session-secret".to_owned()),
+            token_expiry_posture: "unknown_coordinator_session".to_owned(),
+            expires_at: None,
+            provider_tokens_exposed_to_cli: false,
+            provider_tokens_sent_to_nodes: false,
+            created_at_unix_seconds: 1,
+        },
+    )
+    .unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        assert!(line.contains(r#""session_secret":"project-select-session-secret""#));
+        assert!(line.contains(r#""type":"select_project""#));
+        assert!(line.contains(r#""project":"project-two""#));
+        stream
+            .write_all(
+                br#"{"type":"project_selected","project":{"id":"project-two","tenant":"tenant-session","name":"Project Two"},"actor":"user-session"}"#,
+            )
+            .unwrap();
+        stream.write_all(b"\n").unwrap();
+    });
+
+    project_select_report(
+        ProjectSelectArgs {
+            scope: CliScopeArgs {
+                coordinator: None,
+                tenant: "ignored-tenant".to_owned(),
+                project: "ignored-project".to_owned(),
+                user: "ignored-user".to_owned(),
+                json: false,
+            },
+            selected_project: "project-two".to_owned(),
+        },
+        temp.path().to_path_buf(),
+    )
+    .unwrap();
+    server.join().unwrap();
+
+    assert_eq!(
+        read_cli_session(temp.path()).unwrap().unwrap().project,
+        "project-two"
+    );
+    assert_eq!(
+        read_project_config(temp.path()).unwrap().unwrap().project,
+        "project-two"
+    );
+}
+
+#[test]
 fn project_status_queries_public_coordinator_state() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap().to_string();

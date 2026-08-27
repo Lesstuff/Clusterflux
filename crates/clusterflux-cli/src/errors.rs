@@ -1,4 +1,120 @@
+use anyhow::Error;
+use clusterflux_core::{ApiError, ApiErrorCode};
 use serde_json::{json, Value};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CliFailureCode {
+    AuthenticationRequired,
+    CoordinatorNotConfigured,
+}
+
+impl CliFailureCode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::AuthenticationRequired => "authentication_required",
+            Self::CoordinatorNotConfigured => "coordinator_not_configured",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CliFailure {
+    pub(crate) code: CliFailureCode,
+    message: String,
+    pub(crate) coordinator: Option<String>,
+}
+
+impl CliFailure {
+    pub(crate) fn authentication_required(message: impl Into<String>) -> Self {
+        Self {
+            code: CliFailureCode::AuthenticationRequired,
+            message: message.into(),
+            coordinator: None,
+        }
+    }
+
+    pub(crate) fn coordinator_not_configured(message: impl Into<String>) -> Self {
+        Self {
+            code: CliFailureCode::CoordinatorNotConfigured,
+            message: message.into(),
+            coordinator: None,
+        }
+    }
+
+    pub(crate) fn with_coordinator(mut self, coordinator: impl Into<String>) -> Self {
+        self.coordinator = Some(coordinator.into());
+        self
+    }
+}
+
+impl std::fmt::Display for CliFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for CliFailure {}
+
+pub(crate) fn cli_error_summary_from_error(error: &Error) -> Value {
+    if let Some(error) = error.downcast_ref::<ApiError>() {
+        cli_error_summary_for_api_error(error)
+    } else if let Some(error) = error.downcast_ref::<CliFailure>() {
+        cli_error_summary_for_cli_failure(error)
+    } else {
+        cli_error_summary(&error.to_string())
+    }
+}
+
+fn cli_error_summary_for_cli_failure(error: &CliFailure) -> Value {
+    let category = match error.code {
+        CliFailureCode::AuthenticationRequired => "authentication",
+        CliFailureCode::CoordinatorNotConfigured => "connectivity",
+    };
+    let mut summary = cli_error_summary_for_category(category, &error.message);
+    summary
+        .as_object_mut()
+        .expect("CLI error summary is an object")
+        .insert("code".to_owned(), json!(error.code.as_str()));
+    summary
+}
+
+pub(crate) fn cli_error_summary_for_api_error(error: &ApiError) -> Value {
+    let category = match error.code {
+        ApiErrorCode::Unauthenticated | ApiErrorCode::SessionExpired => "authentication",
+        ApiErrorCode::Forbidden => "authorization",
+        ApiErrorCode::AccountSuspended | ApiErrorCode::TaskNotRestartable => "policy",
+        ApiErrorCode::QuotaExceeded | ApiErrorCode::ArtifactLimitExceeded => "quota",
+        ApiErrorCode::NoCapableNode => "capability",
+        ApiErrorCode::NodeOffline
+        | ApiErrorCode::TemporaryCapacity
+        | ApiErrorCode::ArtifactUnavailable => "connectivity",
+        ApiErrorCode::ActiveProcessExists => "active_process",
+        ApiErrorCode::ValidationError => "environment",
+        ApiErrorCode::DebugEpochPartial => "program",
+        ApiErrorCode::NotFound | ApiErrorCode::Conflict | ApiErrorCode::InternalError => "unknown",
+    };
+    let mut summary = cli_error_summary_for_category(category, &error.message);
+    if let Some(object) = summary.as_object_mut() {
+        object.insert(
+            "code".to_owned(),
+            serde_json::to_value(error.code).unwrap_or_else(|_| json!("internal_error")),
+        );
+        object.insert(
+            "api_category".to_owned(),
+            serde_json::to_value(error.category).unwrap_or_else(|_| json!("internal")),
+        );
+        object.insert("request_id".to_owned(), json!(error.request_id));
+        object.insert("retryable".to_owned(), json!(error.retryable));
+        object.insert("resource".to_owned(), json!(error.resource));
+        object.insert("current".to_owned(), json!(error.current));
+        object.insert("maximum".to_owned(), json!(error.maximum));
+        object.insert(
+            "coordinator_next_actions".to_owned(),
+            json!(error.next_actions),
+        );
+    }
+    summary
+}
 
 pub(crate) fn cli_error_summary(message: &str) -> Value {
     let category = classify_cli_error_message(message);
@@ -257,5 +373,48 @@ fn cli_error_next_actions(category: &str) -> Vec<&'static str> {
             "clusterflux doctor",
             "rerun with --json for machine-readable details",
         ],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clusterflux_core::{ApiError, ApiErrorCategory, ApiErrorCode};
+
+    use super::*;
+    use crate::guidance::ensure_report_guidance;
+
+    #[test]
+    fn typed_api_code_controls_guidance_independent_of_message_text() {
+        let guidance_for = |message: &str| {
+            let error = ApiError::new(
+                ApiErrorCode::SessionExpired,
+                ApiErrorCategory::Authentication,
+                message,
+                false,
+                "request-1",
+            );
+            let mut report = json!({
+                "command": "error",
+                "machine_error": cli_error_summary_for_api_error(&error),
+            });
+            ensure_report_guidance(&mut report).unwrap();
+            report["guidance"].clone()
+        };
+
+        assert_eq!(
+            guidance_for("arbitrary text"),
+            guidance_for("totally different text")
+        );
+    }
+
+    #[test]
+    fn typed_local_authentication_failure_does_not_depend_on_message_text() {
+        for message in ["no local session", "wording may change freely"] {
+            let error = anyhow::Error::new(CliFailure::authentication_required(message));
+            let summary = cli_error_summary_from_error(&error);
+            assert_eq!(summary["code"], "authentication_required");
+            assert_eq!(summary["category"], "authentication");
+            assert_eq!(summary["stable_exit_code"], 20);
+        }
     }
 }

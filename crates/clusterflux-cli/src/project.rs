@@ -10,7 +10,7 @@ use crate::client::{
 };
 use crate::config::{
     effective_project_scope, effective_scope_value, project_config_file, read_cli_session,
-    read_project_config, write_project_config, ProjectConfig, StoredCliSession,
+    read_project_config, write_cli_session, write_project_config, ProjectConfig, StoredCliSession,
 };
 use crate::process::process_list_report_with_session;
 use crate::process_events::project_quota_posture;
@@ -328,9 +328,12 @@ pub(crate) fn project_select_report(args: ProjectSelectArgs, cwd: PathBuf) -> Re
     } else {
         None
     };
-    write_project_config(&cwd, &config)?;
     let selected_project = match coordinator_response.as_ref() {
         Some(CoordinatorResponse::ProjectSelected { project, .. }) => {
+            if let Some(mut selected_session) = stored_session.clone() {
+                selected_session.project = project.id.as_str().to_owned();
+                write_cli_session(&cwd, &selected_session)?;
+            }
             serde_json::to_value(project)?
         }
         Some(_) => anyhow::bail!("coordinator returned an unexpected project-select response"),
@@ -340,6 +343,7 @@ pub(crate) fn project_select_report(args: ProjectSelectArgs, cwd: PathBuf) -> Re
             "name": config.project.clone(),
         }),
     };
+    write_project_config(&cwd, &config)?;
     Ok(json!({
         "command": "project select",
         "source": if coordinator.is_some() { "public_coordinator_api" } else { "local_project_config" },

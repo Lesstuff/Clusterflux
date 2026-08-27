@@ -397,6 +397,10 @@ impl LinuxRootlessPodmanBackend {
         let mut args = vec![
             "run".to_owned(),
             "--rm".to_owned(),
+            // Names are derived from the exact process/task identity. Replacing
+            // that name recovers only this task's container after a node crash;
+            // it cannot match an unrelated workload.
+            "--replace".to_owned(),
             "--name".to_owned(),
             container_identity,
             "--network".to_owned(),
@@ -852,6 +856,7 @@ mod tests {
 
         assert_eq!(plan.run.program, "podman");
         assert!(plan.run.args.contains(&"run".to_owned()));
+        assert!(plan.run.args.contains(&"--replace".to_owned()));
         let name_index = plan
             .run
             .args

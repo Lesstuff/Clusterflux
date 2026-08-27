@@ -152,6 +152,7 @@ fn auth_status_reads_stored_cli_session_without_provider_tokens() {
 
     let report = auth_status_report(
         AuthStatusArgs {
+            require_valid_for: None,
             scope: CliScopeArgs {
                 coordinator: None,
                 tenant: "tenant".to_owned(),
@@ -192,6 +193,68 @@ fn auth_status_reads_stored_cli_session_without_provider_tokens() {
         report["coordinator_account_status"]["sensitive_moderation_details_exposed"],
         false
     );
+}
+
+#[test]
+fn auth_status_requires_enough_confirmed_session_validity() {
+    for (remaining, expected) in [(120_u64, true), (30_u64, false)] {
+        let temp = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            stream.write_all(br#"{"type":"auth_status","tenant":"tenant-session","project":"project-session","actor":"user-session","authenticated":true,"account_status":"active","suspended":false,"disabled":false,"deleted":false,"manual_review":false,"sanitized_reason":null,"next_actions":[],"sensitive_moderation_details_exposed":false,"signup_failure_details_exposed":false}"#).unwrap();
+            stream.write_all(b"\n").unwrap();
+        });
+        write_cli_session(
+            temp.path(),
+            &StoredCliSession {
+                kind: "human".to_owned(),
+                coordinator: addr,
+                tenant: "tenant-session".to_owned(),
+                project: "project-session".to_owned(),
+                user: "user-session".to_owned(),
+                cli_session_credential_kind: "CliDeviceSession".to_owned(),
+                session_secret: Some("session-secret".to_owned()),
+                token_expiry_posture: "expires_at".to_owned(),
+                expires_at: Some(
+                    crate::tools::unix_timestamp_seconds()
+                        .saturating_add(remaining)
+                        .to_string(),
+                ),
+                provider_tokens_exposed_to_cli: false,
+                provider_tokens_sent_to_nodes: false,
+                created_at_unix_seconds: 1,
+            },
+        )
+        .unwrap();
+        let report = auth_status_report(
+            AuthStatusArgs {
+                require_valid_for: Some(std::time::Duration::from_secs(60)),
+                scope: CliScopeArgs {
+                    coordinator: None,
+                    tenant: "tenant".to_owned(),
+                    project: "project".to_owned(),
+                    user: "user".to_owned(),
+                    json: false,
+                },
+            },
+            temp.path().to_path_buf(),
+        )
+        .unwrap();
+        server.join().unwrap();
+        assert_eq!(report["valid_for_requirement_met"], expected);
+        assert_eq!(report["required_valid_for_seconds"], 60);
+        assert_eq!(report["machine_error"].is_null(), expected);
+        if !expected {
+            assert_eq!(report["machine_error"]["category"], "authentication");
+            assert_eq!(report["guidance"]["recommended"]["command"][1], "login");
+        }
+    }
 }
 
 #[test]
@@ -240,6 +303,7 @@ fn auth_status_reports_expired_or_revoked_cli_session_as_login_required() {
 
         let report = auth_status_report(
             AuthStatusArgs {
+                require_valid_for: None,
                 scope: CliScopeArgs {
                     coordinator: None,
                     tenant: "tenant".to_owned(),
@@ -258,6 +322,16 @@ fn auth_status_reports_expired_or_revoked_cli_session_as_login_required() {
         assert_eq!(
             report["coordinator_account_status"]["machine_error"]["category"],
             "authentication"
+        );
+        assert_eq!(report["machine_error"]["category"], "authentication");
+        let mut exit_report = report.clone();
+        assert_eq!(
+            crate::output::apply_command_report_exit_code(&mut exit_report),
+            Some(20)
+        );
+        assert_eq!(
+            exit_report["machine_error"]["process_exit_code_applied"],
+            true
         );
         assert!(
             report["coordinator_account_status"]["next_actions"]
@@ -293,6 +367,7 @@ fn auth_status_queries_coordinator_account_state_without_sensitive_moderation_de
     let temp = tempfile::tempdir().unwrap();
     let report = auth_status_report(
         AuthStatusArgs {
+            require_valid_for: None,
             scope: CliScopeArgs {
                 coordinator: Some(addr),
                 tenant: "tenant-live".to_owned(),
@@ -422,6 +497,7 @@ fn auth_status_reports_disabled_deleted_and_manual_review_safely() {
         let temp = tempfile::tempdir().unwrap();
         let report = auth_status_report(
             AuthStatusArgs {
+                require_valid_for: None,
                 scope: CliScopeArgs {
                     coordinator: Some(addr.clone()),
                     tenant: tenant.to_owned(),

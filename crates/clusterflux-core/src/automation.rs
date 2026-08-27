@@ -604,6 +604,57 @@ impl AutomatedRunRecord {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WebhookDeliveryOutcome {
+    Accepted,
+    Deduplicated,
+    Rejected,
+}
+
+/// Bounded, credential-free audit metadata for a hosted forge delivery.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebhookDeliveryRecord {
+    pub sequence: u64,
+    pub binding_id: String,
+    pub tenant: TenantId,
+    pub project: ProjectId,
+    pub repository_id: RepositoryId,
+    pub delivery_id: Option<String>,
+    pub commit_sha: Option<String>,
+    pub git_ref: Option<String>,
+    pub outcome: WebhookDeliveryOutcome,
+    pub run_id: Option<RunId>,
+    pub reason_code: Option<String>,
+    pub received_at: u64,
+}
+
+impl WebhookDeliveryRecord {
+    pub fn validate(&self) -> Result<(), String> {
+        validate_bounded_text("repository binding ID", &self.binding_id, 128)?;
+        if let Some(delivery_id) = &self.delivery_id {
+            validate_bounded_text("forge delivery ID", delivery_id, 256)?;
+        }
+        if let Some(commit_sha) = &self.commit_sha {
+            validate_commit_sha(commit_sha)?;
+        }
+        if let Some(git_ref) = &self.git_ref {
+            validate_bounded_text("Git ref", git_ref, 512)?;
+        }
+        if let Some(reason_code) = &self.reason_code {
+            validate_bounded_text("webhook delivery reason code", reason_code, 128)?;
+        }
+        if self.outcome == WebhookDeliveryOutcome::Rejected && self.run_id.is_some() {
+            return Err("rejected webhook delivery must not reference a run".to_owned());
+        }
+        if self.outcome != WebhookDeliveryOutcome::Rejected && self.run_id.is_none() {
+            return Err("accepted webhook delivery must reference a run".to_owned());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TriggerContext {
     pub trigger_id: TriggerId,

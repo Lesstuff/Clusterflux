@@ -197,9 +197,11 @@ fn coordinator_run_report(plan: RunPlan) -> Result<Value> {
         && human_session_secret.is_none()
         && !crate::client::is_loopback_coordinator(&coordinator)
     {
-        anyhow::bail!(
-            "no authenticated CLI session matches coordinator {coordinator}; run `clusterflux login --browser` from the current project"
-        );
+        return Err(crate::errors::CliFailure::authentication_required(format!(
+            "no authenticated CLI session matches coordinator {coordinator}"
+        ))
+        .with_coordinator(coordinator)
+        .into());
     }
     let process = "vp-current".to_owned();
     let launch_attempt = new_launch_attempt_id();
@@ -663,16 +665,21 @@ pub(crate) fn run_start_summary(response: &CoordinatorResponse) -> Value {
         });
     }
 
-    let message = match response {
-        CoordinatorResponse::Error { error } => error.message.as_str(),
-        _ => "coordinator returned an unexpected response to process start",
+    let (message, machine_error) = match response {
+        CoordinatorResponse::Error { error } => (
+            error.message.as_str(),
+            crate::errors::cli_error_summary_for_api_error(error),
+        ),
+        _ => (
+            "coordinator returned an unexpected response to process start",
+            cli_error_summary("coordinator returned an unexpected response to process start"),
+        ),
     };
-    let active_conflict = message.contains("already has active virtual process");
-    let machine_error = if active_conflict {
-        cli_error_summary_for_category("active_process", message)
-    } else {
-        cli_error_summary(message)
-    };
+    let active_conflict = machine_error
+        .get("code")
+        .and_then(Value::as_str)
+        .is_some_and(|code| code == "active_process_exists")
+        || message.contains("already has active virtual process");
     let error_category = machine_error
         .get("category")
         .cloned()

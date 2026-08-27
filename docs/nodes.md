@@ -65,12 +65,21 @@ need more than the defaults. Keep the values within the host's real capacity.
 
 ~~~bash
 clusterflux node list
-clusterflux node status workstation
+clusterflux node status --node workstation
+clusterflux node doctor --node workstation
 ~~~
 
 The coordinator marks a node stale after its accepted heartbeat age exceeds the
 configured threshold. Stale nodes are excluded before placement and before a
 retained-node download link is created.
+
+`node doctor` is read-only. It checks the stored project-scoped identity,
+coordinator enrollment and reachability, reported container capabilities, and
+automatic compiler availability. To wait for a worker without polling status:
+
+~~~bash
+clusterflux wait node --node workstation --for ready --timeout 5m
+~~~
 
 ## Drain and provider release
 
@@ -106,7 +115,8 @@ when reproducibility matters.
 ## Revoke
 
 ~~~bash
-clusterflux node revoke workstation
+clusterflux node revoke --node workstation --yes
+clusterflux wait node --node workstation --for gone --timeout 5m
 ~~~
 
 Revocation removes the node identity and its live descriptor. Subsequent signed

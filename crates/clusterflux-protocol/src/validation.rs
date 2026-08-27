@@ -826,6 +826,32 @@ fn validate_authenticated_request(
         | AuthenticatedCoordinatorRequest::RetryAutomatedRun { run } => {
             validate_external_id(run, &format!("{path}.run"), RunId::try_new)
         }
+        AuthenticatedCoordinatorRequest::TriggerAutomatedRun {
+            repository,
+            git_ref,
+            commit,
+        } => {
+            validate_external_id(
+                repository,
+                &format!("{path}.repository"),
+                RepositoryId::try_new,
+            )?;
+            if git_ref.len() > 512
+                || !(git_ref.starts_with("refs/heads/") || git_ref.starts_with("refs/tags/"))
+                || git_ref.ends_with('/')
+            {
+                return Err(format!("{path}.git_ref must identify a branch or tag"));
+            }
+            if let Some(commit) = commit {
+                clusterflux_core::validate_commit_sha(commit)
+                    .map_err(|error| format!("{path}.commit is invalid: {error}"))?;
+            }
+            Ok(())
+        }
+        AuthenticatedCoordinatorRequest::ListWebhookDeliveries { cursor, limit } => {
+            validate_optional_cursor(cursor.as_deref(), &format!("{path}.cursor"))?;
+            validate_page_limit(*limit, &format!("{path}.limit"), 100)
+        }
         AuthenticatedCoordinatorRequest::SetProjectSecret { name, value_base64 } => {
             validate_external_token(name, &format!("{path}.name"), 128)?;
             validate_external_token(value_base64, &format!("{path}.value_base64"), 24 * 1024)
