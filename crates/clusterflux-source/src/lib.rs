@@ -255,27 +255,66 @@ pub fn materialize_clean_local_git_revision(
     } else {
         format!("{}/envs", slash_path(project_prefix)?)
     };
-    let status = run_git(
+    let mut changed = run_git(
         &repository_root,
         [
-            "status",
-            "--porcelain=v1",
+            "diff",
+            "--cached",
+            "--name-only",
             "-z",
-            "--untracked-files=all",
+            "--no-ext-diff",
+            "--ignore-cr-at-eol",
             "--",
             environment_path.as_str(),
         ],
         DEFAULT_GIT_TIMEOUT,
         MAX_GIT_DIAGNOSTIC_BYTES,
-    )?;
-    if !status.is_empty() {
-        let changed = status
-            .split(|byte| *byte == 0)
-            .filter(|entry| !entry.is_empty())
-            .take(8)
-            .map(|entry| String::from_utf8_lossy(entry).into_owned())
-            .collect::<Vec<_>>()
-            .join(", ");
+    )?
+    .split(|byte| *byte == 0)
+    .filter(|entry| !entry.is_empty())
+    .map(|entry| String::from_utf8_lossy(entry).into_owned())
+    .collect::<Vec<_>>();
+    changed.extend(
+        run_git(
+            &repository_root,
+            [
+                "diff",
+                "--name-only",
+                "-z",
+                "--no-ext-diff",
+                "--ignore-cr-at-eol",
+                "--",
+                environment_path.as_str(),
+            ],
+            DEFAULT_GIT_TIMEOUT,
+            MAX_GIT_DIAGNOSTIC_BYTES,
+        )?
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| String::from_utf8_lossy(entry).into_owned()),
+    );
+    changed.extend(
+        run_git(
+            &repository_root,
+            [
+                "ls-files",
+                "--others",
+                "--exclude-standard",
+                "-z",
+                "--",
+                environment_path.as_str(),
+            ],
+            DEFAULT_GIT_TIMEOUT,
+            MAX_GIT_DIAGNOSTIC_BYTES,
+        )?
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| String::from_utf8_lossy(entry).into_owned()),
+    );
+    changed.sort_unstable();
+    changed.dedup();
+    if !changed.is_empty() {
+        let changed = changed.into_iter().take(8).collect::<Vec<_>>().join(", ");
         return Err(format!(
             "environment definitions must be committed before immutable image setup: {changed}"
         ));
@@ -1797,6 +1836,11 @@ mod tests {
             .unwrap()
             .windows(2)
             .any(|bytes| bytes == b"\r\n"));
+
+        // Clusterflux deliberately ignores machine-wide Git configuration. A
+        // Windows checkout that inherited core.autocrlf from that configuration
+        // must still compare cleanly against the canonical committed bytes.
+        git(repository.path(), &["config", "core.autocrlf", "false"]);
 
         let materialized = materialize_clean_local_git_revision(repository.path())
             .unwrap()
