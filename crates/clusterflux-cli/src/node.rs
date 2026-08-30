@@ -564,12 +564,12 @@ fn windows_full_runtime_doctor(
         detail: "the Windows nat CNI network is configured".to_owned(),
     });
 
-    let environments = match clusterflux_core::discover_environments(project_root) {
+    let environments = match discover_immutable_environments(project_root) {
         Ok(environments) => environments,
         Err(error) => {
             return WindowsRuntimeDoctorReport::failed(
                 "environment_discovery",
-                error.to_string(),
+                error,
                 requested_environment.map(str::to_owned),
                 None,
                 checks,
@@ -821,6 +821,17 @@ fn windows_full_runtime_doctor(
         mutates_runtime_temporarily: true,
         cleanup_attempted: true,
     }
+}
+
+#[cfg(any(windows, test))]
+fn discover_immutable_environments(
+    project_root: &Path,
+) -> Result<Vec<clusterflux_core::EnvironmentResource>, String> {
+    let materialized = clusterflux_source::materialize_clean_local_git_revision(project_root)?;
+    let discovery_root = materialized
+        .as_ref()
+        .map_or(project_root, |source| source.root());
+    clusterflux_core::discover_environments(discovery_root).map_err(|error| error.to_string())
 }
 
 #[cfg(windows)]
@@ -1749,5 +1760,71 @@ fn parse_capability(cap: &str) -> Option<Capability> {
         "windows-command-dev" => Some(Capability::WindowsCommandDev),
         "artifact-transfer" => Some(Capability::ArtifactTransfer),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod immutable_environment_tests {
+    use super::*;
+    use std::fs;
+    use std::process::Command;
+
+    fn git(root: &Path, arguments: &[&str]) {
+        let status = Command::new("git")
+            .current_dir(root)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .args(arguments)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {arguments:?} failed");
+    }
+
+    #[test]
+    fn doctor_environment_identity_uses_committed_bytes_for_windows_line_endings() {
+        let repository = tempfile::tempdir().unwrap();
+        let environment = repository.path().join("envs/windows-node-build");
+        fs::create_dir_all(&environment).unwrap();
+        fs::write(
+            environment.join("Containerfile"),
+            include_bytes!("../../../envs/windows-node-build/Containerfile"),
+        )
+        .unwrap();
+        fs::write(
+            environment.join("environment.toml"),
+            include_bytes!("../../../envs/windows-node-build/environment.toml"),
+        )
+        .unwrap();
+        git(repository.path(), &["init", "--quiet"]);
+        git(
+            repository.path(),
+            &["config", "user.email", "test@example.com"],
+        );
+        git(repository.path(), &["config", "user.name", "Test"]);
+        git(repository.path(), &["add", "envs"]);
+        git(
+            repository.path(),
+            &["commit", "--quiet", "-m", "environment"],
+        );
+        let canonical = discover_immutable_environments(repository.path()).unwrap()[0]
+            .digest
+            .clone();
+
+        git(repository.path(), &["config", "core.autocrlf", "true"]);
+        fs::remove_dir_all(repository.path().join("envs")).unwrap();
+        git(repository.path(), &["checkout", "--", "envs"]);
+        assert!(fs::read(environment.join("Containerfile"))
+            .unwrap()
+            .windows(2)
+            .any(|bytes| bytes == b"\r\n"));
+        git(repository.path(), &["config", "core.autocrlf", "false"]);
+
+        let working_tree = clusterflux_core::discover_environments(repository.path()).unwrap()[0]
+            .digest
+            .clone();
+        assert_ne!(working_tree, canonical);
+        assert_eq!(
+            discover_immutable_environments(repository.path()).unwrap()[0].digest,
+            canonical
+        );
     }
 }
