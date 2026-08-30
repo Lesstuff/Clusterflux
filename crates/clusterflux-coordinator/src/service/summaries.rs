@@ -298,12 +298,12 @@ impl CoordinatorService {
     fn debug_epoch_summary(&self, key: &ProcessControlKey) -> Option<DebugEpochSummary> {
         let runtime = self.debug_registry.runtime(key)?;
         let acknowledgements = runtime.acknowledgements.values().collect::<Vec<_>>();
-        let all_acknowledged = !runtime.expected.is_empty()
-            && runtime
-                .expected
-                .iter()
-                .all(|participant| runtime.acknowledgements.contains_key(participant));
+        let all_acknowledged = runtime
+            .expected
+            .iter()
+            .all(|participant| runtime.acknowledgements.contains_key(participant));
         let fully_frozen = runtime.command == "freeze"
+            && !runtime.expected.is_empty()
             && all_acknowledged
             && acknowledgements
                 .iter()

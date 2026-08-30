@@ -1257,6 +1257,7 @@ pub(super) fn capability_from_descriptor(capability: &str) -> Result<Capability,
     match capability.to_ascii_lowercase().as_str() {
         "command" => Ok(Capability::Command),
         "rootless_podman" => Ok(Capability::RootlessPodman),
+        "containerd_nerdctl" => Ok(Capability::ContainerdNerdctl),
         "source_git" => Ok(Capability::SourceGit),
         "source_filesystem" => Ok(Capability::SourceFilesystem),
         "network" => Ok(Capability::Network),
@@ -1588,6 +1589,7 @@ mod tests {
                 expected: BTreeSet::new(),
                 acknowledgements: BTreeMap::new(),
                 deadline: std::time::Instant::now(),
+                lease_deadline: std::time::Instant::now(),
             },
         );
 

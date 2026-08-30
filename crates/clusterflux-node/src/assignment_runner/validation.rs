@@ -82,6 +82,7 @@ pub(super) fn capability_from_descriptor(value: &str) -> Result<Capability, Stri
         "command" => Ok(Capability::Command),
         "containers" => Ok(Capability::Containers),
         "rootless_podman" => Ok(Capability::RootlessPodman),
+        "containerd_nerdctl" => Ok(Capability::ContainerdNerdctl),
         "source_filesystem" => Ok(Capability::SourceFilesystem),
         "source_git" => Ok(Capability::SourceGit),
         "host_filesystem" => Ok(Capability::HostFilesystem),

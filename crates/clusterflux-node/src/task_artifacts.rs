@@ -456,9 +456,6 @@ pub(crate) fn task_output_root(
     node: &str,
     task: &TaskInstanceId,
 ) -> Result<PathBuf, String> {
-    let base = project_root
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
     let safe = |value: &str| {
         value
             .chars()
@@ -471,10 +468,7 @@ pub(crate) fn task_output_root(
             })
             .collect::<String>()
     };
-    let parent = base
-        .join("target/clusterflux")
-        .join("task-outputs")
-        .join(safe(node));
+    let parent = task_output_parent(project_root).join(safe(node));
     fs::create_dir_all(&parent).map_err(|error| error.to_string())?;
     let now_nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -501,9 +495,6 @@ pub(crate) fn clean_stale_task_output_roots(
     project_root: Option<&Path>,
     node: &str,
 ) -> Result<usize, String> {
-    let base = project_root
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
     let node = node
         .chars()
         .map(|character| {
@@ -514,10 +505,7 @@ pub(crate) fn clean_stale_task_output_roots(
             }
         })
         .collect::<String>();
-    let parent = base
-        .join("target/clusterflux")
-        .join("task-outputs")
-        .join(node);
+    let parent = task_output_parent(project_root).join(node);
     let parent_metadata = match fs::symlink_metadata(&parent) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
@@ -540,18 +528,49 @@ pub(crate) fn clean_stale_task_output_roots(
     Ok(removed)
 }
 
+fn task_output_parent(project_root: Option<&Path>) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let _ = project_root;
+        std::env::temp_dir()
+            .join("clusterflux")
+            .join("task-outputs")
+    }
+    #[cfg(not(windows))]
+    {
+        project_root
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("target/clusterflux")
+            .join("task-outputs")
+    }
+}
+
 fn confined_output_file(output_root: &Path, relative_path: &str) -> Result<PathBuf, String> {
     validate_relative_path(relative_path)?;
-    let root = output_root
-        .canonicalize()
-        .map_err(|error| error.to_string())?;
+    let root = output_root.canonicalize().map_err(|error| {
+        format!(
+            "resolve task output root `{}` before publishing `{relative_path}`: {error}",
+            output_root.display()
+        )
+    })?;
     reject_symlink_components(&root, relative_path, true)?;
     let path = root.join(relative_path);
-    let metadata = fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
+    let metadata = fs::symlink_metadata(&path).map_err(|error| {
+        format!(
+            "inspect task output `{}` before publication: {error}",
+            path.display()
+        )
+    })?;
     if metadata.file_type().is_symlink() {
         return Err("task output publication rejects symbolic links".to_owned());
     }
-    let canonical = path.canonicalize().map_err(|error| error.to_string())?;
+    let canonical = path.canonicalize().map_err(|error| {
+        format!(
+            "resolve task output `{}` before publication: {error}",
+            path.display()
+        )
+    })?;
     if !canonical.starts_with(&root) {
         return Err("task output path escapes its bounded output root".to_owned());
     }

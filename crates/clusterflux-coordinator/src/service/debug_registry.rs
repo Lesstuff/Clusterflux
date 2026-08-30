@@ -1,4 +1,3 @@
-use std::collections::BTreeSet;
 use std::collections::{BTreeMap, VecDeque};
 
 use clusterflux_core::{ProcessId, ProjectId, TaskInstanceId, TenantId};
@@ -58,14 +57,14 @@ impl DebugRegistry {
         self.commands.remove(key);
     }
 
-    pub(super) fn retain_resumable_commands(
-        &mut self,
-        epoch: u64,
-        resumable: &BTreeSet<TaskControlKey>,
-    ) {
-        self.commands.retain(|key, pending| {
-            pending.epoch != epoch || pending.command != "resume" || resumable.contains(key)
-        });
+    pub(super) fn clear_epoch_commands(&mut self, process_key: &ProcessControlKey, epoch: u64) {
+        self.commands
+            .retain(|(tenant, project, process, _, _), pending| {
+                tenant != &process_key.0
+                    || project != &process_key.1
+                    || process != &process_key.2
+                    || pending.epoch != epoch
+            });
     }
 
     pub(super) fn epoch(&self, key: &ProcessControlKey) -> Option<u64> {
@@ -80,12 +79,42 @@ impl DebugRegistry {
         self.epochs.keys()
     }
 
+    pub(super) fn expired_freeze_leases(
+        &self,
+        now: std::time::Instant,
+    ) -> Vec<(ProcessControlKey, u64)> {
+        self.epoch_runtime
+            .iter()
+            .filter(|(_, runtime)| runtime.command == "freeze" && now >= runtime.lease_deadline)
+            .map(|(key, runtime)| (key.clone(), runtime.epoch))
+            .collect()
+    }
+
     pub(super) fn runtime(&self, key: &ProcessControlKey) -> Option<&DebugEpochRuntime> {
         self.epoch_runtime.get(key)
     }
 
+    pub(super) fn runtime_mut(
+        &mut self,
+        key: &ProcessControlKey,
+    ) -> Option<&mut DebugEpochRuntime> {
+        self.epoch_runtime.get_mut(key)
+    }
+
     pub(super) fn set_runtime(&mut self, key: ProcessControlKey, runtime: DebugEpochRuntime) {
         self.epoch_runtime.insert(key, runtime);
+    }
+
+    pub(super) fn remove_runtime_participant(
+        &mut self,
+        process_key: &ProcessControlKey,
+        participant: &TaskControlKey,
+    ) {
+        if let Some(runtime) = self.epoch_runtime.get_mut(process_key) {
+            runtime.expected.remove(participant);
+            runtime.acknowledgements.remove(participant);
+        }
+        self.commands.remove(participant);
     }
 
     pub(super) fn validate_acknowledgement_source(

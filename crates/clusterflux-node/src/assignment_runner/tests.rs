@@ -1,11 +1,17 @@
+#[cfg(unix)]
 use std::io::{BufRead, BufReader, Write};
+#[cfg(unix)]
 use std::net::TcpListener;
-use std::time::{Duration, Instant};
+#[cfg(unix)]
+use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 
 use clusterflux_source::snapshot_project;
 
 use super::*;
 
+#[cfg(unix)]
 fn start_running_control_server() -> (String, thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let coordinator = listener.local_addr().unwrap().to_string();
@@ -25,6 +31,35 @@ fn start_running_control_server() -> (String, thread::JoinHandle<()>) {
     (coordinator, server)
 }
 
+#[cfg(unix)]
+fn start_reconnecting_control_server() -> (String, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let coordinator = listener.local_addr().unwrap().to_string();
+    let server = thread::spawn(move || {
+        let (interrupted, _) = listener.accept().unwrap();
+        let mut request = String::new();
+        BufReader::new(interrupted.try_clone().unwrap())
+            .read_line(&mut request)
+            .unwrap();
+        assert!(!request.trim().is_empty());
+        drop(interrupted);
+
+        let (mut recovered, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(recovered.try_clone().unwrap());
+        loop {
+            let mut request = String::new();
+            match reader.read_line(&mut request) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => recovered
+                    .write_all(b"{\"type\":\"task_control\",\"process\":\"vp\",\"task\":\"task\",\"cancel_requested\":false,\"abort_requested\":false}\n")
+                    .unwrap(),
+            }
+        }
+    });
+    (coordinator, server)
+}
+
+#[cfg(unix)]
 fn test_controlled_runner(
     coordinator: String,
     timeout: Duration,
@@ -47,6 +82,7 @@ fn test_controlled_runner(
             emit_ready: false,
             worker: true,
             capabilities: Vec::new(),
+            dangerous_allow_native_commands: false,
             no_workflow_compilation: true,
             system_tasks_only: false,
             system_compiler_image: None,
@@ -119,6 +155,7 @@ fn controlled_process_runner_kills_running_group_when_abort_is_polled() {
             emit_ready: false,
             worker: true,
             capabilities: Vec::new(),
+            dangerous_allow_native_commands: false,
             no_workflow_compilation: true,
             system_tasks_only: false,
             system_compiler_image: None,
@@ -160,6 +197,7 @@ fn controlled_process_runner_kills_running_group_when_abort_is_polled() {
         .run(&PodmanCommand {
             program: "sh".to_owned(),
             args: vec!["-c".to_owned(), "sleep 30 & wait".to_owned()],
+            working_directory: None,
             environment: BTreeMap::new(),
         })
         .unwrap_err();
@@ -167,6 +205,31 @@ fn controlled_process_runner_kills_running_group_when_abort_is_polled() {
 
     assert!(matches!(error, BackendError::Cancelled(_)));
     assert!(started.elapsed() < Duration::from_secs(5));
+}
+
+#[cfg(unix)]
+#[test]
+fn controlled_process_runner_survives_a_transient_control_disconnect() {
+    let (coordinator, server) = start_reconnecting_control_server();
+    let mut runner = test_controlled_runner(coordinator, Duration::from_secs(5));
+
+    let output = runner
+        .run(&PodmanCommand {
+            program: "sh".to_owned(),
+            args: vec!["-c".to_owned(), "sleep 1".to_owned()],
+            working_directory: None,
+            environment: BTreeMap::new(),
+        })
+        .unwrap();
+    server.join().unwrap();
+
+    assert_eq!(output.status_code, Some(0));
+    assert!(runner
+        .command_status
+        .lock()
+        .unwrap()
+        .as_deref()
+        .is_some_and(|status| status.contains("exited with status")));
 }
 
 #[cfg(unix)]
@@ -179,6 +242,7 @@ fn command_timeout_is_bounded_and_a_later_command_still_runs() {
         .run(&PodmanCommand {
             program: "sh".to_owned(),
             args: vec!["-c".to_owned(), "sleep 30 & wait".to_owned()],
+            working_directory: None,
             environment: BTreeMap::new(),
         })
         .unwrap_err();
@@ -193,6 +257,7 @@ fn command_timeout_is_bounded_and_a_later_command_still_runs() {
         .run(&PodmanCommand {
             program: "sh".to_owned(),
             args: vec!["-c".to_owned(), "printf healthy".to_owned()],
+            working_directory: None,
             environment: BTreeMap::new(),
         })
         .unwrap();
@@ -214,6 +279,59 @@ fn command_source_verification_rejects_a_changed_checkout() {
 
     assert!(error.contains("source snapshot mismatch"));
     assert!(error.contains(expected.as_str()));
+}
+
+#[test]
+fn exact_revision_snapshot_returns_its_authoritative_handle() {
+    let checkout = tempfile::tempdir().unwrap();
+    std::fs::write(checkout.path().join("source.c"), "int value = 1;\n").unwrap();
+    let checkout_digest = snapshot_project(checkout.path()).unwrap().digest;
+    let revision_handle = Digest::from_parts([
+        b"clusterflux-git-revision:v1".as_slice(),
+        b"github:example/project".as_slice(),
+        b"https://github.com/example/project.git".as_slice(),
+        b"0123456789abcdef0123456789abcdef01234567".as_slice(),
+    ]);
+    assert_ne!(checkout_digest, revision_handle);
+    let revision = clusterflux_core::RepositoryRevision {
+        repository_id: clusterflux_core::RepositoryId::from("github:example/project"),
+        clone_url: "https://github.com/example/project.git".to_owned(),
+        commit_sha: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+        source_snapshot: revision_handle.clone(),
+    };
+
+    assert_eq!(
+        authoritative_source_snapshot(
+            checkout.path(),
+            Some(&revision_handle),
+            Some(&revision),
+            || false,
+        )
+        .unwrap(),
+        revision_handle
+    );
+}
+
+#[test]
+fn exact_revision_snapshot_rejects_a_different_task_handle() {
+    let checkout = tempfile::tempdir().unwrap();
+    let revision = clusterflux_core::RepositoryRevision {
+        repository_id: clusterflux_core::RepositoryId::from("github:example/project"),
+        clone_url: "https://github.com/example/project.git".to_owned(),
+        commit_sha: "0123456789abcdef0123456789abcdef01234567".to_owned(),
+        source_snapshot: Digest::from_parts([b"revision".as_slice()]),
+    };
+    let different_handle = Digest::from_parts([b"different".as_slice()]);
+
+    let error = authoritative_source_snapshot(
+        checkout.path(),
+        Some(&different_handle),
+        Some(&revision),
+        || false,
+    )
+    .unwrap_err();
+
+    assert!(error.contains("does not match task source handle"));
 }
 
 #[test]

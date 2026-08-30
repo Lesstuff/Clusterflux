@@ -1,7 +1,8 @@
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use clusterflux_core::{
-    generate_ed25519_private_key, node_ed25519_public_key_from_private_key,
+    generate_ed25519_private_key, node_ed25519_public_key_from_private_key, secure_private_path,
     sign_node_assignment_operation_request, sign_node_assignment_request, sign_node_request,
     signed_request_payload_digest, AssignmentAuthority, NodeAssignmentOperation, NodeId,
 };
@@ -40,6 +41,7 @@ pub(crate) fn apply_stored_node_scope(args: &mut Args) -> Result<(), Box<dyn std
     if !credential_file_exists_without_symlink(&file)? {
         return Ok(());
     }
+    secure_private_path(&file, false)?;
     let bytes = std::fs::read(&file)?;
     let credential: StoredNodeCredential = serde_json::from_slice(&bytes)?;
     if credential.node != args.node {
@@ -195,6 +197,7 @@ pub(crate) fn load_or_create_local_node_credential(
 ) -> Result<String, Box<dyn std::error::Error>> {
     let file = local_node_credential_file(project, node);
     if credential_file_exists_without_symlink(&file)? {
+        secure_private_path(&file, false)?;
         let bytes = std::fs::read(&file)?;
         let credential: StoredNodeCredential = serde_json::from_slice(&bytes)?;
         if credential.node != node {
@@ -250,6 +253,7 @@ fn persist_runtime_scope_if_stored(args: &Args) -> Result<(), Box<dyn std::error
     if !credential_file_exists_without_symlink(&file)? {
         return Ok(());
     }
+    secure_private_path(&file, false)?;
     let mut credential: StoredNodeCredential = serde_json::from_slice(&std::fs::read(&file)?)?;
     credential.coordinator = Some(args.coordinator.clone());
     credential.tenant = Some(args.tenant.clone());
@@ -257,6 +261,7 @@ fn persist_runtime_scope_if_stored(args: &Args) -> Result<(), Box<dyn std::error
     let parent = file
         .parent()
         .ok_or_else(|| format!("node credential path {} has no parent", file.display()))?;
+    secure_private_path(parent, true)?;
     let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
     #[cfg(unix)]
     {
@@ -274,6 +279,7 @@ fn persist_runtime_scope_if_stored(args: &Args) -> Result<(), Box<dyn std::error
             error.error
         )
     })?;
+    secure_private_path(&file, false)?;
     Ok(())
 }
 
@@ -312,6 +318,7 @@ fn persist_node_credential(
         )
         .into());
     }
+    secure_private_path(parent, true)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -335,6 +342,7 @@ fn persist_node_credential(
             error.error
         )
     })?;
+    secure_private_path(file, false)?;
     Ok(())
 }
 
@@ -347,8 +355,24 @@ pub(crate) fn local_node_credential_file(project: &Path, node: &str) -> PathBuf 
         .join(format!("{file_stem}.json"))
 }
 
+static NODE_NONCE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
 pub(crate) fn node_nonce(prefix: &str) -> String {
-    format!("{prefix}-{}-{}", unix_timestamp_nanos(), std::process::id())
+    node_nonce_from_parts(
+        prefix,
+        unix_timestamp_nanos(),
+        std::process::id(),
+        NODE_NONCE_SEQUENCE.fetch_add(1, Ordering::Relaxed),
+    )
+}
+
+fn node_nonce_from_parts(
+    prefix: &str,
+    timestamp_nanos: u128,
+    process_id: u32,
+    sequence: u64,
+) -> String {
+    format!("{prefix}-{timestamp_nanos}-{process_id}-{sequence}")
 }
 
 pub(crate) fn unix_timestamp_seconds() -> u64 {
@@ -450,6 +474,16 @@ pub(crate) fn unix_timestamp_nanos() -> u128 {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn node_nonce_sequence_stays_unique_when_the_clock_does_not_advance() {
+        let first = node_nonce_from_parts("poll_task_control", 1_000, 42, 7);
+        let second = node_nonce_from_parts("poll_task_control", 1_000, 42, 8);
+
+        assert_ne!(first, second);
+        assert_eq!(first, "poll_task_control-1000-42-7");
+        assert_eq!(second, "poll_task_control-1000-42-8");
+    }
 
     #[test]
     fn enrolled_scope_is_reused_and_conflicting_scope_is_rejected() {

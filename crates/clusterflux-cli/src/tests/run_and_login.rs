@@ -197,7 +197,7 @@ fn node_attach_detects_and_accepts_capability_overrides() {
     else {
         panic!("wrong command");
     };
-    let plan = attach_plan(args);
+    let plan = attach_plan_with_capabilities(args, test_linux_container_node_capabilities());
 
     assert!(plan
         .capabilities
@@ -207,7 +207,7 @@ fn node_attach_detects_and_accepts_capability_overrides() {
     assert!(plan.detection.auto_detected);
     assert_eq!(plan.detection.os, plan.capabilities.os);
     assert_eq!(plan.detection.arch, plan.capabilities.arch);
-    assert_eq!(plan.detection.command_backend, "native-command");
+    assert_eq!(plan.detection.command_backend, "container-command");
     assert!(plan.detection.command_backend_available);
     assert!(plan.detection.manual_capability_overrides_allowed);
     assert_eq!(
@@ -228,7 +228,7 @@ fn node_attach_detects_and_accepts_capability_overrides() {
 }
 
 #[test]
-fn node_attach_discloses_dangerous_capability_grants() {
+fn node_attach_discloses_container_and_sensitive_capability_grants() {
     let Cli {
         command: Commands::Node {
             command: NodeCommands::Attach(args),
@@ -247,14 +247,14 @@ fn node_attach_discloses_dangerous_capability_grants() {
     else {
         panic!("wrong command");
     };
-    let plan = attach_plan(args);
+    let plan = attach_plan_with_capabilities(args, test_linux_container_node_capabilities());
     let grants = plan
         .grant_disclosures
         .iter()
         .map(|disclosure| disclosure.grant.as_str())
         .collect::<Vec<_>>();
 
-    assert!(grants.contains(&"native_command_execution"));
+    assert!(grants.contains(&"container_command_execution"));
     assert!(grants.contains(&"source_access"));
     assert!(grants.contains(&"network_access"));
     assert!(grants.contains(&"host_filesystem_access"));
@@ -269,7 +269,7 @@ fn node_attach_discloses_dangerous_capability_grants() {
         "node": plan.node,
         "grant_disclosures": plan.grant_disclosures,
     }));
-    assert!(rendered.contains("grant native_command_execution"));
+    assert!(rendered.contains("grant container_command_execution"));
     assert!(rendered.contains("grant network_access"));
     assert!(rendered.contains("policy-limited"));
 }

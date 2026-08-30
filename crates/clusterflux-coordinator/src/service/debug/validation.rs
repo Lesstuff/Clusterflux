@@ -10,13 +10,12 @@ pub(super) fn runtime_all_in_state(
     runtime: &DebugEpochRuntime,
     state: DebugAcknowledgementState,
 ) -> bool {
-    !runtime.expected.is_empty()
-        && runtime.expected.iter().all(|key| {
-            runtime
-                .acknowledgements
-                .get(key)
-                .is_some_and(|ack| ack.state == state)
-        })
+    runtime.expected.iter().all(|key| {
+        runtime
+            .acknowledgements
+            .get(key)
+            .is_some_and(|ack| ack.state == state)
+    })
 }
 
 pub(super) fn validate_probe_symbols(

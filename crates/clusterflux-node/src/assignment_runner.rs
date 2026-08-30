@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -14,7 +14,7 @@ use crate::artifact_interchange::ArtifactWarmupManager;
 use crate::coordinator_session::CoordinatorSession;
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use clusterflux_core::{
-    Capability, CommandInvocation, Digest, NodeId, ProcessId, ProjectId, TaskBoundaryValue,
+    Capability, CommandInvocation, Digest, NodeId, Os, ProcessId, ProjectId, TaskBoundaryValue,
     TaskDispatch, TaskInstanceId, TaskJoinResult, TaskJoinState, TaskSpec, TenantId, VfsManifest,
     WasmExportAbi, WasmHostDebugProbeRequest, WasmHostDebugProbeResult,
     WasmHostSourceSnapshotRequest, WasmHostSourceSnapshotResult, WasmHostTaskHandle,
@@ -23,9 +23,10 @@ use clusterflux_core::{
     WasmTaskOutcome, WasmTaskResult,
 };
 use clusterflux_node::{
-    BackendError, CommandOutput, LinuxRootlessPodmanBackend, LocalCheckoutTaskRequest,
-    LocalSourceCheckout, PodmanCommand, ProcessOutput, ProcessRunner, WasmDebugControl,
-    DEFAULT_COMMAND_LOG_LIMIT_BYTES,
+    execute_dangerous_native_checkout_task, BackendError, CommandOutput,
+    LinuxRootlessPodmanBackend, LocalCheckoutTaskRequest, LocalSourceCheckout,
+    LocalTaskCancellation, PodmanCommand, ProcessOutput, ProcessRunner, WasmDebugControl,
+    WindowsContainerdNerdctlBackend, DEFAULT_COMMAND_LOG_LIMIT_BYTES,
 };
 use clusterflux_protocol::{CoordinatorRequest, CoordinatorResponse};
 use clusterflux_source::{
@@ -941,6 +942,10 @@ impl CoordinatorWasmTaskHost {
         authorize_command_network(&request.network, self.allow_network)?;
         let environment_id = require_command_environment(self.environment_id.as_deref())?;
         let project_root = &self.source_root;
+        let source_inventory = snapshot_project_cancellable(project_root, || {
+            self.cancellation_requested.is_cancelled()
+                || self.abort_requested.load(Ordering::Acquire)
+        })?;
         let source_digest = match (&self.source_snapshot, &self.source_revision) {
             (Some(expected), Some(revision)) => {
                 if expected != &revision.source_snapshot {
@@ -950,7 +955,15 @@ impl CoordinatorWasmTaskHost {
                 }
                 expected.clone()
             }
-            (Some(expected), None) => verify_source_snapshot(project_root, expected)?.digest,
+            (Some(expected), None) => {
+                if &source_inventory.digest != expected {
+                    return Err(format!(
+                        "node checkout source snapshot mismatch: task requires {expected}, but the current checkout is {}",
+                        source_inventory.digest
+                    ));
+                }
+                expected.clone()
+            }
             (None, None) => Digest::from_parts([
                 b"clusterflux-empty-task-source:v1".as_slice(),
                 self.parent_task.as_bytes(),
@@ -1052,23 +1065,52 @@ impl CoordinatorWasmTaskHost {
             network: request.network,
             env: Some(environment),
         };
-        let execution = LinuxRootlessPodmanBackend.execute_local_checkout_task(
-            LocalCheckoutTaskRequest {
-                process: ProcessId::from(self.process.as_str()),
-                virtual_thread: task_id,
-                invocation: &invocation,
-                checkout: LocalSourceCheckout {
-                    snapshot: source_digest,
-                    host_path: checkout,
-                },
-                output_root: self.output_root.clone(),
-                stage_stdout_as: None,
-                system_package_dir: self.args.system_compiler_package_dir.clone(),
-                run_policy: self.args.task_container_policy(),
+        let task_request = LocalCheckoutTaskRequest {
+            process: ProcessId::from(self.process.as_str()),
+            virtual_thread: task_id,
+            execution_attempt: format!(
+                "{}:{}",
+                self.assignment_authority.assignment_id, self.assignment_authority.attempt_id
+            ),
+            invocation: &invocation,
+            checkout: LocalSourceCheckout {
+                snapshot: source_digest,
+                host_path: checkout,
+                inventory: Some(source_inventory),
             },
-            &mut runner,
-            artifacts.overlay_mut(),
-        );
+            output_root: self.output_root.clone(),
+            stage_stdout_as: None,
+            system_package_dir: self.args.system_compiler_package_dir.clone(),
+            run_policy: self.args.task_container_policy(),
+            cancellation: LocalTaskCancellation::new(
+                self.cancellation_requested.clone(),
+                Arc::clone(&self.abort_requested),
+            ),
+        };
+        let execution = if self.args.dangerous_allow_native_commands {
+            execute_dangerous_native_checkout_task(
+                task_request,
+                &mut runner,
+                artifacts.overlay_mut(),
+            )
+        } else {
+            match Os::current() {
+                Os::Linux => LinuxRootlessPodmanBackend.execute_local_checkout_task(
+                    task_request,
+                    &mut runner,
+                    artifacts.overlay_mut(),
+                ),
+                Os::Windows => WindowsContainerdNerdctlBackend.execute_local_checkout_task(
+                    task_request,
+                    &mut runner,
+                    artifacts.overlay_mut(),
+                ),
+                Os::Macos | Os::Other(_) => Err(BackendError::Denied(
+                    "this platform has no configured container command backend; native execution requires --dangerous-allow-native-commands"
+                        .to_owned(),
+                )),
+            }
+        };
         for (name, value) in &mut invocation.environment_variables {
             if secret_environment_names.contains(name) || is_secret_environment_name(name) {
                 value.zeroize();
@@ -1240,19 +1282,45 @@ impl CoordinatorWasmTaskHost {
                     .to_owned(),
             );
         }
-        let snapshot = if let Some(snapshot) = &self.source_snapshot {
-            verify_source_snapshot(&self.source_root, snapshot)?.digest
-        } else {
-            snapshot_project_cancellable(&self.source_root, || {
+        let snapshot = authoritative_source_snapshot(
+            &self.source_root,
+            self.source_snapshot.as_ref(),
+            self.source_revision.as_ref(),
+            || {
                 self.cancellation_requested.is_cancelled()
                     || self.abort_requested.load(Ordering::Acquire)
-            })?
-            .digest
-        };
+            },
+        )?;
         Ok(WasmHostSourceSnapshotResult {
             abi_version: clusterflux_core::WASM_TASK_ABI_VERSION,
             snapshot,
         })
+    }
+}
+
+fn authoritative_source_snapshot(
+    source_root: &Path,
+    source_snapshot: Option<&Digest>,
+    source_revision: Option<&clusterflux_core::RepositoryRevision>,
+    cancelled: impl Fn() -> bool,
+) -> Result<Digest, String> {
+    match (source_snapshot, source_revision) {
+        // The revision handle is an authority over repository identity, clone URL, and
+        // commit, not the digest produced by snapshotting a checkout. `prepare` has
+        // already validated this metadata and materialized that exact commit.
+        (Some(expected), Some(revision)) => {
+            if expected != &revision.source_snapshot {
+                return Err(
+                    "materialized Git revision does not match task source handle".to_owned(),
+                );
+            }
+            Ok(expected.clone())
+        }
+        (Some(expected), None) => Ok(verify_source_snapshot(source_root, expected)?.digest),
+        (None, None) => Ok(snapshot_project_cancellable(source_root, cancelled)?.digest),
+        (None, Some(_)) => {
+            Err("task carries Git revision metadata without a source handle".to_owned())
+        }
     }
 }
 

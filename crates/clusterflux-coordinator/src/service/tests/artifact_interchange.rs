@@ -2,6 +2,53 @@ use super::*;
 use crate::NodeScopeKey;
 
 #[test]
+fn endpoint_advertisement_allows_only_the_bounded_node_clock_skew() {
+    let mut service = CoordinatorService::new(90);
+    service.set_server_time(100);
+    let tenant = TenantId::from("tenant");
+    let project = ProjectId::from("project");
+    let node = NodeId::from("clock-skew-node");
+    service
+        .handle_request(CoordinatorRequest::AttachNode {
+            tenant: tenant.to_string(),
+            project: project.to_string(),
+            node: node.to_string(),
+            public_key: test_node_public_key(node.as_str()),
+        })
+        .unwrap();
+
+    let advertisement = |expires_at| IrohEndpointAdvertisement {
+        tenant: tenant.clone(),
+        project: project.clone(),
+        node: node.clone(),
+        endpoint_id: format!("clock-skew-endpoint-{expires_at}"),
+        generation: 1,
+        relay_configuration_generation: 1,
+        direct_addresses: vec!["127.0.0.1:41000".parse().unwrap()],
+        relay_urls: Vec::new(),
+        expires_at,
+    };
+
+    service
+        .handle_report_iroh_endpoint_advertisement(
+            tenant.to_string(),
+            project.to_string(),
+            node.to_string(),
+            advertisement(165),
+        )
+        .unwrap();
+    let error = service
+        .handle_report_iroh_endpoint_advertisement(
+            tenant.to_string(),
+            project.to_string(),
+            node.to_string(),
+            advertisement(166),
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("outside the coordinator policy"));
+}
+
+#[test]
 fn iroh_interchange_exchanges_authorized_peers_and_publishes_after_verification() {
     let mut service = CoordinatorService::new(91);
     service.set_server_time(100);

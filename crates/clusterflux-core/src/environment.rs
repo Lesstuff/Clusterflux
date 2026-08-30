@@ -42,6 +42,15 @@ impl EnvironmentRequirements {
         }
     }
 
+    pub fn windows_container() -> Self {
+        Self {
+            os: Some(Os::Windows),
+            arch: None,
+            capabilities: BTreeSet::from([Capability::Containers, Capability::ContainerdNerdctl]),
+            secret_declarations: BTreeSet::new(),
+        }
+    }
+
     pub fn unconstrained() -> Self {
         Self {
             os: None,
@@ -96,6 +105,34 @@ impl EnvironmentResource {
         }
         Ok(())
     }
+}
+
+pub fn environment_image_tag(environment: &EnvironmentResource) -> String {
+    let name = environment
+        .name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    let digest = environment
+        .digest
+        .as_str()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+                character
+            } else {
+                '-'
+            }
+        })
+        .take(24)
+        .collect::<String>();
+    format!("clusterflux-env/{name}:{digest}")
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -267,11 +304,12 @@ pub fn environment_resource_from_revision_bytes(
     validate_context_manifest(&mut context_manifest)?;
     let context_manifest_digest = context_manifest_identity(&context_manifest);
     let requirements = parse_environment_manifest(name, &kind, metadata_bytes)?;
+    let portable_recipe_path = recipe_path.to_string_lossy().replace('\\', "/");
     let digest = Digest::from_parts([
         b"environment:v3".as_slice(),
         name.as_bytes(),
         format!("{kind:?}").as_bytes(),
-        recipe_path.to_string_lossy().as_bytes(),
+        portable_recipe_path.as_bytes(),
         Digest::sha256(recipe_bytes).as_str().as_bytes(),
         Digest::sha256(metadata_bytes).as_str().as_bytes(),
         context_manifest_digest.as_str().as_bytes(),
@@ -300,7 +338,7 @@ fn parse_environment_manifest(
         EnvironmentKind::Containerfile | EnvironmentKind::Dockerfile
             if directory_name.eq_ignore_ascii_case("windows") =>
         {
-            EnvironmentRequirements::windows_command_dev()
+            EnvironmentRequirements::windows_container()
         }
         EnvironmentKind::Containerfile | EnvironmentKind::Dockerfile => {
             EnvironmentRequirements::linux_container()
@@ -340,6 +378,28 @@ fn parse_environment_manifest(
             "macos" => Os::Macos,
             _ => return Err(format!("unsupported environment OS `{os}`")),
         });
+        if matches!(
+            kind,
+            EnvironmentKind::Containerfile | EnvironmentKind::Dockerfile
+        ) {
+            requirements
+                .capabilities
+                .remove(&Capability::RootlessPodman);
+            requirements
+                .capabilities
+                .remove(&Capability::ContainerdNerdctl);
+            match requirements.os {
+                Some(Os::Linux) => {
+                    requirements.capabilities.insert(Capability::RootlessPodman);
+                }
+                Some(Os::Windows) => {
+                    requirements
+                        .capabilities
+                        .insert(Capability::ContainerdNerdctl);
+                }
+                Some(Os::Macos) | Some(Os::Other(_)) | None => {}
+            }
+        }
     }
     if let Some(arch) = manifest.arch {
         if arch.is_empty()
@@ -360,7 +420,17 @@ fn parse_environment_manifest(
                 }
                 "container" => {
                     requirements.capabilities.insert(Capability::Containers);
-                    requirements.capabilities.insert(Capability::RootlessPodman);
+                    match requirements.os {
+                        Some(Os::Linux) => {
+                            requirements.capabilities.insert(Capability::RootlessPodman);
+                        }
+                        Some(Os::Windows) => {
+                            requirements
+                                .capabilities
+                                .insert(Capability::ContainerdNerdctl);
+                        }
+                        Some(Os::Macos) | Some(Os::Other(_)) | None => {}
+                    }
                 }
                 "network" => {
                     requirements.capabilities.insert(Capability::Network);
@@ -644,13 +714,13 @@ mod tests {
     }
 
     #[test]
-    fn windows_environment_name_uses_windows_development_requirements() {
+    fn windows_environment_name_uses_containerd_nerdctl_requirements() {
         let temp = tempfile::tempdir().unwrap();
         let windows = temp.path().join("envs/windows");
         fs::create_dir_all(&windows).unwrap();
         fs::write(
             windows.join("Dockerfile"),
-            "# user-attached windows dev contract\n",
+            "# Windows container environment\n",
         )
         .unwrap();
 
@@ -659,6 +729,10 @@ mod tests {
         assert_eq!(envs[0].name, "windows");
         assert_eq!(envs[0].requirements.os, Some(Os::Windows));
         assert!(envs[0]
+            .requirements
+            .capabilities
+            .contains(&Capability::ContainerdNerdctl));
+        assert!(!envs[0]
             .requirements
             .capabilities
             .contains(&Capability::WindowsCommandDev));
@@ -686,6 +760,39 @@ mod tests {
         );
         assert_ne!(first.digest, second.digest);
         assert_eq!(second.context_manifest[1].path, "install-tool.sh");
+    }
+
+    #[test]
+    fn environment_identity_normalizes_windows_path_separators() {
+        let metadata = b"version = 1\nname = \"windows-node-build\"\nos = \"windows\"\narch = \"x86_64\"\ncapabilities = [\"command\"]\nsecrets = []\n";
+        let manifest = vec![EnvironmentContextFile {
+            path: "Containerfile".to_owned(),
+            mode: 0o100644,
+            size: 12,
+            digest: Digest::sha256("FROM scratch"),
+        }];
+        let slash = environment_resource_from_revision_bytes(
+            "windows-node-build",
+            EnvironmentKind::Containerfile,
+            PathBuf::from("envs/windows-node-build/Containerfile"),
+            PathBuf::from("envs/windows-node-build"),
+            b"FROM scratch",
+            metadata,
+            manifest.clone(),
+        )
+        .unwrap();
+        let backslash = environment_resource_from_revision_bytes(
+            "windows-node-build",
+            EnvironmentKind::Containerfile,
+            PathBuf::from(r"envs\windows-node-build\Containerfile"),
+            PathBuf::from(r"envs\windows-node-build"),
+            b"FROM scratch",
+            metadata,
+            manifest,
+        )
+        .unwrap();
+
+        assert_eq!(slash.digest, backslash.digest);
     }
 
     #[test]

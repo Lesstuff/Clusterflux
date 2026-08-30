@@ -22,6 +22,9 @@ pub mod source;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod system_bundle;
 pub mod vfs;
+#[cfg(windows)]
+mod windows_container;
+mod windows_security;
 pub mod workflow_manifest;
 
 pub use api_error::{ApiError, ApiErrorCategory, ApiErrorCode};
@@ -73,7 +76,8 @@ pub use bundle::{
     CompilerProfile, FinalizedWorkflow, SelectedInput, SourceLocation,
 };
 pub use capability::{
-    Capability, CapabilityReportError, EnvironmentBackend, NodeCapabilities, NodeWorkPolicy, Os,
+    probe_containerd_nerdctl_readiness, Capability, CapabilityReportError,
+    ContainerdNerdctlReadiness, EnvironmentBackend, NodeCapabilities, NodeWorkPolicy, Os,
     SystemBundleCapability, SystemTaskSandbox,
 };
 pub use checkpoint::{
@@ -87,7 +91,7 @@ pub use debug::{
 pub use dep_info::parse_makefile_dep_info;
 pub use digest::Digest;
 pub use environment::{
-    diagnose_environment_references, discover_environments,
+    diagnose_environment_references, discover_environments, environment_image_tag,
     environment_resource_from_revision_bytes, EnvironmentContextFile, EnvironmentDiagnostic,
     EnvironmentKind, EnvironmentReference, EnvironmentRequirements, EnvironmentResource,
     MAX_ENVIRONMENT_CONTEXT_BYTES, MAX_ENVIRONMENT_CONTEXT_DEPTH, MAX_ENVIRONMENT_CONTEXT_FILES,
@@ -142,6 +146,9 @@ pub use vfs::{
     ReuseDecision, SyncPolicy, VfsError, VfsManifest, VfsObject, VfsOverlay, VfsPath,
     VfsSyncDecision,
 };
+#[cfg(windows)]
+pub use windows_container::SuspendedWindowsProcesses;
+pub use windows_security::secure_private_path;
 pub use workflow_manifest::{
     NormalizedWorkflowManifest, WorkflowManifestError, MAX_WORKFLOW_MANIFEST_BYTES,
     SUPPORTED_WORKFLOW_EDITION, SUPPORTED_WORKFLOW_SDK_VERSION, SUPPORTED_WORKFLOW_SERDE_VERSION,

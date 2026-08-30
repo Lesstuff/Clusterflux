@@ -1139,6 +1139,276 @@ fn debug_epoch_commands_are_polled_by_signed_active_task_nodes() {
 }
 
 #[test]
+fn departing_debug_participant_rolls_back_partial_freeze() {
+    let mut service = CoordinatorService::new(7);
+    service
+        .handle_request(CoordinatorRequest::CreateProject {
+            tenant: "tenant".to_owned(),
+            actor_user: "user".to_owned(),
+            project: "project".to_owned(),
+            name: "Demo".to_owned(),
+        })
+        .unwrap();
+    service
+        .handle_request(CoordinatorRequest::AttachNode {
+            tenant: "tenant".to_owned(),
+            project: "project".to_owned(),
+            node: "worker".to_owned(),
+            public_key: test_node_public_key("worker"),
+        })
+        .unwrap();
+    service
+        .handle_signed_node_request_auto(CoordinatorRequest::ReportNodeCapabilities {
+            tenant: "tenant".to_owned(),
+            project: "project".to_owned(),
+            node: "worker".to_owned(),
+            capabilities: linux_capabilities(),
+            cached_environment_digests: vec![],
+            dependency_cache_digests: vec![],
+            source_snapshots: vec![],
+            artifact_locations: vec![],
+            online: true,
+        })
+        .unwrap();
+    service
+        .handle_request(CoordinatorRequest::StartProcess {
+            launch_attempt: None,
+            tenant: "tenant".to_owned(),
+            project: "project".to_owned(),
+            actor_user: Some("user".to_owned()),
+            actor_agent: None,
+            agent_public_key_fingerprint: None,
+            agent_signature: None,
+            process: "process".to_owned(),
+            restart: false,
+        })
+        .unwrap();
+    for task in ["frozen-task", "departing-task"] {
+        service
+            .handle_authorized_test_task_launch(CoordinatorRequest::LaunchTask {
+                task_spec: test_task_spec(
+                    "tenant",
+                    "project",
+                    "process",
+                    task,
+                    7,
+                    [Capability::Command],
+                ),
+                tenant: "tenant".to_owned(),
+                project: "project".to_owned(),
+                actor_user: Some("user".to_owned()),
+                actor_agent: None,
+                agent_public_key_fingerprint: None,
+                agent_signature: None,
+                wait_for_node: false,
+                artifact_path: format!("/vfs/artifacts/{task}.txt"),
+                wasm_module_base64: test_wasm_module_base64(),
+            })
+            .unwrap();
+    }
+
+    let CoordinatorResponse::DebugEpoch { epoch: 1, .. } = service
+        .handle_request(CoordinatorRequest::CreateDebugEpoch {
+            tenant: "tenant".to_owned(),
+            project: "project".to_owned(),
+            actor_user: "user".to_owned(),
+            process: "process".to_owned(),
+            stopped_task: "frozen-task".to_owned(),
+            reason: "test partial freeze rollback".to_owned(),
+        })
+        .unwrap()
+    else {
+        panic!("expected debug epoch");
+    };
+    let CoordinatorResponse::DebugCommand {
+        epoch: Some(1),
+        command: Some(command),
+        ..
+    } = service
+        .handle_signed_node_request_auto(CoordinatorRequest::PollDebugCommand {
+            tenant: "tenant".to_owned(),
+            project: "project".to_owned(),
+            process: "process".to_owned(),
+            node: "worker".to_owned(),
+            task: "frozen-task".to_owned(),
+        })
+        .unwrap()
+    else {
+        panic!("expected freeze command");
+    };
+    assert_eq!(command, "freeze");
+    service
+        .handle_signed_node_request_auto(CoordinatorRequest::ReportDebugState {
+            tenant: "tenant".to_owned(),
+            project: "project".to_owned(),
+            process: "process".to_owned(),
+            node: "worker".to_owned(),
+            task: "frozen-task".to_owned(),
+            epoch: 1,
+            state: DebugAcknowledgementState::Frozen,
+            current_source_location: None,
+            stack_frames: vec![],
+            local_values: vec![],
+            task_args: vec![],
+            handles: vec![],
+            command_status: Some("frozen".to_owned()),
+            recent_output: vec![],
+            message: None,
+        })
+        .unwrap();
+
+    service
+        .handle_signed_node_request_auto(CoordinatorRequest::TaskCompleted {
+            tenant: "tenant".to_owned(),
+            project: "project".to_owned(),
+            process: "process".to_owned(),
+            node: "worker".to_owned(),
+            task: "departing-task".to_owned(),
+            terminal_state: Some(TaskTerminalState::Failed),
+            status_code: Some(1),
+            stdout_bytes: 0,
+            stderr_bytes: 0,
+            stdout_tail: String::new(),
+            stderr_tail: "node_offline".to_owned(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+            artifact_path: None,
+            artifact_digest: None,
+            artifact_size_bytes: None,
+            result: None,
+        })
+        .unwrap();
+
+    let CoordinatorResponse::DebugCommand {
+        epoch: Some(1),
+        command: Some(command),
+        ..
+    } = service
+        .handle_signed_node_request_auto(CoordinatorRequest::PollDebugCommand {
+            tenant: "tenant".to_owned(),
+            project: "project".to_owned(),
+            process: "process".to_owned(),
+            node: "worker".to_owned(),
+            task: "frozen-task".to_owned(),
+        })
+        .unwrap()
+    else {
+        panic!("expected rollback resume command");
+    };
+    assert_eq!(command, "resume");
+    service
+        .handle_signed_node_request_auto(CoordinatorRequest::ReportDebugState {
+            tenant: "tenant".to_owned(),
+            project: "project".to_owned(),
+            process: "process".to_owned(),
+            node: "worker".to_owned(),
+            task: "frozen-task".to_owned(),
+            epoch: 1,
+            state: DebugAcknowledgementState::Running,
+            current_source_location: None,
+            stack_frames: vec![],
+            local_values: vec![],
+            task_args: vec![],
+            handles: vec![],
+            command_status: Some("running".to_owned()),
+            recent_output: vec![],
+            message: None,
+        })
+        .unwrap();
+    let CoordinatorResponse::DebugEpochStatus {
+        fully_resumed,
+        expected_tasks,
+        ..
+    } = service
+        .handle_request(CoordinatorRequest::InspectDebugEpoch {
+            tenant: "tenant".to_owned(),
+            project: "project".to_owned(),
+            actor_user: "user".to_owned(),
+            process: "process".to_owned(),
+            epoch: 1,
+        })
+        .unwrap()
+    else {
+        panic!("expected resumed epoch status");
+    };
+    assert!(fully_resumed);
+    assert_eq!(expected_tasks.len(), 1);
+
+    service.set_debug_epoch_lease_timeout(std::time::Duration::from_millis(50));
+    let CoordinatorResponse::DebugEpoch { epoch: 2, .. } = service
+        .handle_request(CoordinatorRequest::CreateDebugEpoch {
+            tenant: "tenant".to_owned(),
+            project: "project".to_owned(),
+            actor_user: "user".to_owned(),
+            process: "process".to_owned(),
+            stopped_task: "frozen-task".to_owned(),
+            reason: "test abandoned debugger lease".to_owned(),
+        })
+        .unwrap()
+    else {
+        panic!("expected second debug epoch");
+    };
+    let CoordinatorResponse::DebugCommand {
+        epoch: Some(2),
+        command: Some(command),
+        ..
+    } = service
+        .handle_signed_node_request_auto(CoordinatorRequest::PollDebugCommand {
+            tenant: "tenant".to_owned(),
+            project: "project".to_owned(),
+            process: "process".to_owned(),
+            node: "worker".to_owned(),
+            task: "frozen-task".to_owned(),
+        })
+        .unwrap()
+    else {
+        panic!("expected second freeze command");
+    };
+    assert_eq!(command, "freeze");
+    service
+        .handle_signed_node_request_auto(CoordinatorRequest::ReportDebugState {
+            tenant: "tenant".to_owned(),
+            project: "project".to_owned(),
+            process: "process".to_owned(),
+            node: "worker".to_owned(),
+            task: "frozen-task".to_owned(),
+            epoch: 2,
+            state: DebugAcknowledgementState::Frozen,
+            current_source_location: None,
+            stack_frames: vec![],
+            local_values: vec![],
+            task_args: vec![],
+            handles: vec![],
+            command_status: Some("frozen".to_owned()),
+            recent_output: vec![],
+            message: None,
+        })
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(75));
+    assert!(matches!(
+        service.handle_request(CoordinatorRequest::Ping).unwrap(),
+        CoordinatorResponse::Pong { .. }
+    ));
+    let CoordinatorResponse::DebugCommand {
+        epoch: Some(2),
+        command: Some(command),
+        ..
+    } = service
+        .handle_signed_node_request_auto(CoordinatorRequest::PollDebugCommand {
+            tenant: "tenant".to_owned(),
+            project: "project".to_owned(),
+            process: "process".to_owned(),
+            node: "worker".to_owned(),
+            task: "frozen-task".to_owned(),
+        })
+        .unwrap()
+    else {
+        panic!("expired debugger lease must enqueue resume");
+    };
+    assert_eq!(command, "resume");
+}
+
+#[test]
 fn service_reports_task_restart_boundary_through_public_api() {
     let mut service = CoordinatorService::new(7);
     service

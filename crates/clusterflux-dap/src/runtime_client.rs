@@ -1183,6 +1183,35 @@ pub(crate) fn wait_for_debug_epoch_resumed(
     wait_for_debug_epoch_state(state, epoch, false)
 }
 
+pub(crate) fn renew_debug_epoch_lease(state: &AdapterState, epoch: u64) -> Result<()> {
+    let response = coordinator_debug_epoch_request(
+        state,
+        client_user_request(
+            state,
+            CoordinatorRequest::InspectDebugEpoch {
+                tenant: state.tenant.to_string(),
+                project: state.project_id.to_string(),
+                actor_user: state.actor_user.to_string(),
+                process: state.process.to_string(),
+                epoch,
+            },
+        ),
+    )?;
+    match response {
+        CoordinatorResponse::DebugEpochStatus {
+            epoch: returned_epoch,
+            command,
+            ..
+        } if returned_epoch == epoch && command == "freeze" => Ok(()),
+        CoordinatorResponse::DebugEpochStatus { command, .. } => Err(anyhow!(
+            "debug epoch {epoch} lease cannot be renewed while command `{command}` is active"
+        )),
+        _ => Err(anyhow!(
+            "coordinator returned an unexpected debug epoch lease response"
+        )),
+    }
+}
+
 pub(crate) fn debug_epoch_runtime_record(
     state: &AdapterState,
     status: &DebugEpochStatusRecord,

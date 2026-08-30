@@ -5,6 +5,7 @@ use clusterflux::serde::{Deserialize, Serialize};
 
 use crate::tasks::{
     ARCHIVE_NAME, CHECKSUMS_NAME, DEB_NAME, INSTALLER_NAME, RPM_NAME, ReleaseAssets, VSIX_NAME,
+    WINDOWS_ARCHIVE_NAME, WINDOWS_INSTALLER_NAME,
 };
 
 #[derive(Clone, Serialize, Deserialize, clusterflux::TaskArg)]
@@ -60,6 +61,10 @@ pub async fn publish(input: PublishInput) -> Result<PublicationResult> {
     let rpm = fs::materialize(&input.assets.rpm, RPM_NAME).await?;
     let vscode = fs::materialize(&input.assets.vscode, VSIX_NAME).await?;
     let installer = fs::materialize(&input.assets.installer, INSTALLER_NAME).await?;
+    let windows_archive =
+        fs::materialize(&input.assets.windows_archive, WINDOWS_ARCHIVE_NAME).await?;
+    let windows_installer =
+        fs::materialize(&input.assets.windows_installer, WINDOWS_INSTALLER_NAME).await?;
     let checksums = fs::materialize(&input.assets.checksums, CHECKSUMS_NAME).await?;
 
     let title = if input.assets.prerelease {
@@ -98,6 +103,14 @@ pub async fn publish(input: PublishInput) -> Result<PublicationResult> {
         installer.as_str().to_owned(),
         input.assets.installer.digest.clone(),
         input.assets.installer.size_bytes.to_string(),
+        WINDOWS_ARCHIVE_NAME.to_owned(),
+        windows_archive.as_str().to_owned(),
+        input.assets.windows_archive.digest.clone(),
+        input.assets.windows_archive.size_bytes.to_string(),
+        WINDOWS_INSTALLER_NAME.to_owned(),
+        windows_installer.as_str().to_owned(),
+        input.assets.windows_installer.digest.clone(),
+        input.assets.windows_installer.size_bytes.to_string(),
         CHECKSUMS_NAME.to_owned(),
         checksums.as_str().to_owned(),
         input.assets.checksums.digest.clone(),
@@ -118,6 +131,8 @@ pub async fn publish(input: PublishInput) -> Result<PublicationResult> {
     input.assets.rpm.release().await?;
     input.assets.vscode.release().await?;
     input.assets.installer.release().await?;
+    input.assets.windows_archive.release().await?;
+    input.assets.windows_installer.release().await?;
     input.assets.checksums.release().await?;
     Ok(result)
 }
@@ -189,6 +204,8 @@ fn parse_result(stdout: &str) -> Result<PublicationResult> {
             RPM_NAME.to_owned(),
             VSIX_NAME.to_owned(),
             INSTALLER_NAME.to_owned(),
+            WINDOWS_ARCHIVE_NAME.to_owned(),
+            WINDOWS_INSTALLER_NAME.to_owned(),
             CHECKSUMS_NAME.to_owned(),
         ],
         published_at,

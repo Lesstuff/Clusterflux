@@ -9,6 +9,7 @@ impl CoordinatorService {
             .validate_external_identifiers()
             .map_err(CoordinatorServiceError::Protocol)?;
         self.reconcile_expired_process_assignments()?;
+        self.reconcile_expired_debug_epoch_leases()?;
         self.pump_main_runtime_commands();
         let request_payload = serde_json::to_value(&request).map_err(|error| {
             CoordinatorServiceError::Protocol(format!(

@@ -2,7 +2,9 @@
 
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek};
+#[cfg(unix)]
 use std::os::fd::AsRawFd;
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -399,14 +401,20 @@ fn materialize_packaged_compiler_image(args: &mut Args) -> Result<(), String> {
         return Err("packaged compiler environment did not load its release identity".to_owned());
     };
     if identity.image_digest != package.image_digest
-        || identity.environment_digest != package.environment_digest
+        || identity
+            .environment_digest
+            .as_ref()
+            .is_some_and(|digest| digest != &package.environment_digest)
     {
         return Err(format!(
             "imported compiler image identity mismatch: expected {} / {}, got {} / {}",
             package.image_digest,
             package.environment_digest,
             identity.image_digest,
-            identity.environment_digest,
+            identity
+                .environment_digest
+                .as_ref()
+                .map_or("unlabeled", Digest::as_str),
         ));
     }
     eprintln!(
@@ -445,7 +453,7 @@ fn installed_system_compiler_package(
 
 struct CompilerImageIdentity {
     image_digest: Digest,
-    environment_digest: Digest,
+    environment_digest: Option<Digest>,
 }
 
 fn packaged_compiler_image_matches(
@@ -454,7 +462,10 @@ fn packaged_compiler_image_matches(
 ) -> bool {
     identity.is_some_and(|identity| {
         identity.image_digest == package.image_digest
-            && identity.environment_digest == package.environment_digest
+            && identity
+                .environment_digest
+                .as_ref()
+                .is_none_or(|digest| digest == &package.environment_digest)
     })
 }
 
@@ -500,19 +511,27 @@ fn compiler_image_identity(
     let image_digest = Digest::from_sha256_hex(image_id)
         .map_err(|error| format!("inspect packaged compiler image digest: {error}"))?;
     let environment = lines.next().unwrap_or_default().trim();
-    let environment_digest = Digest::from_sha256_hex(
-        environment
-            .strip_prefix("sha256:")
-            .ok_or("inspect packaged compiler environment digest omitted sha256 prefix")?,
-    )
-    .map_err(|error| format!("inspect packaged compiler environment digest: {error}"))?;
+    let environment_digest = if environment.is_empty() {
+        None
+    } else {
+        Some(
+            Digest::from_sha256_hex(
+                environment
+                    .strip_prefix("sha256:")
+                    .ok_or("inspect packaged compiler environment digest omitted sha256 prefix")?,
+            )
+            .map_err(|error| format!("inspect packaged compiler environment digest: {error}"))?,
+        )
+    };
     Ok(Some(CompilerImageIdentity {
         image_digest,
         environment_digest,
     }))
 }
 
-struct CompilerImageImportLock(fs::File);
+struct CompilerImageImportLock {
+    _file: fs::File,
+}
 
 impl CompilerImageImportLock {
     fn acquire(image_digest: &Digest) -> Result<Self, String> {
@@ -537,21 +556,25 @@ impl CompilerImageImportLock {
             .truncate(false)
             .open(directory.join(lock_name))
             .map_err(|error| format!("open compiler image import lock: {error}"))?;
-        let status = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-        if status != 0 {
-            return Err(format!(
-                "acquire compiler image import lock: {}",
-                std::io::Error::last_os_error()
-            ));
+        #[cfg(unix)]
+        {
+            let status = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+            if status != 0 {
+                return Err(format!(
+                    "acquire compiler image import lock: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
         }
-        Ok(Self(file))
+        Ok(Self { _file: file })
     }
 }
 
 impl Drop for CompilerImageImportLock {
     fn drop(&mut self) {
+        #[cfg(unix)]
         unsafe {
-            libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
+            libc::flock(self._file.as_raw_fd(), libc::LOCK_UN);
         }
     }
 }
@@ -720,6 +743,7 @@ pub(crate) fn compile_assignment(
         LocalSourceCheckout {
             host_path: source_dir.clone(),
             snapshot: request.source.tree_digest.clone(),
+            inventory: None,
         },
         output_dir.clone(),
         None,
@@ -838,6 +862,7 @@ impl ProcessRunner for BoundedSystemProcessRunner {
             .stderr(Stdio::from(stderr));
         // The command owns a process group so cancellation also terminates the
         // container monitor and rustc rather than leaving detached work.
+        #[cfg(unix)]
         unsafe {
             command.pre_exec(|| {
                 if libc::setpgid(0, 0) != 0 {
@@ -1006,6 +1031,7 @@ fn directory_bytes(root: &Path, stop_after: usize) -> Result<usize, String> {
 }
 
 fn terminate_compiler_group(child: &mut std::process::Child) {
+    #[cfg(unix)]
     unsafe {
         libc::killpg(child.id() as libc::pid_t, libc::SIGKILL);
     }
@@ -1053,7 +1079,7 @@ mod tests {
                 WorkflowSourceFile::new(
                     ".clusterflux/Cargo.toml",
                     0o100644,
-                    b"[package]\nname='compiler-test'\nversion='0.0.0'\nedition='2024'\npublish=false\n[lib]\npath='main.rs'\ncrate-type=['cdylib']\n[dependencies]\nclusterflux={package='clusterflux-sdk',version='=0.1.2'}\n[workspace]\nresolver='3'\n"
+                    b"[package]\nname='compiler-test'\nversion='0.0.0'\nedition='2024'\npublish=false\n[lib]\npath='main.rs'\ncrate-type=['cdylib']\n[dependencies]\nclusterflux={package='clusterflux-sdk',version='=0.2.0'}\n[workspace]\nresolver='3'\n"
                         .to_vec(),
                 )
                 .unwrap(),
@@ -1112,6 +1138,7 @@ mod tests {
                 LocalSourceCheckout {
                     host_path: PathBuf::from("/tmp/source"),
                     snapshot: request.source.tree_digest,
+                    inventory: None,
                 },
                 PathBuf::from("/tmp/output"),
                 None,
@@ -1190,26 +1217,34 @@ mod tests {
         assert!(!packaged_compiler_image_matches(
             Some(&CompilerImageIdentity {
                 image_digest: Digest::sha256("wrong"),
-                environment_digest: environment_digest.clone(),
+                environment_digest: Some(environment_digest.clone()),
             }),
             &package,
         ));
         assert!(!packaged_compiler_image_matches(
             Some(&CompilerImageIdentity {
                 image_digest: image_digest.clone(),
-                environment_digest: Digest::sha256("wrong-environment"),
+                environment_digest: Some(Digest::sha256("wrong-environment")),
+            }),
+            &package,
+        ));
+        assert!(packaged_compiler_image_matches(
+            Some(&CompilerImageIdentity {
+                image_digest: image_digest.clone(),
+                environment_digest: None,
             }),
             &package,
         ));
         assert!(packaged_compiler_image_matches(
             Some(&CompilerImageIdentity {
                 image_digest,
-                environment_digest,
+                environment_digest: Some(environment_digest),
             }),
             &package,
         ));
     }
 
+    #[cfg(unix)]
     #[test]
     fn compiler_image_import_lock_serializes_concurrent_startup() {
         let directory = tempfile::tempdir().unwrap();
@@ -1253,11 +1288,14 @@ mod tests {
 
     #[test]
     fn output_validator_rejects_symlinks_and_excess_files() {
-        let temp = tempfile::tempdir().unwrap();
-        std::os::unix::fs::symlink("missing", temp.path().join("link")).unwrap();
-        assert!(validate_output_directory(temp.path())
-            .unwrap_err()
-            .contains("symlink"));
+        #[cfg(unix)]
+        {
+            let temp = tempfile::tempdir().unwrap();
+            std::os::unix::fs::symlink("missing", temp.path().join("link")).unwrap();
+            assert!(validate_output_directory(temp.path())
+                .unwrap_err()
+                .contains("symlink"));
+        }
 
         let temp = tempfile::tempdir().unwrap();
         for index in 0..=MAX_COMPILER_OUTPUT_FILES {
@@ -1290,6 +1328,7 @@ mod tests {
             emit_ready: false,
             worker: true,
             capabilities: Vec::new(),
+            dangerous_allow_native_commands: false,
             no_workflow_compilation: false,
             system_tasks_only: false,
             system_compiler_image: Some(image),

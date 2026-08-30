@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use clusterflux_core::{
     Capability, CommandBackendKind, CommandInvocation, CommandPlan, Digest, EnvironmentKind,
@@ -8,6 +10,7 @@ use clusterflux_core::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as ShaDigest, Sha256};
 use thiserror::Error;
+use tokio_util::sync::CancellationToken;
 
 mod command_runner;
 mod windows_dev;
@@ -20,7 +23,9 @@ pub use command_runner::{
     authorize_node_command, CapturedCommandLogs, CommandOutput, LocalCommandExecutor,
     VirtualThreadCommand, DEFAULT_COMMAND_LOG_LIMIT_BYTES,
 };
-pub use windows_dev::{WindowsCommandDevBackend, WindowsSandboxStubBackend};
+pub use windows_dev::{
+    WindowsCommandDevBackend, WindowsContainerdNerdctlBackend, WindowsSandboxStubBackend,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MaterializedEnvironment {
@@ -55,7 +60,7 @@ pub trait CommandBackend {
 #[derive(Clone, Debug, Default)]
 pub struct LinuxRootlessPodmanBackend;
 
-fn podman_container_identity(process: &ProcessId, task: &TaskInstanceId) -> String {
+fn container_identity(process: &ProcessId, task: &TaskInstanceId) -> String {
     let mut digest = Sha256::new();
     digest.update(process.to_string().as_bytes());
     digest.update([0]);
@@ -69,10 +74,31 @@ fn podman_container_identity(process: &ProcessId, task: &TaskInstanceId) -> Stri
     format!("clusterflux-{suffix}")
 }
 
+fn container_attempt_identity(
+    process: &ProcessId,
+    task: &TaskInstanceId,
+    execution_attempt: &str,
+) -> String {
+    let logical_identity = container_identity(process, task);
+    let mut digest = Sha256::new();
+    digest.update(execution_attempt.as_bytes());
+    let suffix = digest
+        .finalize()
+        .iter()
+        .take(8)
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("{logical_identity}-{suffix}")
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PodmanCommand {
     pub program: String,
     pub args: Vec<String>,
+    /// Optional host-side working directory. Container runtime invocations do
+    /// not set this; the dangerous native-command override does.
+    #[serde(skip, default)]
+    pub working_directory: Option<PathBuf>,
     /// Environment inherited by the host-side process. Container variables are
     /// named on the Podman command line without placing their values there.
     #[serde(skip, default)]
@@ -98,6 +124,12 @@ impl ProcessRunner for StdProcessRunner {
         let output = std::process::Command::new(&command.program)
             .args(&command.args)
             .envs(&command.environment)
+            .current_dir(
+                command
+                    .working_directory
+                    .as_deref()
+                    .unwrap_or_else(|| std::path::Path::new(".")),
+            )
             .output()
             .map_err(|err| BackendError::Command(format!("{err:#}")))?;
 
@@ -123,12 +155,43 @@ pub struct PodmanEnvironmentMaterialization {
 pub struct LocalSourceCheckout {
     pub host_path: PathBuf,
     pub snapshot: Digest,
+    /// Validated immutable file plan required by backends that must stage a
+    /// checkout instead of mounting it directly (currently Windows runhcs).
+    pub inventory: Option<clusterflux_source::SourceSnapshotInventory>,
+}
+
+#[derive(Clone, Debug)]
+pub struct LocalTaskCancellation {
+    requested: CancellationToken,
+    aborted: Arc<AtomicBool>,
+}
+
+impl LocalTaskCancellation {
+    pub fn new(requested: CancellationToken, aborted: Arc<AtomicBool>) -> Self {
+        Self { requested, aborted }
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.requested.is_cancelled() || self.aborted.load(Ordering::Acquire)
+    }
+}
+
+impl Default for LocalTaskCancellation {
+    fn default() -> Self {
+        Self {
+            requested: CancellationToken::new(),
+            aborted: Arc::new(AtomicBool::new(false)),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
 pub struct LocalCheckoutTaskRequest<'a> {
     pub process: ProcessId,
     pub virtual_thread: TaskInstanceId,
+    /// Coordinator-issued assignment/attempt identity. Windows uses this to
+    /// keep a retry from colliding with an orphaned nerdctl name record.
+    pub execution_attempt: String,
     pub invocation: &'a CommandInvocation,
     pub checkout: LocalSourceCheckout,
     pub output_root: PathBuf,
@@ -137,6 +200,7 @@ pub struct LocalCheckoutTaskRequest<'a> {
     pub system_package_dir: Option<PathBuf>,
     /// Operator-selected ceiling for this node's project task containers.
     pub run_policy: ContainerRunPolicy,
+    pub cancellation: LocalTaskCancellation,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -152,6 +216,84 @@ pub enum SourceAccessMode {
         container_path: String,
         snapshot: Digest,
     },
+    HostNativeCheckout {
+        host_path: PathBuf,
+        snapshot: Digest,
+    },
+}
+
+pub fn execute_dangerous_native_checkout_task(
+    request: LocalCheckoutTaskRequest<'_>,
+    runner: &mut impl ProcessRunner,
+    overlay: &mut VfsOverlay,
+) -> Result<LinuxCommandTaskOutput, BackendError> {
+    let working_directory = native_checkout_working_directory(
+        &request.checkout.host_path,
+        &request.invocation.working_directory,
+    )?;
+    let lifecycle =
+        LinuxTaskLifecycle::new(request.process.clone(), request.virtual_thread.clone());
+    let plan = LinuxCommandRunPlan {
+        process: request.process,
+        virtual_thread: request.virtual_thread,
+        image_tag: "dangerous-host-native".to_owned(),
+        run: PodmanCommand {
+            program: request.invocation.program.clone(),
+            args: request.invocation.args.clone(),
+            working_directory: Some(working_directory),
+            environment: request.invocation.environment_variables.clone(),
+        },
+        source_access: SourceAccessMode::HostNativeCheckout {
+            host_path: request.checkout.host_path,
+            snapshot: request.checkout.snapshot,
+        },
+        output_root: request.output_root,
+        stage_stdout_as: request.stage_stdout_as,
+        uses_full_repo_tarball: false,
+        coordinator_routed_file_reads: false,
+        lifecycle,
+    };
+    LinuxRootlessPodmanBackend.execute_run_plan(plan, runner, overlay)
+}
+
+fn native_checkout_working_directory(
+    checkout: &std::path::Path,
+    requested: &str,
+) -> Result<PathBuf, BackendError> {
+    let checkout = checkout.canonicalize().map_err(|error| {
+        BackendError::Command(format!("resolve native command checkout: {error}"))
+    })?;
+    let normalized = requested.replace('\\', "/");
+    let suffix = if normalized == "/workspace" || normalized.eq_ignore_ascii_case("c:/workspace") {
+        ""
+    } else {
+        normalized
+            .strip_prefix("/workspace/")
+            .or_else(|| normalized.strip_prefix("C:/workspace/"))
+            .ok_or_else(|| {
+                BackendError::Command(
+                    "native command working directory must be under /workspace".to_owned(),
+                )
+            })?
+    };
+    let mut target = checkout.clone();
+    for component in suffix.split('/').filter(|component| !component.is_empty()) {
+        if matches!(component, "." | "..") {
+            return Err(BackendError::Command(
+                "native command working directory cannot traverse outside /workspace".to_owned(),
+            ));
+        }
+        target.push(component);
+    }
+    let target = target.canonicalize().map_err(|error| {
+        BackendError::Command(format!("resolve native command working directory: {error}"))
+    })?;
+    if !target.starts_with(&checkout) {
+        return Err(BackendError::Command(
+            "native command working directory escapes the checkout".to_owned(),
+        ));
+    }
+    Ok(target)
 }
 
 impl SourceAccessMode {
@@ -292,6 +434,7 @@ impl LinuxRootlessPodmanBackend {
             inspect: PodmanCommand {
                 program: "podman".to_owned(),
                 args: vec!["image".to_owned(), "exists".to_owned(), image_tag.clone()],
+                working_directory: None,
                 environment: BTreeMap::new(),
             },
             build: PodmanCommand {
@@ -305,6 +448,7 @@ impl LinuxRootlessPodmanBackend {
                     env.recipe_path.to_string_lossy().into_owned(),
                     env.context_path.to_string_lossy().into_owned(),
                 ],
+                working_directory: None,
                 environment: BTreeMap::new(),
             },
             rootless_user_podman: true,
@@ -392,7 +536,7 @@ impl LinuxRootlessPodmanBackend {
             snapshot: checkout.snapshot,
         };
         let lifecycle = LinuxTaskLifecycle::new(process.clone(), virtual_thread.clone());
-        let container_identity = podman_container_identity(&process, &virtual_thread);
+        let container_identity = container_identity(&process, &virtual_thread);
         let network = podman_network(&invocation.network);
         let mut args = vec![
             "run".to_owned(),
@@ -462,6 +606,7 @@ impl LinuxRootlessPodmanBackend {
             run: PodmanCommand {
                 program: "podman".to_owned(),
                 args,
+                working_directory: None,
                 environment: process_environment,
             },
             source_access,
@@ -611,32 +756,12 @@ impl LinuxRootlessPodmanBackend {
     }
 
     fn image_tag(&self, env: &clusterflux_core::EnvironmentResource) -> String {
-        let name = env
-            .name
-            .chars()
-            .map(|ch| {
-                if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
-                    ch
-                } else {
-                    '-'
-                }
-            })
-            .collect::<String>();
-        let digest = env
-            .digest
-            .as_str()
-            .chars()
-            .map(|ch| {
-                if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.' {
-                    ch
-                } else {
-                    '-'
-                }
-            })
-            .take(24)
-            .collect::<String>();
-        format!("clusterflux-env/{name}:{digest}")
+        environment_image_tag(env)
     }
+}
+
+fn environment_image_tag(env: &clusterflux_core::EnvironmentResource) -> String {
+    clusterflux_core::environment_image_tag(env)
 }
 
 fn mount_system_package(
@@ -761,6 +886,19 @@ mod tests {
         }
     }
 
+    fn windows_container_env() -> EnvironmentResource {
+        EnvironmentResource {
+            name: "windows".to_owned(),
+            kind: EnvironmentKind::Dockerfile,
+            recipe_path: PathBuf::from(r"C:\checkout\envs\windows\Dockerfile"),
+            context_path: PathBuf::from(r"C:\checkout\envs\windows"),
+            context_manifest: Vec::new(),
+            context_manifest_digest: Digest::from_parts([b"environment-context:v1"]),
+            digest: Digest::sha256("windows-recipe"),
+            requirements: EnvironmentRequirements::windows_container(),
+        }
+    }
+
     #[test]
     fn rootless_network_policy_uses_podmans_pasta_helper() {
         assert_eq!(
@@ -848,6 +986,7 @@ mod tests {
                 LocalSourceCheckout {
                     host_path: PathBuf::from("/work/example"),
                     snapshot: Digest::sha256("checkout"),
+                    inventory: None,
                 },
                 PathBuf::from("/work/output"),
                 Some(VfsPath::new("/vfs/artifacts/app").unwrap()),
@@ -917,6 +1056,9 @@ mod tests {
             SourceAccessMode::NodePreparedSnapshot { .. } => {
                 panic!("local Linux build should use the node-local checkout")
             }
+            SourceAccessMode::HostNativeCheckout { .. } => {
+                panic!("local Linux container build should not use host-native execution")
+            }
         }
     }
 
@@ -941,10 +1083,12 @@ mod tests {
                 LocalCheckoutTaskRequest {
                     process: ProcessId::from("vp"),
                     virtual_thread: TaskInstanceId::from("compile-linux"),
+                    execution_attempt: "linux-test-attempt".to_owned(),
                     invocation: &invocation,
                     checkout: LocalSourceCheckout {
                         host_path: PathBuf::from("/work/demo"),
                         snapshot: Digest::sha256("checkout"),
+                        inventory: None,
                     },
                     output_root: PathBuf::from("/work/output"),
                     stage_stdout_as: Some(VfsPath::new("/vfs/artifacts/app.tar.zst").unwrap()),
@@ -957,6 +1101,7 @@ mod tests {
                         pids_limit: 1_024,
                         ..ContainerRunPolicy::default()
                     },
+                    cancellation: LocalTaskCancellation::default(),
                 },
                 &mut runner,
                 &mut overlay,
@@ -1082,6 +1227,7 @@ mod tests {
                 LocalSourceCheckout {
                     host_path: PathBuf::from("/work/demo"),
                     snapshot: Digest::sha256("checkout"),
+                    inventory: None,
                 },
                 PathBuf::from("/work/output"),
                 Some(VfsPath::new("/vfs/artifacts/app.txt").unwrap()),
@@ -1169,6 +1315,197 @@ mod tests {
 
         assert!(plan.user_attached_development_execution);
         assert_eq!(plan.required_capability, Capability::WindowsCommandDev);
+    }
+
+    #[test]
+    fn windows_backend_uses_nerdctl_without_native_execution() {
+        let invocation = CommandInvocation {
+            program: "cmd.exe".to_owned(),
+            args: vec!["/C".to_owned(), "build.cmd".to_owned()],
+            working_directory: "/workspace/crates/node".to_owned(),
+            environment_variables: BTreeMap::from([(
+                "BUILD_CHANNEL".to_owned(),
+                "test-value-not-in-argv".to_owned(),
+            )]),
+            timeout_ms: 60_000,
+            network: clusterflux_core::CommandNetworkPolicy::Disabled,
+            env: Some(windows_container_env()),
+        };
+        let backend = WindowsContainerdNerdctlBackend;
+        let command_plan = backend.plan(&invocation).unwrap();
+        assert_eq!(
+            command_plan.backend,
+            CommandBackendKind::WindowsContainerdNerdctl
+        );
+        assert_eq!(
+            command_plan.required_capability,
+            Capability::ContainerdNerdctl
+        );
+        assert!(!command_plan.user_attached_development_execution);
+
+        let materialization = backend
+            .materialize_environment(invocation.env.as_ref().unwrap())
+            .unwrap();
+        assert_eq!(materialization.inspect.program, "nerdctl");
+        assert_eq!(materialization.build.program, "nerdctl");
+        assert!(!materialization.rootless_user_podman);
+
+        let run = backend
+            .plan_local_checkout_run_with_policy(
+                ProcessId::from("windows-process"),
+                TaskInstanceId::from("windows-task"),
+                "windows-attempt-one",
+                &invocation,
+                LocalSourceCheckout {
+                    host_path: PathBuf::from(r"C:\checkout"),
+                    snapshot: Digest::sha256("source"),
+                    inventory: None,
+                },
+                PathBuf::from(r"C:\node-output"),
+                None,
+                &ContainerRunPolicy {
+                    cpu_count: 4,
+                    memory_bytes: 8 * 1024 * 1024 * 1024,
+                    pids_limit: 512,
+                    ..ContainerRunPolicy::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(run.run.program, "nerdctl");
+        assert!(run
+            .run
+            .args
+            .windows(2)
+            .any(|args| args == ["--isolation", "process"]));
+        assert!(run.run.args.windows(2).any(|args| args == ["--cpus", "4"]));
+        assert!(run
+            .run
+            .args
+            .windows(2)
+            .any(|args| args == ["--memory", "8589934592"]));
+        assert!(!run.run.args.contains(&"--pids-limit".to_owned()));
+        assert!(!run.run.args.contains(&"--mount".to_owned()));
+        assert!(!run.run.args.contains(&"--read-only".to_owned()));
+        assert!(!run
+            .run
+            .args
+            .iter()
+            .any(|arg| arg.starts_with("CARGO_TARGET_DIR=")));
+        assert_eq!(
+            run.run
+                .args
+                .windows(2)
+                .find(|args| args[0] == "--volume")
+                .map(|args| args[1].as_str()),
+            Some(r"C:\checkout:C:\workspace:ro")
+        );
+        assert!(run
+            .run
+            .args
+            .windows(2)
+            .any(|args| args == ["--network", "none"]));
+        let container_name = run
+            .run
+            .args
+            .windows(2)
+            .find(|args| args[0] == "--name")
+            .map(|args| args[1].clone())
+            .unwrap();
+        assert!(container_name.starts_with("clusterflux-"));
+        assert!(run.run.args.windows(2).any(|args| {
+            args[0] == "--label" && args[1].starts_with("clusterflux.task-identity=clusterflux-")
+        }));
+        let retry = backend
+            .plan_local_checkout_run_with_policy(
+                ProcessId::from("windows-process"),
+                TaskInstanceId::from("windows-task"),
+                "windows-attempt-two",
+                &invocation,
+                LocalSourceCheckout {
+                    host_path: PathBuf::from(r"C:\checkout"),
+                    snapshot: Digest::sha256("source"),
+                    inventory: None,
+                },
+                PathBuf::from(r"C:\node-output"),
+                None,
+                &ContainerRunPolicy::default(),
+            )
+            .unwrap();
+        let retry_name = retry
+            .run
+            .args
+            .windows(2)
+            .find(|args| args[0] == "--name")
+            .map(|args| args[1].clone())
+            .unwrap();
+        assert_ne!(container_name, retry_name);
+        assert!(run
+            .run
+            .args
+            .contains(&r"C:\workspace\crates\node".to_owned()));
+        assert!(run.run.args.contains(&"BUILD_CHANNEL".to_owned()));
+        assert!(!run.run.args.contains(&"test-value-not-in-argv".to_owned()));
+        assert_eq!(
+            run.run.environment.get("BUILD_CHANNEL").map(String::as_str),
+            Some("test-value-not-in-argv")
+        );
+    }
+
+    #[test]
+    fn windows_backend_removes_labeled_previous_attempt_before_running() {
+        let invocation = CommandInvocation {
+            program: "cmd.exe".to_owned(),
+            args: vec!["/C".to_owned(), "build.cmd".to_owned()],
+            working_directory: "/workspace".to_owned(),
+            environment_variables: BTreeMap::new(),
+            timeout_ms: 60_000,
+            network: clusterflux_core::CommandNetworkPolicy::Disabled,
+            env: Some(windows_container_env()),
+        };
+        let previous = "0123456789abcdef0123456789abcdef";
+        let mut runner = RecordingRunner::with_outputs([
+            success_output([]),
+            success_output(format!("{previous}\r\n")),
+            success_output([]),
+            success_output([]),
+        ]);
+        let task = TaskInstanceId::from("windows-task");
+        let mut overlay = VfsOverlay::new(task.clone(), NodeId::from("windows-node"));
+
+        let output = WindowsContainerdNerdctlBackend
+            .execute_local_checkout_task(
+                LocalCheckoutTaskRequest {
+                    process: ProcessId::from("windows-process"),
+                    virtual_thread: task,
+                    execution_attempt: "windows-attempt".to_owned(),
+                    invocation: &invocation,
+                    checkout: LocalSourceCheckout {
+                        host_path: PathBuf::from(r"C:\checkout"),
+                        snapshot: Digest::sha256("source"),
+                        inventory: None,
+                    },
+                    output_root: PathBuf::from(r"C:\node-output"),
+                    stage_stdout_as: None,
+                    system_package_dir: None,
+                    run_policy: ContainerRunPolicy::default(),
+                    cancellation: LocalTaskCancellation::default(),
+                },
+                &mut runner,
+                &mut overlay,
+            )
+            .unwrap();
+
+        assert_eq!(output.status_code, Some(0));
+        assert_eq!(runner.commands[1].args[0], "ps");
+        assert!(runner.commands[1]
+            .args
+            .iter()
+            .any(|arg| arg.starts_with("label=clusterflux.task-identity=clusterflux-")));
+        assert_eq!(
+            runner.commands[2].args,
+            ["rm", "--force", previous].map(str::to_owned)
+        );
+        assert_eq!(runner.commands[3].args[0], "run");
     }
 
     #[test]

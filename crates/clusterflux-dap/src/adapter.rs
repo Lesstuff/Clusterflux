@@ -20,10 +20,10 @@ use crate::demo_backend::{
 };
 use crate::runtime_client::{
     attach_services_runtime, create_debug_epoch, debug_epoch_runtime_record,
-    observe_services_runtime, relaunch_services_main_runtime, restart_task, resume_debug_epoch,
-    run_live_services_runtime, run_local_services_runtime, set_services_debug_breakpoints,
-    wait_for_debug_epoch_frozen, wait_for_debug_epoch_resumed, LocalRuntimeSession,
-    RuntimeContinuationOutcome,
+    observe_services_runtime, relaunch_services_main_runtime, renew_debug_epoch_lease,
+    restart_task, resume_debug_epoch, run_live_services_runtime, run_local_services_runtime,
+    set_services_debug_breakpoints, wait_for_debug_epoch_frozen, wait_for_debug_epoch_resumed,
+    LocalRuntimeSession, RuntimeContinuationOutcome,
 };
 use crate::variables::variables_response;
 use crate::virtual_model::{AdapterState, DapSessionMode, RuntimeBackend, VirtualThread};
@@ -45,6 +45,7 @@ enum AdapterEvent {
     },
     PauseFinished {
         generation: u64,
+        stopped_thread: i64,
         result: std::result::Result<AdapterState, String>,
     },
     ResumeFinished {
@@ -57,6 +58,10 @@ enum AdapterEvent {
         generation: u64,
         revision: u64,
         result: std::result::Result<(), String>,
+    },
+    DebugLeaseDiagnostic {
+        generation: u64,
+        message: String,
     },
 }
 
@@ -75,6 +80,7 @@ pub(crate) fn run_adapter() -> Result<()> {
     let mut runtime_starting = false;
     let mut runtime_generation = 0_u64;
     let mut observation_cancel = None;
+    let mut debug_lease_cancel = None;
     let (event_tx, event_rx) = mpsc::channel();
     spawn_input_reader(event_tx.clone());
 
@@ -83,10 +89,19 @@ pub(crate) fn run_adapter() -> Result<()> {
             AdapterEvent::Request(request) => request,
             AdapterEvent::InputClosed => {
                 cancel_observation(&mut observation_cancel);
+                cancel_debug_lease(&mut debug_lease_cancel);
+                let _ = resume_coordinator_epoch(&mut state);
                 break;
             }
             AdapterEvent::InputFailed(message) => {
                 cancel_observation(&mut observation_cancel);
+                cancel_debug_lease(&mut debug_lease_cancel);
+                let cleanup = resume_coordinator_epoch(&mut state).err();
+                if let Some(cleanup) = cleanup {
+                    return Err(anyhow::anyhow!(
+                        "{message}; debug epoch cleanup failed: {cleanup:#}"
+                    ));
+                }
                 return Err(anyhow::anyhow!(message));
             }
             AdapterEvent::LaunchFinished { generation, result } => {
@@ -179,14 +194,25 @@ pub(crate) fn run_adapter() -> Result<()> {
                 }
                 continue;
             }
-            AdapterEvent::PauseFinished { generation, result } => {
+            AdapterEvent::PauseFinished {
+                generation,
+                stopped_thread,
+                result,
+            } => {
                 if generation != runtime_generation {
                     continue;
                 }
                 match result {
                     Ok(paused_state) => {
                         state = paused_state;
-                        let stopped_thread = default_thread_id(&state);
+                        if state.debug_all_threads_stopped {
+                            spawn_debug_lease_heartbeat(
+                                &event_tx,
+                                &state,
+                                generation,
+                                &mut debug_lease_cancel,
+                            );
+                        }
                         writer.event(
                             "stopped",
                             json!({
@@ -276,6 +302,15 @@ pub(crate) fn run_adapter() -> Result<()> {
                             writer.output("stderr", format!("{message}\n"))?;
                         }
                     }
+                }
+                continue;
+            }
+            AdapterEvent::DebugLeaseDiagnostic {
+                generation,
+                message,
+            } => {
+                if generation == runtime_generation {
+                    writer.output("stderr", format!("{message}\n"))?;
                 }
                 continue;
             }
@@ -722,11 +757,12 @@ pub(crate) fn run_adapter() -> Result<()> {
                         continue;
                     }
                     cancel_observation(&mut observation_cancel);
+                    cancel_debug_lease(&mut debug_lease_cancel);
                     runtime_generation = runtime_generation.saturating_add(1);
                     let generation = runtime_generation;
                     let mut pause_state = state.clone();
                     let pause_tx = event_tx.clone();
-                    let stopped_thread = default_thread_id(&pause_state);
+                    let stopped_thread = request_thread(&request, &state).id;
                     writer.response(&request, true, json!({}))?;
                     thread::spawn(move || {
                         let result = freeze_all(&mut pause_state, stopped_thread, None)
@@ -742,11 +778,15 @@ pub(crate) fn run_adapter() -> Result<()> {
                                 })
                             })
                             .map(|()| pause_state);
-                        let _ = pause_tx.send(AdapterEvent::PauseFinished { generation, result });
+                        let _ = pause_tx.send(AdapterEvent::PauseFinished {
+                            generation,
+                            stopped_thread,
+                            result,
+                        });
                     });
                     continue;
                 }
-                let stopped_thread = default_thread_id(&state);
+                let stopped_thread = request_thread(&request, &state).id;
                 match freeze_all(
                     &mut state,
                     stopped_thread,
@@ -794,6 +834,7 @@ pub(crate) fn run_adapter() -> Result<()> {
                         continue;
                     }
                     cancel_observation(&mut observation_cancel);
+                    cancel_debug_lease(&mut debug_lease_cancel);
                     runtime_generation = runtime_generation.saturating_add(1);
                     let generation = runtime_generation;
                     let mut resume_state = state.clone();
@@ -1013,6 +1054,13 @@ pub(crate) fn run_adapter() -> Result<()> {
             }
             "disconnect" | "terminate" => {
                 cancel_observation(&mut observation_cancel);
+                cancel_debug_lease(&mut debug_lease_cancel);
+                if let Err(error) = resume_coordinator_epoch(&mut state) {
+                    writer.output(
+                        "stderr",
+                        format!("debug epoch cleanup during disconnect failed: {error:#}\n"),
+                    )?;
+                }
                 writer.response(&request, true, json!({}))?;
                 writer.event("terminated", json!({}))?;
                 break;
@@ -1053,6 +1101,49 @@ fn cancel_observation(observation_cancel: &mut Option<Arc<AtomicBool>>) {
     if let Some(cancelled) = observation_cancel.take() {
         cancelled.store(true, Ordering::Release);
     }
+}
+
+fn cancel_debug_lease(debug_lease_cancel: &mut Option<Arc<AtomicBool>>) {
+    if let Some(cancelled) = debug_lease_cancel.take() {
+        cancelled.store(true, Ordering::Release);
+    }
+}
+
+fn spawn_debug_lease_heartbeat(
+    event_tx: &mpsc::Sender<AdapterEvent>,
+    state: &AdapterState,
+    generation: u64,
+    debug_lease_cancel: &mut Option<Arc<AtomicBool>>,
+) {
+    cancel_debug_lease(debug_lease_cancel);
+    let Some(epoch) = state.coordinator_debug_epoch else {
+        return;
+    };
+    let cancelled = Arc::new(AtomicBool::new(false));
+    *debug_lease_cancel = Some(cancelled.clone());
+    let heartbeat_state = state.clone();
+    let heartbeat_tx = event_tx.clone();
+    thread::spawn(move || {
+        while !cancelled.load(Ordering::Acquire) {
+            for _ in 0..100 {
+                if cancelled.load(Ordering::Acquire) {
+                    return;
+                }
+                thread::sleep(std::time::Duration::from_millis(100));
+            }
+            if cancelled.load(Ordering::Acquire) {
+                return;
+            }
+            if let Err(error) = renew_debug_epoch_lease(&heartbeat_state, epoch) {
+                let _ = heartbeat_tx.send(AdapterEvent::DebugLeaseDiagnostic {
+                    generation,
+                    message: format!(
+                        "debug epoch {epoch} lease renewal failed; the coordinator will resume participants automatically if renewal does not recover: {error:#}"
+                    ),
+                });
+            }
+        }
+    });
 }
 
 fn spawn_runtime_observer(
@@ -1341,6 +1432,27 @@ fn record_coordinator_debug_epoch(
             status.expected_tasks
         ));
     }
+    if !status.fully_frozen {
+        let partial_status = state.command_status.clone();
+        let failure = if status.failure_messages.is_empty() {
+            "one or more participants did not confirm all-stop".to_owned()
+        } else {
+            status.failure_messages.join("; ")
+        };
+        let rollback = resume_coordinator_epoch(state);
+        state.debug_all_threads_stopped = false;
+        state.command_status = match rollback {
+            Ok(()) => format!(
+                "{partial_status}; partial all-stop was rolled back safely ({failure})"
+            ),
+            Err(error) => format!(
+                "{partial_status}; partial all-stop rollback was requested but did not fully acknowledge ({failure}; {error:#})"
+            ),
+        };
+        if let Some(thread) = state.threads.get_mut(&stopped_thread) {
+            thread.recent_output.push(state.command_status.clone());
+        }
+    }
     Ok(())
 }
 
@@ -1348,7 +1460,10 @@ fn debug_epoch_stop_description(state: &AdapterState, fully_frozen: &str) -> Str
     if state.debug_all_threads_stopped {
         fully_frozen.to_owned()
     } else {
-        "Clusterflux Debug Epoch is partially frozen; missing or failed participants remain running or unavailable, so inspected state may be inconsistent".to_owned()
+        format!(
+            "Clusterflux Debug Epoch did not reach all-stop and was rolled back: {}",
+            state.command_status
+        )
     }
 }
 

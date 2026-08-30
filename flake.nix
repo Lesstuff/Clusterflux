@@ -40,7 +40,7 @@
           publicPackages = import ./packages.nix { inherit pkgs self; };
           compilerToolchain = builtins.fromJSON (builtins.readFile ./compiler-toolchain.json);
           checkedRust = pkgs.rust-bin.stable.${compilerToolchain.rust_release}.default.override {
-            targets = [ compilerToolchain.wasm_target ];
+            targets = [ compilerToolchain.wasm_target "x86_64-pc-windows-msvc" ];
           };
           checkedRustPlatform = pkgs.makeRustPlatform { cargo = checkedRust; rustc = checkedRust; };
         in
@@ -61,7 +61,7 @@
           '';
           public-workspace = checkedRustPlatform.buildRustPackage {
             pname = "clusterflux-public-workspace-check";
-            version = "0.1.2";
+            version = "0.2.0";
             src = self;
             cargoLock.lockFile = ./Cargo.lock;
             nativeBuildInputs = [ pkgs.git ];
@@ -101,7 +101,7 @@
           compilerToolchain = builtins.fromJSON (builtins.readFile ./compiler-toolchain.json);
           checkedRust = pkgs.rust-bin.stable.${compilerToolchain.rust_release}.default.override {
             extensions = [ "clippy" "rustfmt" ];
-            targets = [ compilerToolchain.wasm_target ];
+            targets = [ compilerToolchain.wasm_target "x86_64-pc-windows-msvc" ];
           };
         in
         {
@@ -110,8 +110,12 @@
               checkedRust
               (assert cargo-deny.version == "0.18.9"; cargo-deny)
               (assert cargo-machete.version == "0.9.1"; cargo-machete)
+              cargo-xwin
               git
               jq
+              llvmPackages.clang
+              llvmPackages.lld
+              llvmPackages.llvm
               nodejs_22
               podman
               zip

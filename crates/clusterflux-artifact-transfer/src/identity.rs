@@ -94,6 +94,7 @@ impl PersistentIrohIdentity {
         let parent = path.parent().ok_or(IdentityError::MissingParent)?;
         let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
         set_private_file_permissions(temporary.as_file())?;
+        clusterflux_core::secure_private_path(temporary.path(), false)?;
         temporary.write_all(&serde_json::to_vec_pretty(&stored)?)?;
         temporary.as_file().sync_all()?;
         match temporary.persist_noclobber(path) {
@@ -155,6 +156,7 @@ fn ensure_private_directory(path: &Path) -> Result<(), IdentityError> {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
     }
+    clusterflux_core::secure_private_path(path, true)?;
     Ok(())
 }
 
@@ -164,6 +166,7 @@ fn set_private_file_permissions(file: &fs::File) -> Result<(), IdentityError> {
         use std::os::unix::fs::PermissionsExt;
         file.set_permissions(fs::Permissions::from_mode(0o600))?;
     }
+    let _ = file;
     Ok(())
 }
 
@@ -178,12 +181,21 @@ fn ensure_private_file_permissions(
             return Err(IdentityError::InsecurePermissions(path.to_path_buf()));
         }
     }
-    let _ = path;
+    clusterflux_core::secure_private_path(path, false)?;
+    let _ = metadata;
     Ok(())
 }
 
+#[cfg(unix)]
 fn sync_directory(path: &Path) -> Result<(), IdentityError> {
     fs::File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> Result<(), IdentityError> {
+    // The identity file itself is flushed before its atomic rename. Windows
+    // does not support opening a directory through std::fs::File for fsync.
     Ok(())
 }
 

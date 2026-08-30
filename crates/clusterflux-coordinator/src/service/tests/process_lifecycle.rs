@@ -133,7 +133,16 @@ fn unacknowledged_process_offer_expires_and_is_safely_redelivered_with_a_new_fen
         &test_node_private_key("node-a"),
         Some(stale_authority),
     );
-    assert!(service.handle_request(stale_ack).is_err());
+    let stale_error = service
+        .handle_request(stale_ack)
+        .expect_err("an expired offer must not be acknowledged");
+    assert!(matches!(
+        stale_error,
+        CoordinatorServiceError::StaleNodeAssignmentAcknowledgement
+    ));
+    let api_error = stale_error.api_error("stale-ack");
+    assert_eq!(api_error.code, clusterflux_core::ApiErrorCode::Conflict);
+    assert!(api_error.retryable);
 
     let fresh_authority = assignment_authority(&redelivered);
     service

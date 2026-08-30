@@ -3,11 +3,15 @@ use std::collections::BTreeSet;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+#[cfg(not(target_arch = "wasm32"))]
+use wait_timeout::ChildExt;
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum Capability {
     Command,
     Containers,
     RootlessPodman,
+    ContainerdNerdctl,
     SourceFilesystem,
     SourceGit,
     HostFilesystem,
@@ -107,7 +111,6 @@ impl NodeCapabilities {
     pub fn detect_current() -> Self {
         let os = Os::current();
         let mut capabilities = BTreeSet::from([
-            Capability::Command,
             Capability::SourceFilesystem,
             Capability::SourceGit,
             Capability::VfsArtifacts,
@@ -118,25 +121,35 @@ impl NodeCapabilities {
         match os {
             Os::Linux => {
                 if rootless_podman_available() {
+                    capabilities.insert(Capability::Command);
                     capabilities.insert(Capability::Containers);
                     capabilities.insert(Capability::RootlessPodman);
                     environment_backends.insert(EnvironmentBackend::Container);
                 }
             }
             Os::Windows => {
-                capabilities.insert(Capability::WindowsCommandDev);
-                environment_backends.insert(EnvironmentBackend::WindowsCommandDev);
+                if containerd_nerdctl_available() {
+                    capabilities.insert(Capability::Command);
+                    capabilities.insert(Capability::Containers);
+                    capabilities.insert(Capability::ContainerdNerdctl);
+                    environment_backends.insert(EnvironmentBackend::Container);
+                }
             }
             Os::Macos | Os::Other(_) => {}
         }
 
+        let work_policy = if matches!(os, Os::Windows | Os::Macos) {
+            NodeWorkPolicy::ExecutionOnly
+        } else {
+            NodeWorkPolicy::Normal
+        };
         Self {
             os,
             arch: std::env::consts::ARCH.to_owned(),
             capabilities,
             environment_backends,
             source_providers: BTreeSet::from(["filesystem".to_owned(), "git".to_owned()]),
-            work_policy: NodeWorkPolicy::Normal,
+            work_policy,
             system_bundles: Vec::new(),
         }
     }
@@ -198,6 +211,208 @@ impl NodeCapabilities {
         }
         Ok(())
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContainerdNerdctlReadiness {
+    pub ready: bool,
+    pub failure_layer: Option<String>,
+    pub message: String,
+    pub namespace: String,
+    pub server_version: Option<String>,
+    pub os_type: Option<String>,
+    pub storage_driver: Option<String>,
+    pub storage_plugins: Vec<String>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn probe_containerd_nerdctl_readiness() -> ContainerdNerdctlReadiness {
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+
+    const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+    const MAX_OUTPUT_BYTES: usize = 64 * 1024;
+
+    let mut child = match Command::new("nerdctl")
+        .args(["info", "--format", "{{json .}}"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            return failed_nerdctl_readiness(
+                "nerdctl_client",
+                format!("start bounded nerdctl server probe: {error}"),
+            )
+        }
+    };
+    match child.wait_timeout(PROBE_TIMEOUT) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return failed_nerdctl_readiness(
+                "containerd_connectivity",
+                "nerdctl info did not complete within 5 seconds".to_owned(),
+            );
+        }
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return failed_nerdctl_readiness(
+                "containerd_connectivity",
+                format!("wait for nerdctl info: {error}"),
+            );
+        }
+    }
+    let output = match child.wait_with_output() {
+        Ok(output) => output,
+        Err(error) => {
+            return failed_nerdctl_readiness(
+                "containerd_connectivity",
+                format!("collect nerdctl info output: {error}"),
+            )
+        }
+    };
+    if output.stdout.len() > MAX_OUTPUT_BYTES || output.stderr.len() > MAX_OUTPUT_BYTES {
+        return failed_nerdctl_readiness(
+            "nerdctl_protocol",
+            "nerdctl info output exceeded the 64 KiB bound".to_owned(),
+        );
+    }
+    if !output.status.success() {
+        return failed_nerdctl_readiness(
+            "containerd_connectivity",
+            format!(
+                "nerdctl info failed with status {:?}: {}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        );
+    }
+    parse_containerd_nerdctl_info(&output.stdout)
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn probe_containerd_nerdctl_readiness() -> ContainerdNerdctlReadiness {
+    failed_nerdctl_readiness(
+        "platform",
+        "containerd readiness cannot be probed from wasm".to_owned(),
+    )
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn parse_containerd_nerdctl_info(stdout: &[u8]) -> ContainerdNerdctlReadiness {
+    let value: serde_json::Value = match serde_json::from_slice(stdout) {
+        Ok(value) => value,
+        Err(error) => {
+            return failed_nerdctl_readiness(
+                "nerdctl_protocol",
+                format!("parse nerdctl info JSON: {error}"),
+            )
+        }
+    };
+    let object = match value.as_object() {
+        Some(object) => object,
+        None => {
+            return failed_nerdctl_readiness(
+                "nerdctl_protocol",
+                "nerdctl info did not return a JSON object".to_owned(),
+            )
+        }
+    };
+    let server_version = object
+        .get("ServerVersion")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned);
+    let os_type = object
+        .get("OSType")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    let storage_driver = object
+        .get("Driver")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    let storage_plugins = value
+        .pointer("/Plugins/Storage")
+        .and_then(serde_json::Value::as_array)
+        .map(|plugins| {
+            plugins
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if server_version.is_none() {
+        return failed_nerdctl_readiness(
+            "containerd_connectivity",
+            "nerdctl info omitted the containerd server version".to_owned(),
+        );
+    }
+    if os_type.as_deref() != Some("windows") || storage_driver.as_deref() != Some("windows") {
+        return ContainerdNerdctlReadiness {
+            ready: false,
+            failure_layer: Some("windows_runtime".to_owned()),
+            message: "containerd did not report the Windows runtime and storage driver".to_owned(),
+            namespace: "default".to_owned(),
+            server_version,
+            os_type,
+            storage_driver,
+            storage_plugins,
+        };
+    }
+    if !storage_plugins
+        .iter()
+        .any(|plugin| matches!(plugin.as_str(), "windows" | "cimfs" | "windows-lcow"))
+    {
+        return ContainerdNerdctlReadiness {
+            ready: false,
+            failure_layer: Some("windows_snapshotter".to_owned()),
+            message: "containerd reported no usable Windows storage plugin".to_owned(),
+            namespace: "default".to_owned(),
+            server_version,
+            os_type,
+            storage_driver,
+            storage_plugins,
+        };
+    }
+    ContainerdNerdctlReadiness {
+        ready: true,
+        failure_layer: None,
+        message: "containerd default namespace and Windows runtime are reachable".to_owned(),
+        namespace: "default".to_owned(),
+        server_version,
+        os_type,
+        storage_driver,
+        storage_plugins,
+    }
+}
+
+fn failed_nerdctl_readiness(layer: &str, message: String) -> ContainerdNerdctlReadiness {
+    ContainerdNerdctlReadiness {
+        ready: false,
+        failure_layer: Some(layer.to_owned()),
+        message,
+        namespace: "default".to_owned(),
+        server_version: None,
+        os_type: None,
+        storage_driver: None,
+        storage_plugins: Vec::new(),
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn containerd_nerdctl_available() -> bool {
+    probe_containerd_nerdctl_readiness().ready
+}
+
+#[cfg(target_arch = "wasm32")]
+fn containerd_nerdctl_available() -> bool {
+    false
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -284,5 +499,27 @@ mod tests {
                 "../checkout".to_owned()
             ))
         );
+    }
+
+    #[test]
+    fn nerdctl_readiness_requires_a_windows_server_and_storage_plugin() {
+        let ready = parse_containerd_nerdctl_info(
+            br#"{"Driver":"windows","Plugins":{"Storage":["cimfs","windows"]},"OSType":"windows","ServerVersion":"v2.3.4"}"#,
+        );
+        assert!(ready.ready);
+        assert_eq!(ready.failure_layer, None);
+
+        let client_only = parse_containerd_nerdctl_info(br#"{"OSType":"windows"}"#);
+        assert!(!client_only.ready);
+        assert_eq!(
+            client_only.failure_layer.as_deref(),
+            Some("containerd_connectivity")
+        );
+
+        let linux = parse_containerd_nerdctl_info(
+            br#"{"Driver":"overlayfs","Plugins":{"Storage":["overlayfs"]},"OSType":"linux","ServerVersion":"v2"}"#,
+        );
+        assert!(!linux.ready);
+        assert_eq!(linux.failure_layer.as_deref(), Some("windows_runtime"));
     }
 }

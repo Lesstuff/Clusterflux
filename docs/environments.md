@@ -33,6 +33,16 @@ is rejected rather than substituted.
 On Linux, container-backed environments use rootless Podman. Clusterflux does
 not enable privileged containers by default.
 
+On Windows, container-backed environments use containerd through `nerdctl` and
+require process isolation. The operator prebuilds the exact declared image with
+`clusterflux-environment-setup`; tasks never replace a missing image with a
+native command. See [Windows nodes](windows-nodes.md).
+
+Environment setup reads definitions from the clean, committed current Git
+revision so line-ending conversion cannot change their identity. Commit changes
+under `envs/` before setup, then restart the node so it advertises the refreshed
+cache inventory.
+
 A task may use a bind-mounted local checkout for speed. That source path is
 non-hermetic. Choose a source snapshot when you need a reproducible input
 identity independent of the current working tree.

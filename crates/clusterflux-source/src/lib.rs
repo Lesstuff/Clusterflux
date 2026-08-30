@@ -225,6 +225,131 @@ impl MaterializedRepositoryRevision {
     }
 }
 
+/// Canonical checkout of the current local Git revision for deployment-time
+/// environment materialization. The selected project's environment definitions
+/// must be clean so the image identity cannot silently diverge from `HEAD`.
+#[derive(Debug)]
+pub struct MaterializedLocalGitRevision {
+    _directory: tempfile::TempDir,
+    project_root: PathBuf,
+}
+
+impl MaterializedLocalGitRevision {
+    pub fn root(&self) -> &Path {
+        &self.project_root
+    }
+}
+
+pub fn materialize_clean_local_git_revision(
+    project_root: &Path,
+) -> Result<Option<MaterializedLocalGitRevision>, String> {
+    let project_root = resolve_project_root(project_root)?;
+    let Some(repository_root) = git_repository_root(&project_root)? else {
+        return Ok(None);
+    };
+    let project_prefix = project_root
+        .strip_prefix(&repository_root)
+        .map_err(|_| "project root is outside its discovered Git repository".to_owned())?;
+    let environment_path = if project_prefix.as_os_str().is_empty() {
+        "envs".to_owned()
+    } else {
+        format!("{}/envs", slash_path(project_prefix)?)
+    };
+    let status = run_git(
+        &repository_root,
+        [
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--",
+            environment_path.as_str(),
+        ],
+        DEFAULT_GIT_TIMEOUT,
+        MAX_GIT_DIAGNOSTIC_BYTES,
+    )?;
+    if !status.is_empty() {
+        let changed = status
+            .split(|byte| *byte == 0)
+            .filter(|entry| !entry.is_empty())
+            .take(8)
+            .map(|entry| String::from_utf8_lossy(entry).into_owned())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!(
+            "environment definitions must be committed before immutable image setup: {changed}"
+        ));
+    }
+    let commit = run_git(
+        &repository_root,
+        ["rev-parse", "--verify", "HEAD"],
+        DEFAULT_GIT_TIMEOUT,
+        128,
+    )?;
+    let commit = std::str::from_utf8(&commit)
+        .map_err(|_| "Git returned a non-UTF-8 commit identity".to_owned())?
+        .trim()
+        .to_owned();
+    validate_commit_sha(&commit)?;
+    let repository_text = repository_root
+        .to_str()
+        .ok_or_else(|| "Git repository path is not UTF-8".to_owned())?;
+    #[cfg(windows)]
+    let repository_text = {
+        let slash_path = repository_text.replace('\\', "/");
+        if let Some(unc) = slash_path.strip_prefix("//?/UNC/") {
+            format!("//{unc}")
+        } else {
+            slash_path
+                .strip_prefix("//?/")
+                .unwrap_or(&slash_path)
+                .to_owned()
+        }
+    };
+    #[cfg(not(windows))]
+    let repository_text = repository_text.to_owned();
+    let directory = tempfile::Builder::new()
+        .prefix("clusterflux-local-revision-")
+        .tempdir()
+        .map_err(|error| format!("create local revision checkout: {error}"))?;
+    run_git_cancellable_bounded(
+        directory.path(),
+        [
+            "clone",
+            "--quiet",
+            "--no-checkout",
+            "--no-hardlinks",
+            repository_text.as_str(),
+            "checkout",
+        ],
+        DEFAULT_GIT_TIMEOUT,
+        MAX_GIT_DIAGNOSTIC_BYTES,
+        MAX_REVISION_CHECKOUT_DISK_BYTES,
+        &|| false,
+    )?;
+    let checkout = directory.path().join("checkout");
+    run_git(
+        &checkout,
+        ["config", "core.autocrlf", "false"],
+        DEFAULT_GIT_TIMEOUT,
+        MAX_GIT_DIAGNOSTIC_BYTES,
+    )?;
+    run_git(
+        &checkout,
+        ["checkout", "--quiet", "--detach", commit.as_str()],
+        DEFAULT_GIT_TIMEOUT,
+        MAX_GIT_DIAGNOSTIC_BYTES,
+    )?;
+    let materialized_project_root = checkout.join(project_prefix);
+    if !materialized_project_root.is_dir() {
+        return Err("materialized local Git revision omits the selected project".to_owned());
+    }
+    Ok(Some(MaterializedLocalGitRevision {
+        _directory: directory,
+        project_root: materialized_project_root,
+    }))
+}
+
 pub fn materialize_exact_repository_revision(
     revision: &RepositoryRevision,
 ) -> Result<MaterializedRepositoryRevision, String> {
@@ -252,6 +377,14 @@ pub fn materialize_exact_repository_revision_cancellable(
     run_git_cancellable_bounded(
         directory.path(),
         ["init", "--quiet"],
+        DEFAULT_GIT_TIMEOUT,
+        MAX_GIT_DIAGNOSTIC_BYTES,
+        MAX_REVISION_CHECKOUT_DISK_BYTES,
+        &cancelled,
+    )?;
+    run_git_cancellable_bounded(
+        directory.path(),
+        ["config", "core.autocrlf", "false"],
         DEFAULT_GIT_TIMEOUT,
         MAX_GIT_DIAGNOSTIC_BYTES,
         MAX_REVISION_CHECKOUT_DISK_BYTES,
@@ -337,13 +470,21 @@ pub fn resolve_public_git_ref(repository_url: &str, git_ref: &str) -> Result<Str
         return Err("Git ref must identify a branch or tag".to_owned());
     }
     let peeled = format!("{git_ref}^{{}}");
+    let workspace = isolated_git_metadata_workspace()?;
     let output = run_git(
-        Path::new("."),
+        workspace.path(),
         ["ls-remote", repository_url, git_ref, peeled.as_str()],
         DEFAULT_GIT_TIMEOUT,
         4 * 1024,
     )?;
     parse_resolved_git_ref(&output, git_ref)
+}
+
+fn isolated_git_metadata_workspace() -> Result<tempfile::TempDir, String> {
+    tempfile::Builder::new()
+        .prefix("clusterflux-git-metadata-")
+        .tempdir()
+        .map_err(|error| format!("create Git metadata temporary directory: {error}"))
 }
 
 fn parse_resolved_git_ref(output: &[u8], git_ref: &str) -> Result<String, String> {
@@ -937,6 +1078,68 @@ pub struct SourceSnapshotInventory {
     pub file_count: usize,
     pub total_bytes: u64,
     pub source_mode: String,
+    pub entries: Vec<SourceSnapshotEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceSnapshotEntryKind {
+    File,
+    Symlink,
+    Deleted,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceSnapshotEntry {
+    pub path: String,
+    pub kind: SourceSnapshotEntryKind,
+    pub executable: bool,
+    pub digest: Digest,
+    pub size_bytes: u64,
+}
+
+impl SourceSnapshotInventory {
+    /// Revalidates the immutable materialization plan before a backend uses it.
+    /// Snapshot creation already applies these checks; this second boundary keeps
+    /// filesystem backends from trusting a malformed or stale in-memory plan.
+    pub fn validate_materialization_plan(&self) -> Result<(), String> {
+        if self.file_count != self.entries.len() {
+            return Err("source snapshot file count does not match its entries".to_owned());
+        }
+        if self.file_count > MAX_SNAPSHOT_FILES {
+            return Err(format!(
+                "source snapshot has {} files; limit is {MAX_SNAPSHOT_FILES}",
+                self.file_count
+            ));
+        }
+        let mut previous = None;
+        let mut total_bytes = 0_u64;
+        for entry in &self.entries {
+            validate_relative_source_path(&entry.path)?;
+            if previous.is_some_and(|previous: &str| previous >= entry.path.as_str()) {
+                return Err("source snapshot entries are not sorted and unique".to_owned());
+            }
+            previous = Some(entry.path.as_str());
+            if entry.size_bytes > MAX_SNAPSHOT_FILE_BYTES {
+                return Err(format!(
+                    "source file `{}` is {} bytes; per-file limit is {MAX_SNAPSHOT_FILE_BYTES}",
+                    entry.path, entry.size_bytes
+                ));
+            }
+            total_bytes = total_bytes
+                .checked_add(entry.size_bytes)
+                .ok_or_else(|| "source snapshot byte accounting overflowed".to_owned())?;
+        }
+        if total_bytes != self.total_bytes {
+            return Err("source snapshot total bytes do not match its entries".to_owned());
+        }
+        if total_bytes > MAX_SNAPSHOT_TOTAL_BYTES {
+            return Err(format!(
+                "source snapshot is {total_bytes} bytes; limit is {MAX_SNAPSHOT_TOTAL_BYTES}"
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1017,6 +1220,7 @@ fn snapshot_git_project(
     } else {
         slash_path(project_prefix)?
     };
+    let index_executable = git_index_executable_modes(repository_root, &project_prefix)?;
     let mut command = git_command(repository_root);
     command
         .args([
@@ -1050,7 +1254,17 @@ fn snapshot_git_project(
         let relative = absolute
             .strip_prefix(project_root)
             .map_err(|_| "Git enumerated source outside the selected project".to_owned())?;
-        files.push(snapshot_file(&absolute, &slash_path(relative)?, cancelled)?);
+        files.push(snapshot_file(
+            &absolute,
+            &slash_path(relative)?,
+            Some(
+                index_executable
+                    .get(repository_relative)
+                    .copied()
+                    .unwrap_or(false),
+            ),
+            cancelled,
+        )?);
     }
     files.sort_by(|left, right| left.path.cmp(&right.path));
     files.dedup_by(|left, right| left.path == right.path);
@@ -1082,6 +1296,52 @@ fn snapshot_git_project(
     )
 }
 
+fn git_index_executable_modes(
+    repository_root: &Path,
+    project_prefix: &str,
+) -> Result<BTreeMap<String, bool>, String> {
+    let output = git_command(repository_root)
+        .args(["ls-files", "-z", "--stage", "--"])
+        .arg(project_prefix)
+        .output()
+        .map_err(|error| format!("enumerate Git index modes: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "enumerate Git index modes failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let mut modes = BTreeMap::new();
+    for raw in output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|raw| !raw.is_empty())
+    {
+        let record =
+            std::str::from_utf8(raw).map_err(|_| "Git index path is not UTF-8".to_owned())?;
+        let (metadata, path) = record
+            .split_once('\t')
+            .ok_or_else(|| "Git returned an invalid index-mode record".to_owned())?;
+        let mut metadata = metadata.split_ascii_whitespace();
+        let mode = metadata
+            .next()
+            .ok_or_else(|| "Git index-mode record omitted its mode".to_owned())?;
+        let _object = metadata
+            .next()
+            .ok_or_else(|| "Git index-mode record omitted its object".to_owned())?;
+        let stage = metadata
+            .next()
+            .ok_or_else(|| "Git index-mode record omitted its stage".to_owned())?;
+        if stage != "0" {
+            return Err(format!(
+                "source snapshot cannot identify unmerged Git index path `{path}`"
+            ));
+        }
+        modes.insert(path.to_owned(), mode == "100755");
+    }
+    Ok(modes)
+}
+
 fn snapshot_filesystem_project(
     project_root: &Path,
     cancelled: &dyn Fn() -> bool,
@@ -1101,8 +1361,20 @@ fn snapshot_filesystem_project(
         let relative = absolute
             .strip_prefix(project_root)
             .map_err(|_| "filesystem source escaped its project root".to_owned())?;
-        files.push(snapshot_file(&absolute, &slash_path(relative)?, cancelled)?);
+        files.push(snapshot_file(
+            &absolute,
+            &slash_path(relative)?,
+            None,
+            cancelled,
+        )?);
     }
+    // `PathBuf` ordering is component-based, while the materialization plan
+    // is ordered by its portable slash-separated path. Those orders differ
+    // for pairs such as `src/run.rs` and `src/run/local.rs`. Sort only after
+    // normalization so a non-Git checkout produces the same valid inventory
+    // on Linux, Windows, and macOS.
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+    files.dedup_by(|left, right| left.path == right.path);
     validate_snapshot_bounds(&files)?;
     finish_snapshot(
         "filesystem",
@@ -1130,18 +1402,37 @@ fn finish_snapshot<const N: usize>(
         parts.push(file.digest.as_str().as_bytes().to_vec());
         parts.push(file.size_bytes.to_string().into_bytes());
     }
-    Ok(SourceSnapshotInventory {
+    let entries = files
+        .into_iter()
+        .map(|file| SourceSnapshotEntry {
+            path: file.path,
+            kind: match file.kind {
+                "file" => SourceSnapshotEntryKind::File,
+                "symlink" => SourceSnapshotEntryKind::Symlink,
+                "deleted" => SourceSnapshotEntryKind::Deleted,
+                _ => unreachable!("snapshot_file constructs only known entry kinds"),
+            },
+            executable: file.executable,
+            digest: file.digest,
+            size_bytes: file.size_bytes,
+        })
+        .collect::<Vec<_>>();
+    let inventory = SourceSnapshotInventory {
         digest: Digest::from_parts(parts),
         provider: provider.to_owned(),
-        file_count: files.len(),
+        file_count: entries.len(),
         total_bytes,
         source_mode: source_mode.to_owned(),
-    })
+        entries,
+    };
+    inventory.validate_materialization_plan()?;
+    Ok(inventory)
 }
 
 fn snapshot_file(
     absolute: &Path,
     relative: &str,
+    executable_override: Option<bool>,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<SnapshotFile, String> {
     check_snapshot_cancelled(cancelled)?;
@@ -1209,6 +1500,7 @@ fn snapshot_file(
     };
     #[cfg(not(unix))]
     let executable = false;
+    let executable = executable_override.unwrap_or(executable);
     Ok(SnapshotFile {
         path: relative.to_owned(),
         kind: "file",
@@ -1342,6 +1634,16 @@ fn validate_relative_source_path(path: &str) -> Result<(), String> {
     {
         return Err("source snapshot path must be a safe relative path".to_owned());
     }
+    if path.len() > MAX_ENVIRONMENT_CONTEXT_PATH_BYTES {
+        return Err(format!(
+            "source snapshot path exceeds {MAX_ENVIRONMENT_CONTEXT_PATH_BYTES} bytes"
+        ));
+    }
+    if path.split('/').count() > MAX_ENVIRONMENT_CONTEXT_DEPTH {
+        return Err(format!(
+            "source snapshot path exceeds depth limit of {MAX_ENVIRONMENT_CONTEXT_DEPTH}"
+        ));
+    }
     Ok(())
 }
 
@@ -1438,6 +1740,84 @@ mod tests {
         assert_eq!(untracked.file_count, 2);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn git_snapshot_executable_identity_comes_from_the_portable_index_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let script = temp.path().join("script.sh");
+        fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        initialize_repository(temp.path(), "executable source");
+        let executable = snapshot_project(temp.path()).unwrap();
+
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o644)).unwrap();
+        let windows_like_worktree = snapshot_project(temp.path()).unwrap();
+        assert_eq!(executable.digest, windows_like_worktree.digest);
+
+        git(temp.path(), &["update-index", "--chmod=-x", "script.sh"]);
+        let non_executable_index = snapshot_project(temp.path()).unwrap();
+        assert_ne!(windows_like_worktree.digest, non_executable_index.digest);
+
+        let untracked = temp.path().join("untracked.sh");
+        fs::write(&untracked, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&untracked, fs::Permissions::from_mode(0o755)).unwrap();
+        let untracked_executable = snapshot_project(temp.path()).unwrap();
+        fs::set_permissions(&untracked, fs::Permissions::from_mode(0o644)).unwrap();
+        let untracked_non_executable = snapshot_project(temp.path()).unwrap();
+        assert_eq!(untracked_executable.digest, untracked_non_executable.digest);
+    }
+
+    #[test]
+    fn deployment_checkout_uses_canonical_git_bytes_and_rejects_dirty_environments() {
+        let repository = tempfile::tempdir().unwrap();
+        let environment = repository.path().join("envs/windows");
+        fs::create_dir_all(&environment).unwrap();
+        fs::write(
+            environment.join("Containerfile"),
+            "FROM mcr.microsoft.com/windows/nanoserver:ltsc2025\nRUN echo ready\n",
+        )
+        .unwrap();
+        fs::write(
+            environment.join("environment.toml"),
+            "version = 1\nname = \"windows\"\nos = \"windows\"\n",
+        )
+        .unwrap();
+        initialize_repository(repository.path(), "canonical environment");
+        let canonical = discover_environments(repository.path()).unwrap()[0]
+            .digest
+            .clone();
+
+        git(repository.path(), &["config", "core.autocrlf", "true"]);
+        fs::remove_file(environment.join("Containerfile")).unwrap();
+        fs::remove_file(environment.join("environment.toml")).unwrap();
+        git(repository.path(), &["checkout", "--", "envs/windows"]);
+        assert!(fs::read(environment.join("Containerfile"))
+            .unwrap()
+            .windows(2)
+            .any(|bytes| bytes == b"\r\n"));
+
+        let materialized = materialize_clean_local_git_revision(repository.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            discover_environments(materialized.root()).unwrap()[0].digest,
+            canonical
+        );
+        assert!(
+            !fs::read(materialized.root().join("envs/windows/Containerfile"))
+                .unwrap()
+                .windows(2)
+                .any(|bytes| bytes == b"\r\n")
+        );
+
+        fs::write(environment.join("Containerfile"), "FROM scratch\n").unwrap();
+        assert!(materialize_clean_local_git_revision(repository.path())
+            .unwrap_err()
+            .contains("must be committed"));
+    }
+
     #[test]
     fn different_repositories_at_the_same_path_are_not_identified_by_path() {
         let temp = tempfile::tempdir().unwrap();
@@ -1532,8 +1912,66 @@ mod tests {
         assert!(error.contains("per-file limit"));
     }
 
+    #[test]
+    fn materialization_plan_revalidates_shape_order_paths_and_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("src")).unwrap();
+        fs::write(temp.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+        fs::write(temp.path().join("src/lib.rs"), "pub fn ready() {}\n").unwrap();
+        let inventory =
+            snapshot_project_with_provider(temp.path(), &SourceProviderKind::Filesystem).unwrap();
+        inventory.validate_materialization_plan().unwrap();
+
+        let mut wrong_count = inventory.clone();
+        wrong_count.file_count += 1;
+        assert!(wrong_count
+            .validate_materialization_plan()
+            .unwrap_err()
+            .contains("file count"));
+
+        let mut unsorted = inventory.clone();
+        unsorted.entries.reverse();
+        assert!(unsorted
+            .validate_materialization_plan()
+            .unwrap_err()
+            .contains("sorted and unique"));
+
+        let mut escaping = inventory.clone();
+        escaping.entries[0].path = "../escape".to_owned();
+        assert!(escaping.validate_materialization_plan().is_err());
+
+        let mut wrong_bytes = inventory;
+        wrong_bytes.total_bytes += 1;
+        assert!(wrong_bytes
+            .validate_materialization_plan()
+            .unwrap_err()
+            .contains("total bytes"));
+    }
+
+    #[test]
+    fn filesystem_snapshot_sorts_portable_paths_after_normalization() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(temp.path().join("src/run")).unwrap();
+        fs::write(temp.path().join("src/run.rs"), "pub mod local_services;\n").unwrap();
+        fs::write(
+            temp.path().join("src/run/local_services.rs"),
+            "pub fn ready() {}\n",
+        )
+        .unwrap();
+
+        let inventory =
+            snapshot_project_with_provider(temp.path(), &SourceProviderKind::Filesystem).unwrap();
+        let paths = inventory
+            .entries
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(paths, ["src/run.rs", "src/run/local_services.rs"]);
+        inventory.validate_materialization_plan().unwrap();
+    }
+
     fn write_workflow_manifest(root: &Path) -> usize {
-        let manifest = b"[package]\nname='source-test'\nversion='0.0.0'\nedition='2024'\npublish=false\n[lib]\npath='main.rs'\ncrate-type=['cdylib']\n[dependencies]\nclusterflux={package='clusterflux-sdk',version='=0.1.2'}\n[workspace]\nresolver='3'\n";
+        let manifest = b"[package]\nname='source-test'\nversion='0.0.0'\nedition='2024'\npublish=false\n[lib]\npath='main.rs'\ncrate-type=['cdylib']\n[dependencies]\nclusterflux={package='clusterflux-sdk',version='=0.2.0'}\n[workspace]\nresolver='3'\n";
         fs::write(root.join(".clusterflux/Cargo.toml"), manifest).unwrap();
         manifest.len()
     }
@@ -1765,5 +2203,15 @@ mod tests {
         assert!(parse_resolved_git_ref(b"", "refs/heads/main")
             .unwrap_err()
             .contains("not found"));
+    }
+
+    #[test]
+    fn public_ref_resolution_uses_an_empty_isolated_workspace() {
+        let workspace = isolated_git_metadata_workspace().unwrap();
+        assert_ne!(
+            workspace.path().canonicalize().unwrap(),
+            Path::new(".").canonicalize().unwrap()
+        );
+        assert_eq!(workspace_size(workspace.path(), 1).unwrap(), 0);
     }
 }

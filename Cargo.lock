@@ -447,7 +447,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "clusterflux-artifact-transfer"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "clusterflux-core",
  "futures-util",
@@ -464,7 +464,7 @@ dependencies = [
 
 [[package]]
 name = "clusterflux-cli"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -479,11 +479,12 @@ dependencies = [
  "tempfile",
  "time",
  "url",
+ "wait-timeout",
 ]
 
 [[package]]
 name = "clusterflux-client"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "clusterflux-coordinator",
  "clusterflux-core",
@@ -498,7 +499,7 @@ dependencies = [
 
 [[package]]
 name = "clusterflux-coordinator"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "aes-gcm",
  "base64",
@@ -518,7 +519,7 @@ dependencies = [
 
 [[package]]
 name = "clusterflux-core"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "base64",
  "ed25519-dalek 2.2.0",
@@ -531,12 +532,14 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "toml",
+ "wait-timeout",
  "wasmparser 0.245.1",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "clusterflux-dap"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -550,7 +553,7 @@ dependencies = [
 
 [[package]]
 name = "clusterflux-macros"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "hex",
  "proc-macro2",
@@ -562,7 +565,7 @@ dependencies = [
 
 [[package]]
 name = "clusterflux-node"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "base64",
  "clap",
@@ -583,12 +586,13 @@ dependencies = [
  "wait-timeout",
  "wasmparser 0.245.1",
  "wat",
+ "windows-sys 0.61.2",
  "zeroize",
 ]
 
 [[package]]
 name = "clusterflux-protocol"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "clusterflux-core",
  "serde",
@@ -598,7 +602,7 @@ dependencies = [
 
 [[package]]
 name = "clusterflux-relay"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "clap",
  "iroh",
@@ -612,7 +616,7 @@ dependencies = [
 
 [[package]]
 name = "clusterflux-sdk"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "clusterflux-core",
  "clusterflux-macros",
@@ -623,7 +627,7 @@ dependencies = [
 
 [[package]]
 name = "clusterflux-source"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "clusterflux-core",
  "libc",
@@ -635,7 +639,7 @@ dependencies = [
 
 [[package]]
 name = "clusterflux-system-compiler-driver"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "clusterflux-core",
  "serde_json",
@@ -643,7 +647,7 @@ dependencies = [
 
 [[package]]
 name = "clusterflux-wasm-runtime"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "clusterflux-core",
  "serde",

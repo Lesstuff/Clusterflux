@@ -404,6 +404,7 @@ impl CoordinatorService {
         let process_key = process_control_key(&event.tenant, &event.project, &event.process);
         let process_was_aborted = self.process_registry.is_aborted(&process_key);
         event.placement = self.task_registry.finish_task(&task_key);
+        self.reconcile_departed_debug_participant(&task_key)?;
         if let (Some(path), Some(digest)) = (&event.artifact_path, artifact_digest) {
             self.flush_artifact_metadata(ArtifactFlush {
                 id: artifact_id_from_path(path).map_err(|error| {

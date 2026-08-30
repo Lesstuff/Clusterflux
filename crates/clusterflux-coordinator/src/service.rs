@@ -253,6 +253,8 @@ pub enum CoordinatorServiceError {
     InvalidTaskLogTail(String),
     #[error("terminal node operation conflicts with its previously committed payload")]
     TerminalOperationConflict,
+    #[error("node assignment acknowledgement is stale or outside node scope")]
+    StaleNodeAssignmentAcknowledgement,
     #[error("node identity quota exceeded ({current} of {maximum})")]
     NodeIdentityQuota { current: u64, maximum: u64 },
     #[error("project quota exceeded ({current} of {maximum})")]
@@ -297,6 +299,9 @@ impl CoordinatorServiceError {
             }
             Self::TerminalOperationConflict => {
                 (ApiErrorCode::Conflict, ApiErrorCategory::State, false)
+            }
+            Self::StaleNodeAssignmentAcknowledgement => {
+                (ApiErrorCode::Conflict, ApiErrorCategory::State, true)
             }
             Self::Download(DownloadError::NotFound) => {
                 (ApiErrorCode::NotFound, ApiErrorCategory::State, false)
@@ -404,6 +409,7 @@ pub struct CoordinatorService {
     node_registry: NodeRegistry,
     node_stale_after_seconds: u64,
     debug_freeze_timeout: std::time::Duration,
+    debug_epoch_lease_timeout: std::time::Duration,
     process_registry: ProcessRegistry,
     task_registry: TaskRegistry,
     recent_log_store: RecentLogStore,
@@ -533,6 +539,10 @@ impl CoordinatorService {
 
     pub fn set_debug_freeze_timeout(&mut self, timeout: std::time::Duration) {
         self.debug_freeze_timeout = timeout.max(std::time::Duration::from_millis(1));
+    }
+
+    pub fn set_debug_epoch_lease_timeout(&mut self, timeout: std::time::Duration) {
+        self.debug_epoch_lease_timeout = timeout.max(std::time::Duration::from_millis(1));
     }
 
     pub fn configure_coordinator_main_runtime(
@@ -722,7 +732,11 @@ impl CoordinatorService {
             store,
             node_registry: NodeRegistry::default(),
             node_stale_after_seconds: startup.node_stale_after_seconds,
-            debug_freeze_timeout: std::time::Duration::from_secs(5),
+            // The node has its own bounded 5-second local freeze operation. The
+            // coordinator deadline also has to include command polling and the
+            // signed acknowledgement round trip.
+            debug_freeze_timeout: std::time::Duration::from_secs(15),
+            debug_epoch_lease_timeout: std::time::Duration::from_secs(30),
             process_registry: ProcessRegistry::default(),
             task_registry: TaskRegistry::default(),
             recent_log_store: RecentLogStore::default(),

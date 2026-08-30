@@ -905,7 +905,7 @@ mod tests {
                 WorkflowSourceFile::new(
                     ".clusterflux/Cargo.toml",
                     0o100644,
-                    b"[package]\nname='test'\nversion='0.0.0'\nedition='2024'\npublish=false\n[lib]\npath='main.rs'\ncrate-type=['cdylib']\n[dependencies]\nclusterflux={package='clusterflux-sdk',version='=0.1.2'}\n[workspace]\nresolver='3'\n"
+                    b"[package]\nname='test'\nversion='0.0.0'\nedition='2024'\npublish=false\n[lib]\npath='main.rs'\ncrate-type=['cdylib']\n[dependencies]\nclusterflux={package='clusterflux-sdk',version='=0.2.0'}\n[workspace]\nresolver='3'\n"
                         .to_vec(),
                 )
                 .unwrap(),

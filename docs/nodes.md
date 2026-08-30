@@ -56,6 +56,15 @@ The worker reports detected command, container, source, VFS, environment, OS,
 and architecture capabilities. Use `clusterflux node attach --cap <capability>`
 only when detection needs an explicit override.
 
+Windows nodes use process-isolated Windows containers through containerd and
+`nerdctl`. They are execution-only: keep a compiler-capable Linux node online
+to compile the platform-neutral workflow. See [Windows nodes](windows-nodes.md)
+for setup and the platform-specific isolation limits.
+
+Native workflow commands are disabled on every supported platform. The node
+only enables them when its operator starts it with the conspicuous
+`--dangerous-allow-native-commands` override.
+
 Project task containers default to 2 CPUs, 2 GiB of memory, and 256 processes
 or threads. Operators can raise those ceilings with `--task-cpus`,
 `--task-memory-gib`, and `--task-pids-limit`; large Rust release builds commonly

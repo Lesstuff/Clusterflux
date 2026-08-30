@@ -247,11 +247,17 @@ async fn debug_acknowledgement(
                 Some((DebugAcknowledgementState::Frozen, None))
             } else {
                 context.debug_control.request_resume(epoch);
+                let command_status = context
+                    .command_status
+                    .lock()
+                    .ok()
+                    .and_then(|status| status.clone())
+                    .unwrap_or_else(|| "node command status unavailable".to_owned());
                 Some((
                     DebugAcknowledgementState::Failed,
                     Some(format!(
-                        "node execution did not reach a freezeable Wasm safepoint or verified native/Podman boundary within {} ms",
-                        freeze_timeout.as_millis()
+                        "node execution did not reach a freezeable Wasm safepoint or verified command boundary within {} ms; last command status: {command_status}",
+                        freeze_timeout.as_millis(),
                     )),
                 ))
             }

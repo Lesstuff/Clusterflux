@@ -8,7 +8,7 @@ let
   checkedRustPlatform = pkgs.makeRustPlatform { cargo = checkedRust; rustc = checkedRust; };
   compiler-artifacts = checkedRustPlatform.buildRustPackage {
     pname = "clusterflux-system-compiler-artifacts";
-    version = "0.1.2";
+    version = "0.2.0";
     src = self;
     cargoLock.lockFile = ./Cargo.lock;
     nativeBuildInputs = [ pkgs.lld ];
@@ -93,7 +93,7 @@ let
 
   clusterflux-tools = checkedRustPlatform.buildRustPackage {
     pname = "clusterflux-tools";
-    version = "0.1.2";
+    version = "0.2.0";
     src = self;
     cargoLock.lockFile = ./Cargo.lock;
     doCheck = false;

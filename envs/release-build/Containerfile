@@ -11,7 +11,7 @@ ENV PATH=/usr/local/cargo/bin:${PATH} \
     CARGO_HOME=/usr/local/cargo
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      build-essential ca-certificates curl git gzip libssl-dev pkg-config rpm tar \
+      build-essential ca-certificates curl git gzip jq libssl-dev pkg-config rpm tar unzip \
  && curl -fsSL "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_amd64.deb" \
       -o /tmp/nfpm.deb \
  && echo "${NFPM_DEB_SHA256}  /tmp/nfpm.deb" | sha256sum -c - \
@@ -21,5 +21,7 @@ RUN apt-get update \
  && rustup target add wasm32-unknown-unknown \
  && rustc --version | grep -F '1.91.1' \
  && node --version | grep -F 'v22.17.0' \
+ && jq --version \
+ && unzip -v | head -n 1 \
  && nfpm --version | grep -F '2.47.0'
 WORKDIR /workspace

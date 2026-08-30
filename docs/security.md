@@ -40,7 +40,10 @@ your secret manager.
 
 The coordinator does not run arbitrary native user commands. Nodes execute
 commands within their reported capabilities. Linux container environments use
-rootless Podman and avoid privileged defaults.
+rootless Podman and avoid privileged defaults. Windows environments use
+containerd/`nerdctl` process isolation. All supported node platforms default to
+container-only command execution; native execution requires the node operator's
+explicit `--dangerous-allow-native-commands` startup override.
 
 Bundle size, canonical argument size, handle count, logs, task history, Debug
 Epoch state, interchange leases, and coordinator collections are bounded. The

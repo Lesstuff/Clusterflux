@@ -192,6 +192,7 @@ The hosted website is not required for self-hosted projects.
 - [Getting started](docs/getting-started.md)
 - [Architecture](docs/architecture.md)
 - [Nodes](docs/nodes.md)
+- [Windows nodes](docs/windows-nodes.md)
 - [Environments](docs/environments.md)
 - [Artifacts](docs/artifacts.md)
 - [Debugging](docs/debugging.md)

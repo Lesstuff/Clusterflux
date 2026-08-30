@@ -96,7 +96,7 @@ use logout::{auth_logout_report, logout_report};
 use logs::logs_report;
 use logs::logs_report_with_session;
 #[cfg(test)]
-use node::attach_plan;
+use node::{attach_plan, attach_plan_with_capabilities};
 use node::{
     execute_node_attach, node_doctor_report, node_enroll_report, node_list_report,
     node_revoke_report, node_status_report,
@@ -570,6 +570,13 @@ struct NodeDoctorArgs {
     scope: CliScopeArgs,
     #[arg(long)]
     node: Option<String>,
+    /// Run bounded local container-runtime qualification in addition to the
+    /// read-only coordinator and identity checks.
+    #[arg(long)]
+    full: bool,
+    /// Select the prebuilt Windows environment used by --full.
+    #[arg(long, requires = "full")]
+    environment: Option<String>,
 }
 
 #[derive(Clone, Debug, Parser)]

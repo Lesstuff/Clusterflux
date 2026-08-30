@@ -100,6 +100,25 @@ pub(super) struct CoordinatorControlledProcessRunner {
     pub(super) local_abort_requested: Arc<AtomicBool>,
 }
 
+#[derive(Clone, Debug)]
+struct ContainerControl {
+    runtime: String,
+    name: String,
+}
+
+enum ExecutionControlPollError {
+    Transient(String),
+    Fatal(BackendError),
+}
+
+enum FrozenExecution {
+    ContainerRuntime(ContainerControl),
+    #[cfg(unix)]
+    UnixProcessGroup(u32),
+    #[cfg(windows)]
+    WindowsProcesses(clusterflux_core::SuspendedWindowsProcesses),
+}
+
 impl Drop for CoordinatorControlledProcessRunner {
     fn drop(&mut self) {
         for secret in &mut self.configured_secrets {
@@ -111,6 +130,8 @@ impl Drop for CoordinatorControlledProcessRunner {
 impl CoordinatorControlledProcessRunner {
     const MAX_CAPTURE_BYTES: usize = 256 * 1024 + 1;
     const PODMAN_CONTROL_TIMEOUT: Duration = Duration::from_secs(2);
+    const EXECUTION_CONTROL_OUTAGE_GRACE: Duration = Duration::from_secs(30);
+    const EXECUTION_CONTROL_RETRY_MAX_DELAY: Duration = Duration::from_secs(2);
 
     pub(super) fn new(
         host: &CoordinatorWasmTaskHost,
@@ -139,7 +160,10 @@ impl CoordinatorControlledProcessRunner {
         }
     }
 
-    fn abort_requested(&self, session: &mut CoordinatorSession) -> Result<bool, BackendError> {
+    fn abort_requested(
+        &self,
+        session: &mut CoordinatorSession,
+    ) -> Result<bool, ExecutionControlPollError> {
         let request = crate::node_identity::signed_node_assignment_request(
             &self.args,
             &self.node_private_key,
@@ -154,17 +178,24 @@ impl CoordinatorControlledProcessRunner {
                 child_tasks: Vec::new(),
             },
         )
-        .map_err(|error| BackendError::Command(error.to_string()))?;
-        let response = session
-            .request(request)
-            .map_err(|error| BackendError::Command(format!("poll task control: {error}")))?;
+        .map_err(|error| {
+            ExecutionControlPollError::Fatal(BackendError::Command(error.to_string()))
+        })?;
+        let response = session.request(request).map_err(|error| {
+            let message = format!("poll task control: {error}");
+            if crate::coordinator_session::retryable_session_error(error.as_ref()) {
+                ExecutionControlPollError::Transient(message)
+            } else {
+                ExecutionControlPollError::Fatal(BackendError::Command(message))
+            }
+        })?;
         match response {
             CoordinatorResponse::TaskControl {
                 abort_requested, ..
             } => Ok(abort_requested),
-            _ => Err(BackendError::Command(
+            _ => Err(ExecutionControlPollError::Fatal(BackendError::Command(
                 "coordinator returned an unexpected task-control response".to_owned(),
-            )),
+            ))),
         }
     }
 
@@ -182,34 +213,49 @@ impl CoordinatorControlledProcessRunner {
         let _ = child.wait();
     }
 
-    fn podman_container_name(command: &PodmanCommand) -> Option<String> {
-        if command.program != "podman" || command.args.first().map(String::as_str) != Some("run") {
+    fn container_control(command: &PodmanCommand) -> Option<ContainerControl> {
+        if !matches!(command.program.as_str(), "podman" | "nerdctl")
+            || command.args.first().map(String::as_str) != Some("run")
+        {
             return None;
         }
         command
             .args
             .windows(2)
             .find(|arguments| arguments[0] == "--name")
-            .map(|arguments| arguments[1].clone())
+            .map(|arguments| ContainerControl {
+                runtime: command.program.clone(),
+                name: arguments[1].clone(),
+            })
     }
 
-    fn set_podman_paused(container: &str, paused: bool) -> Result<(), BackendError> {
+    fn set_container_paused(
+        container: &ContainerControl,
+        paused: bool,
+    ) -> Result<(), BackendError> {
         let action = if paused { "pause" } else { "unpause" };
-        let (status, _, stderr) = Self::bounded_podman_output(&[action, container])?;
+        let (status, _, stderr) =
+            Self::bounded_container_output(&container.runtime, &[action, &container.name])?;
         if !status.success() {
             return Err(BackendError::Command(format!(
-                "`podman {action}` failed for container `{container}`: {}",
+                "`{} {action}` failed for container `{}`: {}",
+                container.runtime,
+                container.name,
                 stderr.trim()
             )));
         }
 
-        let (inspection_status, observed, inspection_stderr) =
-            Self::bounded_podman_output(&["inspect", "--format", "{{.State.Paused}}", container])?;
+        let (inspection_status, observed, inspection_stderr) = Self::bounded_container_output(
+            &container.runtime,
+            &["inspect", "--format", "{{.State.Paused}}", &container.name],
+        )?;
         let expected = if paused { "true" } else { "false" };
         if !inspection_status.success() || observed.trim() != expected {
             return Err(BackendError::Command(format!(
-                "container `{container}` did not verify as {} after `podman {action}`: status={:?} stdout={} stderr={}",
+                "container `{}` did not verify as {} after `{} {action}`: status={:?} stdout={} stderr={}",
+                container.name,
                 if paused { "paused" } else { "running" },
+                container.runtime,
                 inspection_status.code(),
                 observed.trim(),
                 inspection_stderr.trim()
@@ -218,23 +264,26 @@ impl CoordinatorControlledProcessRunner {
         Ok(())
     }
 
-    fn bounded_podman_output(
+    fn bounded_container_output(
+        runtime: &str,
         arguments: &[&str],
     ) -> Result<(std::process::ExitStatus, String, String), BackendError> {
-        let mut child = std::process::Command::new("podman")
+        let mut child = std::process::Command::new(runtime)
             .args(arguments)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|error| BackendError::Command(format!("start Podman control: {error}")))?;
+            .map_err(|error| {
+                BackendError::Command(format!("start {runtime} container control: {error}"))
+            })?;
         let status = match child.wait_timeout(Self::PODMAN_CONTROL_TIMEOUT) {
             Ok(Some(status)) => status,
             Ok(None) => {
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err(BackendError::Command(format!(
-                    "Podman control exceeded {} ms",
+                    "{runtime} container control exceeded {} ms",
                     Self::PODMAN_CONTROL_TIMEOUT.as_millis()
                 )));
             }
@@ -242,7 +291,7 @@ impl CoordinatorControlledProcessRunner {
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err(BackendError::Command(format!(
-                    "wait for Podman control: {error}"
+                    "wait for {runtime} container control: {error}"
                 )));
             }
         };
@@ -267,23 +316,34 @@ impl CoordinatorControlledProcessRunner {
         ))
     }
 
-    fn terminate_execution(child: &mut std::process::Child, container: Option<&str>) {
+    fn terminate_execution(child: &mut std::process::Child, container: Option<&ContainerControl>) {
         if let Some(container) = container {
-            let _ = Self::bounded_podman_output(&["rm", "--force", "--time", "2", container]);
+            let _ = Self::bounded_container_output(&container.runtime, &["kill", &container.name]);
+            let _ = Self::bounded_container_output(
+                &container.runtime,
+                &["rm", "--force", &container.name],
+            );
         }
         Self::terminate_process_group(child);
     }
 
     fn freeze_execution(
         child: &std::process::Child,
-        container: Option<&str>,
-    ) -> Result<(), BackendError> {
+        container: Option<&ContainerControl>,
+    ) -> Result<FrozenExecution, BackendError> {
         if let Some(container) = container {
-            return Self::set_podman_paused(container, true);
+            #[cfg(windows)]
+            if container.runtime == "nerdctl" {
+                return Self::freeze_windows_container(container)
+                    .map(FrozenExecution::WindowsProcesses);
+            }
+            Self::set_container_paused(container, true)?;
+            return Ok(FrozenExecution::ContainerRuntime(container.clone()));
         }
         #[cfg(unix)]
         {
-            Self::freeze_process_group(child)
+            Self::freeze_process_group(child)?;
+            Ok(FrozenExecution::UnixProcessGroup(child.id()))
         }
         #[cfg(not(unix))]
         {
@@ -294,24 +354,64 @@ impl CoordinatorControlledProcessRunner {
         }
     }
 
-    fn resume_execution(
-        child: &std::process::Child,
-        container: Option<&str>,
-    ) -> Result<(), BackendError> {
-        if let Some(container) = container {
-            return Self::set_podman_paused(container, false);
+    fn resume_execution(frozen: &mut FrozenExecution) -> Result<(), BackendError> {
+        match frozen {
+            FrozenExecution::ContainerRuntime(container) => {
+                Self::set_container_paused(container, false)
+            }
+            #[cfg(unix)]
+            FrozenExecution::UnixProcessGroup(process_id) => {
+                Self::resume_process_group_id(*process_id)
+            }
+            #[cfg(windows)]
+            FrozenExecution::WindowsProcesses(processes) => {
+                processes.resume().map_err(BackendError::Command)
+            }
         }
-        #[cfg(unix)]
-        {
-            Self::resume_process_group(child)
+    }
+
+    #[cfg(windows)]
+    fn freeze_windows_container(
+        container: &ContainerControl,
+    ) -> Result<clusterflux_core::SuspendedWindowsProcesses, BackendError> {
+        const MAX_STABILIZATION_PASSES: usize = 8;
+        let root_process_id = Self::windows_container_entry_process_id(container)?;
+        let mut suspended = clusterflux_core::SuspendedWindowsProcesses::new();
+        for _ in 0..MAX_STABILIZATION_PASSES {
+            let added = suspended
+                .suspend_process_tree(root_process_id)
+                .map_err(BackendError::Command)?;
+            if added == 0 {
+                return Ok(suspended);
+            }
         }
-        #[cfg(not(unix))]
-        {
-            let _ = child;
-            Err(BackendError::Command(
-                "native debug resume requires Unix process groups".to_owned(),
+        Err(BackendError::Command(format!(
+            "Windows container `{}` did not reach a stable all-thread suspension after {MAX_STABILIZATION_PASSES} passes",
+            container.name
+        )))
+    }
+
+    #[cfg(windows)]
+    fn windows_container_entry_process_id(
+        container: &ContainerControl,
+    ) -> Result<u32, BackendError> {
+        let (status, stdout, stderr) = Self::bounded_container_output(
+            &container.runtime,
+            &["inspect", "--format", "{{.State.Pid}}", &container.name],
+        )?;
+        if !status.success() {
+            return Err(BackendError::Command(format!(
+                "resolve Windows task entry process for `{}`: {}",
+                container.name,
+                stderr.trim()
+            )));
+        }
+        stdout.trim().parse::<u32>().map_err(|_| {
+            BackendError::Command(format!(
+                "nerdctl returned invalid Windows task entry PID `{}`",
+                stdout.trim()
             ))
-        }
+        })
     }
 
     #[cfg(unix)]
@@ -330,15 +430,15 @@ impl CoordinatorControlledProcessRunner {
     }
 
     #[cfg(unix)]
-    fn resume_process_group(child: &std::process::Child) -> Result<(), BackendError> {
-        let process_group = -(child.id() as i32);
+    fn resume_process_group_id(process_id: u32) -> Result<(), BackendError> {
+        let process_group = -(process_id as i32);
         let result = unsafe { libc::kill(process_group, libc::SIGCONT) };
         if result == 0 {
             Ok(())
         } else {
             Err(BackendError::Command(format!(
                 "failed to resume native process group {}: {}",
-                child.id(),
+                process_id,
                 std::io::Error::last_os_error()
             )))
         }
@@ -497,9 +597,16 @@ impl CoordinatorControlledProcessRunner {
 
 impl ProcessRunner for CoordinatorControlledProcessRunner {
     fn run(&mut self, command: &PodmanCommand) -> Result<ProcessOutput, BackendError> {
-        let podman_container = Self::podman_container_name(command);
+        let container = Self::container_control(command);
+        let execution_kind = if container.is_some() {
+            "container command"
+        } else if matches!(command.program.as_str(), "podman" | "nerdctl") {
+            "container runtime command"
+        } else {
+            "dangerous native command"
+        };
         self.set_command_status(format!(
-            "starting native command: {} {}",
+            "starting {execution_kind}: {} {}",
             command.program,
             command.args.join(" ")
         ));
@@ -510,13 +617,16 @@ impl ProcessRunner for CoordinatorControlledProcessRunner {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        if let Some(working_directory) = &command.working_directory {
+            process.current_dir(working_directory);
+        }
         #[cfg(unix)]
         process.process_group(0);
         let mut child = process
             .spawn()
             .map_err(|error| BackendError::Command(error.to_string()))?;
         self.set_command_status(format!(
-            "running native command pid {}: {} {}",
+            "running {execution_kind} pid {}: {} {}",
             child.id(),
             command.program,
             command.args.join(" ")
@@ -552,7 +662,7 @@ impl ProcessRunner for CoordinatorControlledProcessRunner {
         ) {
             Ok(session) => session,
             Err(error) => {
-                Self::terminate_execution(&mut child, podman_container.as_deref());
+                Self::terminate_execution(&mut child, container.as_ref());
                 let _ = stdout.join();
                 let _ = stderr.join();
                 let _ = live_log_reporter.join();
@@ -562,14 +672,17 @@ impl ProcessRunner for CoordinatorControlledProcessRunner {
             }
         };
 
-        let mut frozen_epoch = None;
+        let mut frozen_execution: Option<(u64, FrozenExecution)> = None;
+        let mut control_outage_started = None;
+        let mut next_control_poll = Instant::now();
+        let mut control_retry_delay = Duration::from_millis(100);
         let started = Instant::now();
         let status = loop {
             match child.try_wait() {
                 Ok(Some(status)) => break status,
                 Ok(None) => {}
                 Err(error) => {
-                    Self::terminate_execution(&mut child, podman_container.as_deref());
+                    Self::terminate_execution(&mut child, container.as_ref());
                     let _ = stdout.join();
                     let _ = stderr.join();
                     let _ = live_log_reporter.join();
@@ -578,25 +691,25 @@ impl ProcessRunner for CoordinatorControlledProcessRunner {
             }
             if started.elapsed() >= self.timeout {
                 self.set_command_status(format!(
-                    "native command pid {} exceeded wall-clock timeout of {} ms",
+                    "{execution_kind} pid {} exceeded wall-clock timeout of {} ms",
                     child.id(),
                     self.timeout.as_millis()
                 ));
-                Self::terminate_execution(&mut child, podman_container.as_deref());
+                Self::terminate_execution(&mut child, container.as_ref());
                 let _ = stdout.join();
                 let _ = stderr.join();
                 let _ = live_log_reporter.join();
                 return Err(BackendError::Command(format!(
-                    "native command exceeded wall-clock timeout of {} ms",
+                    "{execution_kind} exceeded wall-clock timeout of {} ms",
                     self.timeout.as_millis()
                 )));
             }
             if self.local_abort_requested.load(Ordering::Acquire) {
                 self.set_command_status(format!(
-                    "aborting native command pid {} at local lane shutdown",
+                    "aborting {execution_kind} pid {} at local lane shutdown",
                     child.id()
                 ));
-                Self::terminate_execution(&mut child, podman_container.as_deref());
+                Self::terminate_execution(&mut child, container.as_ref());
                 let _ = stdout.join();
                 let _ = stderr.join();
                 let _ = live_log_reporter.join();
@@ -604,57 +717,113 @@ impl ProcessRunner for CoordinatorControlledProcessRunner {
                     "Wasm lane requested local command cancellation".to_owned(),
                 ));
             }
-            match self.abort_requested(&mut session) {
-                Ok(true) => {
-                    self.set_command_status(format!(
-                        "aborting native command pid {} at coordinator request",
-                        child.id()
-                    ));
-                    Self::terminate_execution(&mut child, podman_container.as_deref());
-                    let _ = stdout.join();
-                    let _ = stderr.join();
-                    let _ = live_log_reporter.join();
-                    return Err(BackendError::Cancelled(
-                        "coordinator requested cancellation or abort".to_owned(),
-                    ));
-                }
-                Ok(false) => {}
-                Err(error) => {
-                    Self::terminate_execution(&mut child, podman_container.as_deref());
-                    let _ = stdout.join();
-                    let _ = stderr.join();
-                    let _ = live_log_reporter.join();
-                    return Err(error);
+            let control_now = Instant::now();
+            if control_now >= next_control_poll {
+                match self.abort_requested(&mut session) {
+                    Ok(true) => {
+                        self.set_command_status(format!(
+                            "aborting {execution_kind} pid {} at coordinator request",
+                            child.id()
+                        ));
+                        Self::terminate_execution(&mut child, container.as_ref());
+                        let _ = stdout.join();
+                        let _ = stderr.join();
+                        let _ = live_log_reporter.join();
+                        return Err(BackendError::Cancelled(
+                            "coordinator requested cancellation or abort".to_owned(),
+                        ));
+                    }
+                    Ok(false) => {
+                        if control_outage_started.take().is_some() {
+                            self.set_command_status(format!(
+                                "running {execution_kind} pid {} after execution control reconnected",
+                                child.id()
+                            ));
+                        }
+                        control_retry_delay = Duration::from_millis(100);
+                    }
+                    Err(ExecutionControlPollError::Transient(error)) => {
+                        let outage_started = *control_outage_started.get_or_insert(control_now);
+                        let outage_duration = control_now.duration_since(outage_started);
+                        if outage_duration >= Self::EXECUTION_CONTROL_OUTAGE_GRACE {
+                            Self::terminate_execution(&mut child, container.as_ref());
+                            let _ = stdout.join();
+                            let _ = stderr.join();
+                            let _ = live_log_reporter.join();
+                            return Err(BackendError::Command(format!(
+                                "execution control was unavailable for {} ms; last error: {error}",
+                                outage_duration.as_millis()
+                            )));
+                        }
+                        self.set_command_status(format!(
+                            "{execution_kind} pid {} is running while execution control reconnects: {error}",
+                            child.id()
+                        ));
+                        match CoordinatorSession::connect_with_timeouts(
+                            &self.args.coordinator,
+                            Duration::from_millis(500),
+                            Duration::from_millis(500),
+                        ) {
+                            Ok(reconnected) => session = reconnected,
+                            Err(reconnect_error)
+                                if crate::coordinator_session::retryable_session_error(
+                                    reconnect_error.as_ref(),
+                                ) => {}
+                            Err(reconnect_error) => {
+                                Self::terminate_execution(&mut child, container.as_ref());
+                                let _ = stdout.join();
+                                let _ = stderr.join();
+                                let _ = live_log_reporter.join();
+                                return Err(BackendError::Command(format!(
+                                    "reestablish execution control channel: {reconnect_error}"
+                                )));
+                            }
+                        }
+                        next_control_poll = Instant::now() + control_retry_delay;
+                        control_retry_delay = control_retry_delay
+                            .saturating_mul(2)
+                            .min(Self::EXECUTION_CONTROL_RETRY_MAX_DELAY);
+                    }
+                    Err(ExecutionControlPollError::Fatal(error)) => {
+                        Self::terminate_execution(&mut child, container.as_ref());
+                        let _ = stdout.join();
+                        let _ = stderr.join();
+                        let _ = live_log_reporter.join();
+                        return Err(error);
+                    }
                 }
             }
             if let Some(epoch) = self.debug_control.requested_epoch() {
                 if self.debug_control.resume_requested(epoch) {
-                    if frozen_epoch == Some(epoch) {
-                        match Self::resume_execution(&child, podman_container.as_deref()) {
+                    if frozen_execution.as_ref().map(|(frozen, _)| *frozen) == Some(epoch) {
+                        let (_, frozen) = frozen_execution
+                            .as_mut()
+                            .expect("matching frozen epoch has execution state");
+                        match Self::resume_execution(frozen) {
                             Ok(()) => {
                                 self.set_command_status(format!(
                                     "running command pid {} after debug epoch {epoch} resumed",
                                     child.id()
                                 ));
                                 self.debug_control.mark_running(epoch);
-                                frozen_epoch = None;
+                                frozen_execution = None;
                             }
                             Err(error) => self.set_command_status(format!(
                                 "debug epoch {epoch} resume is pending: {error}"
                             )),
                         }
                     }
-                } else if frozen_epoch != Some(epoch)
+                } else if frozen_execution.as_ref().map(|(frozen, _)| *frozen) != Some(epoch)
                     && self.debug_control.frozen_epoch() != Some(epoch)
                 {
-                    match Self::freeze_execution(&child, podman_container.as_deref()) {
-                        Ok(()) => {
+                    match Self::freeze_execution(&child, container.as_ref()) {
+                        Ok(frozen) => {
                             self.set_command_status(format!(
                                 "frozen command pid {} for debug epoch {epoch}",
                                 child.id()
                             ));
                             self.debug_control.mark_frozen(epoch);
-                            frozen_epoch = Some(epoch);
+                            frozen_execution = Some((epoch, frozen));
                         }
                         Err(error) => self.set_command_status(format!(
                             "debug epoch {epoch} freeze is pending: {error}"
@@ -676,7 +845,7 @@ impl ProcessRunner for CoordinatorControlledProcessRunner {
             .join()
             .map_err(|_| BackendError::Command("live log reporter panicked".to_owned()))?;
         self.set_command_status(format!(
-            "native command exited with status {:?}",
+            "{execution_kind} exited with status {:?}",
             status.code()
         ));
         Ok(ProcessOutput {

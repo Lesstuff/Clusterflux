@@ -3,7 +3,7 @@ use thiserror::Error;
 
 use crate::Digest;
 
-pub const SUPPORTED_WORKFLOW_SDK_VERSION: &str = "0.1.2";
+pub const SUPPORTED_WORKFLOW_SDK_VERSION: &str = "0.2.0";
 pub const SUPPORTED_WORKFLOW_SERDE_VERSION: &str = "1.0.228";
 pub const SUPPORTED_WORKFLOW_EDITION: &str = "2024";
 pub const MAX_WORKFLOW_MANIFEST_BYTES: usize = 16 * 1024;
@@ -266,7 +266,7 @@ mod tests {
 
     fn valid_manifest(name: &str) -> String {
         format!(
-            "[package]\nname = \"{name}\"\nversion = \"0.0.0\"\nedition = \"2024\"\npublish = false\n\n[lib]\npath = \"main.rs\"\ncrate-type = [\"cdylib\"]\n\n[dependencies]\nclusterflux = {{ package = \"clusterflux-sdk\", version = \"=0.1.2\", path = \"../crates/clusterflux-sdk\" }}\n\n[workspace]\nresolver = \"3\"\n"
+            "[package]\nname = \"{name}\"\nversion = \"0.0.0\"\nedition = \"2024\"\npublish = false\n\n[lib]\npath = \"main.rs\"\ncrate-type = [\"cdylib\"]\n\n[dependencies]\nclusterflux = {{ package = \"clusterflux-sdk\", version = \"=0.2.0\", path = \"../crates/clusterflux-sdk\" }}\n\n[workspace]\nresolver = \"3\"\n"
         )
     }
 
@@ -274,7 +274,7 @@ mod tests {
     fn valid_manifest_normalizes_independent_of_order_and_comments() {
         let first =
             NormalizedWorkflowManifest::parse(valid_manifest("demo-workflow").as_bytes()).unwrap();
-        let reordered = b"# editor-compatible, hosted-safe\n[workspace]\nresolver='3'\n[dependencies]\nclusterflux={package='clusterflux-sdk',version='=0.1.2',path='../crates/clusterflux-sdk'}\n[lib]\ncrate-type=['cdylib']\npath='main.rs'\n[package]\npublish=false\nedition='2024'\nversion='0.0.0'\nname='demo-workflow'\n";
+        let reordered = b"# editor-compatible, hosted-safe\n[workspace]\nresolver='3'\n[dependencies]\nclusterflux={package='clusterflux-sdk',version='=0.2.0',path='../crates/clusterflux-sdk'}\n[lib]\ncrate-type=['cdylib']\npath='main.rs'\n[package]\npublish=false\nedition='2024'\nversion='0.0.0'\nname='demo-workflow'\n";
         let second = NormalizedWorkflowManifest::parse(reordered).unwrap();
         assert_eq!(first, second);
         assert_eq!(first.crate_name(), "demo_workflow");
@@ -300,7 +300,7 @@ mod tests {
     #[test]
     fn rejects_every_dependency_form_and_unsupported_table() {
         let path_dependency = valid_manifest("demo").replace(
-            "clusterflux = { package = \"clusterflux-sdk\", version = \"=0.1.2\", path = \"../crates/clusterflux-sdk\" }",
+            "clusterflux = { package = \"clusterflux-sdk\", version = \"=0.2.0\", path = \"../crates/clusterflux-sdk\" }",
             "clusterflux = { path = \"../sdk\" }",
         );
         assert!(
@@ -318,7 +318,8 @@ mod tests {
 
     #[test]
     fn rejects_wrong_exact_values_and_resource_excess() {
-        let wrong_sdk = valid_manifest("demo").replace("=0.1.2", "=0.2.0");
+        let wrong_sdk =
+            valid_manifest("demo").replace(&format!("={SUPPORTED_WORKFLOW_SDK_VERSION}"), "=9.9.9");
         assert!(matches!(
             NormalizedWorkflowManifest::parse(wrong_sdk.as_bytes()),
             Err(WorkflowManifestError::UnsupportedSdk { .. })

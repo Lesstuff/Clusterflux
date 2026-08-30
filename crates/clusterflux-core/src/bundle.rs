@@ -756,7 +756,7 @@ mod tests {
             rustc_commit: Some("0123456789abcdef".to_owned()),
             target: "wasm32-unknown-unknown".to_owned(),
             flags: vec!["-Copt-level=1".to_owned()],
-            sdk_version: "0.1.2".to_owned(),
+            sdk_version: "0.2.0".to_owned(),
             sdk_digest: Digest::sha256("sdk"),
             trusted_dependencies: Vec::new(),
             sandbox_image_digest: None,

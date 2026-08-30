@@ -30,6 +30,7 @@ pub(super) struct DebugEpochRuntime {
     pub(super) expected: BTreeSet<TaskControlKey>,
     pub(super) acknowledgements: BTreeMap<TaskControlKey, DebugParticipantAcknowledgement>,
     pub(super) deadline: Instant,
+    pub(super) lease_deadline: Instant,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -585,16 +586,6 @@ impl CoordinatorService {
         let authorization = self.coordinator.authorize_debug_attach(&context, &process);
         let process_key = process_control_key(&tenant, &project, &process);
         self.sync_coordinator_main_debug_acknowledgement(&process_key, epoch);
-        let runtime = self
-            .debug_registry
-            .runtime(&process_key)
-            .filter(|runtime| runtime.epoch == epoch)
-            .cloned()
-            .ok_or_else(|| {
-                CoordinatorServiceError::Protocol(format!(
-                    "debug epoch {epoch} is not active for {process}"
-                ))
-            })?;
         let audit_event = self.record_debug_audit_event(
             tenant,
             project,
@@ -612,17 +603,34 @@ impl CoordinatorService {
             ))
             .into());
         }
+        if let Some(runtime) = self
+            .debug_registry
+            .runtime_mut(&process_key)
+            .filter(|runtime| runtime.epoch == epoch && runtime.command == "freeze")
+        {
+            runtime.lease_deadline = Instant::now() + self.debug_epoch_lease_timeout;
+        }
+        let runtime = self
+            .debug_registry
+            .runtime(&process_key)
+            .filter(|runtime| runtime.epoch == epoch)
+            .cloned()
+            .ok_or_else(|| {
+                CoordinatorServiceError::Protocol(format!(
+                    "debug epoch {epoch} is not active for {process}"
+                ))
+            })?;
         let acknowledgements = runtime
             .acknowledgements
             .values()
             .cloned()
             .collect::<Vec<_>>();
-        let all_acknowledged = !runtime.expected.is_empty()
-            && runtime
-                .expected
-                .iter()
-                .all(|key| runtime.acknowledgements.contains_key(key));
+        let all_acknowledged = runtime
+            .expected
+            .iter()
+            .all(|key| runtime.acknowledgements.contains_key(key));
         let fully_frozen = runtime.command == "freeze"
+            && !runtime.expected.is_empty()
             && all_acknowledged
             && acknowledgements
                 .iter()
@@ -801,89 +809,61 @@ impl CoordinatorService {
                 next
             }
         };
-        let resumable = if command == "resume" {
-            self.debug_registry
-                .runtime(&process_key)
-                .map(|runtime| {
-                    runtime
-                        .acknowledgements
-                        .iter()
-                        .filter(|(_, ack)| ack.state == DebugAcknowledgementState::Frozen)
-                        .map(|(key, _)| key.clone())
-                        .collect::<BTreeSet<_>>()
-                })
-                .unwrap_or_default()
+        let affected_tasks = if command == "resume" {
+            self.transition_debug_epoch_to_resume(&process_key, epoch)?
         } else {
-            BTreeSet::new()
-        };
-        let mut affected_tasks = self
-            .enqueue_debug_command_for_active_tasks(&tenant, &project, &process, epoch, command);
-        let mut expected = self
-            .task_registry
-            .active_tasks()
-            .filter(|(task_tenant, task_project, task_process, _, _)| {
-                task_tenant == &tenant && task_project == &project && task_process == &process
-            })
-            .cloned()
-            .collect::<BTreeSet<_>>();
-        if let Some(control) = self
-            .main_runtime
-            .controls
-            .get(&process_key)
-            .filter(|control| matches!(control.state.as_str(), "running" | "stopping"))
-        {
-            let key = task_control_key(
-                &tenant,
-                &project,
-                &process,
-                &NodeId::from("coordinator-main"),
-                &control.task_instance,
+            let mut affected_tasks = self.enqueue_debug_command_for_active_tasks(
+                &tenant, &project, &process, epoch, command,
             );
-            expected.insert(key);
-            affected_tasks.push(TaskCancellationTarget {
-                process: process.clone(),
-                node: NodeId::from("coordinator-main"),
-                task: control.task_instance.clone(),
-            });
-        }
-        if command == "resume" {
-            expected.retain(|key| resumable.contains(key));
-            affected_tasks.retain(|target| {
-                resumable
-                    .iter()
-                    .any(|(_, _, _, node, task)| node == &target.node && task == &target.task)
-            });
-            self.debug_registry
-                .retain_resumable_commands(epoch, &resumable);
-        }
-        self.debug_registry.set_runtime(
-            process_key.clone(),
-            DebugEpochRuntime {
-                epoch,
-                command: command.to_owned(),
-                expected,
-                acknowledgements: BTreeMap::new(),
-                deadline: Instant::now() + self.debug_freeze_timeout,
-            },
-        );
-        if let Some(control) = self
-            .main_runtime
-            .controls
-            .get(&process_key)
-            .filter(|control| matches!(control.state.as_str(), "running" | "stopping"))
-        {
-            if command == "freeze" {
-                control.debug.request_freeze(epoch);
-            } else if resumable.contains(&task_control_key(
-                &tenant,
-                &project,
-                &process,
-                &NodeId::from("coordinator-main"),
-                &control.task_instance,
-            )) {
-                control.debug.request_resume(epoch);
+            let mut expected = self
+                .task_registry
+                .active_tasks()
+                .filter(|(task_tenant, task_project, task_process, _, _)| {
+                    task_tenant == &tenant && task_project == &project && task_process == &process
+                })
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            if let Some(control) = self
+                .main_runtime
+                .controls
+                .get(&process_key)
+                .filter(|control| matches!(control.state.as_str(), "running" | "stopping"))
+            {
+                let key = task_control_key(
+                    &tenant,
+                    &project,
+                    &process,
+                    &NodeId::from("coordinator-main"),
+                    &control.task_instance,
+                );
+                expected.insert(key);
+                affected_tasks.push(TaskCancellationTarget {
+                    process: process.clone(),
+                    node: NodeId::from("coordinator-main"),
+                    task: control.task_instance.clone(),
+                });
             }
-        }
+            self.debug_registry.set_runtime(
+                process_key.clone(),
+                DebugEpochRuntime {
+                    epoch,
+                    command: command.to_owned(),
+                    expected,
+                    acknowledgements: BTreeMap::new(),
+                    deadline: Instant::now() + self.debug_freeze_timeout,
+                    lease_deadline: Instant::now() + self.debug_epoch_lease_timeout,
+                },
+            );
+            if let Some(control) = self
+                .main_runtime
+                .controls
+                .get(&process_key)
+                .filter(|control| matches!(control.state.as_str(), "running" | "stopping"))
+            {
+                control.debug.request_freeze(epoch);
+            }
+            affected_tasks
+        };
         self.sync_coordinator_main_debug_acknowledgement(&process_key, epoch);
         Ok(CoordinatorResponse::DebugEpoch {
             process,
@@ -896,6 +876,137 @@ impl CoordinatorService {
             used_debug_read_bytes: audit_event.used_debug_read_bytes,
             audit_event,
         })
+    }
+
+    fn transition_debug_epoch_to_resume(
+        &mut self,
+        process_key: &super::keys::ProcessControlKey,
+        epoch: u64,
+    ) -> Result<Vec<TaskCancellationTarget>, CoordinatorServiceError> {
+        let previous = self
+            .debug_registry
+            .runtime(process_key)
+            .filter(|runtime| runtime.epoch == epoch && runtime.command == "freeze")
+            .cloned()
+            .ok_or_else(|| {
+                CoordinatorServiceError::Protocol(format!(
+                    "cannot resume debug epoch {epoch} for {}: no frozen epoch is active",
+                    process_key.2
+                ))
+            })?;
+        self.debug_registry.clear_epoch_commands(process_key, epoch);
+
+        let active_tasks = self
+            .task_registry
+            .active_tasks()
+            .filter(|(tenant, project, process, _, _)| {
+                tenant == &process_key.0 && project == &process_key.1 && process == &process_key.2
+            })
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let mut expected = previous
+            .expected
+            .intersection(&active_tasks)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let coordinator_main = self
+            .main_runtime
+            .controls
+            .get(process_key)
+            .filter(|control| matches!(control.state.as_str(), "running" | "stopping"))
+            .map(|control| {
+                task_control_key(
+                    &process_key.0,
+                    &process_key.1,
+                    &process_key.2,
+                    &NodeId::from("coordinator-main"),
+                    &control.task_instance,
+                )
+            });
+        if let Some(main_key) = coordinator_main.as_ref() {
+            if previous.expected.contains(main_key) {
+                expected.insert(main_key.clone());
+            }
+        }
+
+        for key in expected
+            .iter()
+            .filter(|(_, _, _, node, _)| node.as_str() != "coordinator-main")
+        {
+            self.debug_registry.queue_command(
+                key.clone(),
+                DebugPendingCommand {
+                    epoch,
+                    command: "resume".to_owned(),
+                },
+            );
+        }
+        let affected_tasks = expected
+            .iter()
+            .map(|(_, _, process, node, task)| TaskCancellationTarget {
+                process: process.clone(),
+                node: node.clone(),
+                task: task.clone(),
+            })
+            .collect::<Vec<_>>();
+        self.debug_registry.set_runtime(
+            process_key.clone(),
+            DebugEpochRuntime {
+                epoch,
+                command: "resume".to_owned(),
+                expected,
+                acknowledgements: BTreeMap::new(),
+                deadline: Instant::now() + self.debug_freeze_timeout,
+                lease_deadline: Instant::now() + self.debug_epoch_lease_timeout,
+            },
+        );
+        if let (Some(main_key), Some(control)) = (
+            coordinator_main,
+            self.main_runtime.controls.get(process_key),
+        ) {
+            if self
+                .debug_registry
+                .runtime(process_key)
+                .is_some_and(|runtime| runtime.expected.contains(&main_key))
+            {
+                control.debug.request_resume(epoch);
+            }
+        }
+        Ok(affected_tasks)
+    }
+
+    pub(super) fn reconcile_departed_debug_participant(
+        &mut self,
+        participant: &TaskControlKey,
+    ) -> Result<(), CoordinatorServiceError> {
+        let process_key = process_control_key(&participant.0, &participant.1, &participant.2);
+        let Some(runtime) = self.debug_registry.runtime(&process_key).cloned() else {
+            return Ok(());
+        };
+        if !runtime.expected.contains(participant) {
+            self.debug_registry.clear_task_command(participant);
+            return Ok(());
+        }
+        if runtime.command == "freeze" {
+            self.transition_debug_epoch_to_resume(&process_key, runtime.epoch)?;
+            self.sync_coordinator_main_debug_acknowledgement(&process_key, runtime.epoch);
+        } else {
+            self.debug_registry
+                .remove_runtime_participant(&process_key, participant);
+        }
+        Ok(())
+    }
+
+    pub(super) fn reconcile_expired_debug_epoch_leases(
+        &mut self,
+    ) -> Result<usize, CoordinatorServiceError> {
+        let expired = self.debug_registry.expired_freeze_leases(Instant::now());
+        let count = expired.len();
+        for (process_key, epoch) in expired {
+            self.transition_debug_epoch_to_resume(&process_key, epoch)?;
+            self.sync_coordinator_main_debug_acknowledgement(&process_key, epoch);
+        }
+        Ok(count)
     }
 
     fn sync_coordinator_main_debug_acknowledgement(

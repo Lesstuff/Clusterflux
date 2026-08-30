@@ -391,10 +391,7 @@ impl CoordinatorService {
                 &authority,
             )?
         {
-            return Err(CoordinatorError::Unauthorized(
-                "node assignment acknowledgement is stale or outside node scope".to_owned(),
-            )
-            .into());
+            return Err(CoordinatorServiceError::StaleNodeAssignmentAcknowledgement);
         }
         Ok(CoordinatorResponse::NodeAssignmentAcknowledged {
             assignment_id,

@@ -15,6 +15,7 @@ use super::interchange_registry::{InterchangeArtifactEffect, InterchangeProgress
 use super::{CoordinatorResponse, CoordinatorService, CoordinatorServiceError};
 
 const DEFAULT_ENDPOINT_ADVERTISEMENT_TTL_SECONDS: u64 = 60;
+const ENDPOINT_ADVERTISEMENT_CLOCK_SKEW_SECONDS: u64 = 5;
 const DEFAULT_TRANSFER_LEASE_TTL_SECONDS: u64 = 120;
 const MAX_INTERCHANGE_TRANSFERS: usize = 4_096;
 const DEFAULT_ACTIVE_TRANSFER_LEASE_TTL_SECONDS: u64 = 10 * 60;
@@ -316,7 +317,10 @@ impl CoordinatorService {
             self.artifact_interchange_configuration
                 .endpoint_advertisement_ttl_seconds,
         );
-        if advertisement.expires_at <= now || advertisement.expires_at > maximum_expiry {
+        if advertisement.expires_at <= now
+            || advertisement.expires_at
+                > maximum_expiry.saturating_add(ENDPOINT_ADVERTISEMENT_CLOCK_SKEW_SECONDS)
+        {
             return Err(CoordinatorServiceError::Protocol(
                 "Iroh endpoint advertisement expiry is outside the coordinator policy".to_owned(),
             ));

@@ -15,6 +15,7 @@ pub enum GuestRuntimeKind {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CommandBackendKind {
     LinuxRootlessPodman,
+    WindowsContainerdNerdctl,
     WindowsCommandDev,
     StubbedWindowsSandbox,
 }

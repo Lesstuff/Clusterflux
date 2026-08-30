@@ -49,6 +49,14 @@ fn cli_first_mvp_command_surface_parses() {
         &["clusterflux", "node", "list"],
         &["clusterflux", "node", "status"],
         &["clusterflux", "node", "doctor", "--node", "node"],
+        &[
+            "clusterflux",
+            "node",
+            "doctor",
+            "--full",
+            "--environment",
+            "windows-node-build",
+        ],
         &["clusterflux", "node", "revoke", "--node", "node", "--yes"],
         &["clusterflux", "process", "list"],
         &["clusterflux", "process", "status"],
@@ -86,6 +94,20 @@ fn cli_first_mvp_command_surface_parses() {
     ] {
         let _ = parse(args);
     }
+}
+
+#[test]
+fn node_doctor_environment_requires_the_full_runtime_probe() {
+    let error = Cli::try_parse_from([
+        "clusterflux",
+        "node",
+        "doctor",
+        "--environment",
+        "windows-node-build",
+    ])
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("--full"));
 }
 
 #[test]

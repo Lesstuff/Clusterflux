@@ -7,7 +7,7 @@ use clap::Parser;
 use clusterflux_core::{
     sign_node_request, signed_request_payload_digest, ApiError, ApiErrorCode, ArtifactId,
     AssignmentAuthority, Capability, Digest, EnvironmentBackend, NodeCapabilities, NodeDrainStatus,
-    NodeId, NodeLifecycleState, NodeWorkPolicy, ProcessId, ProjectId, SystemBundleCapability,
+    NodeId, NodeLifecycleState, NodeWorkPolicy, Os, ProcessId, ProjectId, SystemBundleCapability,
     TaskInstanceId, TaskSpec, TenantId,
 };
 use clusterflux_protocol::{
@@ -41,6 +41,7 @@ use crate::task_artifacts::{
 use crate::task_reports::{record_cancelled_task, record_completed_task, record_failed_task};
 use clusterflux_node::{
     ContainerRunPolicy, LinuxRootlessPodmanBackend, ProcessRunner, StdProcessRunner,
+    WindowsContainerdNerdctlBackend,
 };
 use clusterflux_wasm_runtime::WasmExecutionService;
 
@@ -101,6 +102,9 @@ pub(crate) struct Args {
     /// Operator-approved capabilities that cannot be inferred from the host.
     #[arg(long = "cap", value_parser = parse_capability)]
     pub(crate) capabilities: Vec<Capability>,
+    /// DANGEROUS: run workflow commands directly on the host instead of in containers.
+    #[arg(long)]
+    pub(crate) dangerous_allow_native_commands: bool,
     /// Keep this node execution-only even when a compiler backend is configured.
     #[arg(long, conflicts_with = "system_tasks_only")]
     pub(crate) no_workflow_compilation: bool,
@@ -157,6 +161,17 @@ impl Args {
         capabilities
             .capabilities
             .extend(self.capabilities.iter().cloned());
+        if self.dangerous_allow_native_commands {
+            capabilities.capabilities.insert(Capability::Command);
+            if capabilities.os == Os::Windows {
+                capabilities
+                    .capabilities
+                    .insert(Capability::WindowsCommandDev);
+                capabilities
+                    .environment_backends
+                    .insert(EnvironmentBackend::WindowsCommandDev);
+            }
+        }
         capabilities
     }
 
@@ -201,9 +216,19 @@ pub(crate) fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     let worker_shutdown = CancellationToken::new();
 
-    let compiler_profile = if args.no_workflow_compilation {
+    if args.dangerous_allow_native_commands {
         eprintln!(
-            "Automatic workflow compilation disabled by --no-workflow-compilation; compiler image inspection and import were skipped."
+            "WARNING: --dangerous-allow-native-commands bypasses container isolation for workflow commands on this node."
+        );
+    }
+    if Os::current() == Os::Windows {
+        eprintln!(
+            "Windows process-isolated tasks enforce CPU and memory limits and a read-only source mount. runhcs does not support a read-only container root or expose the per-task PID limit; the writable container layer remains ephemeral."
+        );
+    }
+    let compiler_profile = if args.no_workflow_compilation || Os::current() != Os::Linux {
+        eprintln!(
+            "Automatic workflow compilation disabled on this node; compiler image inspection and import were skipped. A compiler-capable Linux node must remain online."
         );
         None
     } else {
@@ -672,7 +697,7 @@ async fn worker_loop(
             attempt_id: offer.attempt_id.clone(),
             offer_epoch: offer.lease_epoch,
         };
-        let acknowledgement = session.request_signed(|| {
+        let acknowledgement = match session.request_signed(|| {
             signed_node_assignment_request(
                 args,
                 node_private_key,
@@ -686,7 +711,26 @@ async fn worker_loop(
                     lease_epoch: offer.lease_epoch,
                 },
             )
-        })?;
+        }) {
+            Ok(acknowledgement) => acknowledgement,
+            Err(error) if is_stale_assignment_acknowledgement(error.as_ref()) => {
+                eprintln!(
+                    "Coordinator retired a node assignment before it was acknowledged; polling for current work."
+                );
+                wait_for_worker_poll(
+                    initial_idle_poll_backoff,
+                    args,
+                    drain_requested,
+                    completed_work,
+                    worker_started,
+                    last_activity,
+                    &shutdown,
+                )
+                .await;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         if !matches!(
             acknowledgement,
             CoordinatorResponse::NodeAssignmentAcknowledged { .. }
@@ -841,6 +885,12 @@ fn is_account_suspended_error(error: &(dyn std::error::Error + 'static)) -> bool
     error
         .downcast_ref::<ApiError>()
         .is_some_and(|error| error.code == ApiErrorCode::AccountSuspended)
+}
+
+fn is_stale_assignment_acknowledgement(error: &(dyn std::error::Error + 'static)) -> bool {
+    error
+        .downcast_ref::<ApiError>()
+        .is_some_and(|error| error.code == ApiErrorCode::Conflict && error.retryable)
 }
 
 fn pin_report_artifacts(
@@ -1047,12 +1097,23 @@ fn cached_environment_digests(
     let Some(project_root) = project_root else {
         return Ok(Vec::new());
     };
-    let environments = clusterflux_core::discover_environments(project_root)?;
-    let backend = LinuxRootlessPodmanBackend;
+    let materialized_source =
+        clusterflux_source::materialize_clean_local_git_revision(project_root)?;
+    let discovery_root = materialized_source
+        .as_ref()
+        .map_or(project_root, |source| source.root());
+    let environments = clusterflux_core::discover_environments(discovery_root)?;
     let mut runner = StdProcessRunner;
     let mut cached = Vec::new();
     for environment in environments {
-        let materialization = backend.materialize_environment(&environment)?;
+        if environment.requirements.os.as_ref() != Some(&Os::current()) {
+            continue;
+        }
+        let materialization = match Os::current() {
+            Os::Linux => LinuxRootlessPodmanBackend.materialize_environment(&environment)?,
+            Os::Windows => WindowsContainerdNerdctlBackend.materialize_environment(&environment)?,
+            Os::Macos | Os::Other(_) => continue,
+        };
         let inspection = runner.run(&materialization.inspect)?;
         match inspection.status_code {
             Some(0) => cached.push(environment.digest),
@@ -1319,6 +1380,9 @@ fn parse_args() -> Result<Args, Box<dyn std::error::Error>> {
         MAX_DEBUG_FREEZE_TIMEOUT_MILLIS,
     )?;
     args.artifact_retention = NodeArtifactRetentionLimits::from_environment()?;
+    if args.system_tasks_only && Os::current() != Os::Linux {
+        return Err("--system-tasks-only requires a compiler-capable Linux node".into());
+    }
     validate_provider_deadlines(&args, unix_timestamp_seconds())?;
     Ok(args)
 }
@@ -1368,6 +1432,7 @@ fn parse_capability(value: &str) -> Result<Capability, String> {
         "command" => Ok(Capability::Command),
         "containers" => Ok(Capability::Containers),
         "rootless_podman" => Ok(Capability::RootlessPodman),
+        "containerd_nerdctl" => Ok(Capability::ContainerdNerdctl),
         "source_filesystem" => Ok(Capability::SourceFilesystem),
         "source_git" => Ok(Capability::SourceGit),
         "host_filesystem" => Ok(Capability::HostFilesystem),
@@ -1376,7 +1441,10 @@ fn parse_capability(value: &str) -> Result<Capability, String> {
         "inbound_ports" => Ok(Capability::InboundPorts),
         "arbitrary_syscalls" => Ok(Capability::ArbitrarySyscalls),
         "vfs_artifacts" => Ok(Capability::VfsArtifacts),
-        "windows_command_dev" => Ok(Capability::WindowsCommandDev),
+        "windows_command_dev" => Err(
+            "windows_command_dev cannot be granted with --cap; start the node with --dangerous-allow-native-commands"
+                .to_owned(),
+        ),
         "artifact_transfer" => Ok(Capability::ArtifactTransfer),
         "workflow_compiler" | "workflow.compile" => Err(
             "workflow.compile is advertised only after the node compiler self-check passes"
@@ -1611,10 +1679,11 @@ mod tests {
 
     use super::{
         control_endpoint_identity, ephemeral_drain_due, is_account_suspended_error,
-        load_or_create_local_node_credential, next_worker_drain_wait, parse_control_poll_ms,
-        parse_positive_u64, validate_assignment_poll_ms, validate_provider_deadlines,
-        wait_for_worker_poll, Args, ContainerRunPolicy, RuntimeTask,
-        DEFAULT_HOSTED_COORDINATOR_ENDPOINT, MAX_PROVIDER_DEADLINE_HORIZON_SECONDS,
+        is_stale_assignment_acknowledgement, load_or_create_local_node_credential,
+        next_worker_drain_wait, parse_control_poll_ms, parse_positive_u64,
+        validate_assignment_poll_ms, validate_provider_deadlines, wait_for_worker_poll, Args,
+        ContainerRunPolicy, RuntimeTask, DEFAULT_HOSTED_COORDINATOR_ENDPOINT,
+        MAX_PROVIDER_DEADLINE_HORIZON_SECONDS,
     };
     use crate::assignment_runner::{
         node_wasm_execution_service, submit_verified_wasmtime_assignment,
@@ -1638,6 +1707,35 @@ mod tests {
         );
         assert!(is_account_suspended_error(&suspended));
         assert!(!is_account_suspended_error(&forbidden));
+    }
+
+    #[test]
+    fn only_retryable_assignment_conflicts_are_discarded_as_stale_offers() {
+        let stale = ApiError::new(
+            ApiErrorCode::Conflict,
+            ApiErrorCategory::State,
+            "node assignment acknowledgement is stale",
+            true,
+            "node-1",
+        );
+        let terminal_conflict = ApiError::new(
+            ApiErrorCode::Conflict,
+            ApiErrorCategory::State,
+            "terminal operation conflict",
+            false,
+            "node-2",
+        );
+        let forbidden = ApiError::new(
+            ApiErrorCode::Forbidden,
+            ApiErrorCategory::Authorization,
+            "outside node scope",
+            false,
+            "node-3",
+        );
+
+        assert!(is_stale_assignment_acknowledgement(&stale));
+        assert!(!is_stale_assignment_acknowledgement(&terminal_conflict));
+        assert!(!is_stale_assignment_acknowledgement(&forbidden));
     }
 
     #[test]
@@ -1678,6 +1776,29 @@ mod tests {
         assert_eq!(args.task_container_policy(), ContainerRunPolicy::default());
         assert!(!args.no_workflow_compilation);
         assert!(!args.system_tasks_only);
+        assert!(!args.dangerous_allow_native_commands);
+        let dangerous = Args::try_parse_from([
+            "clusterflux-node",
+            "--worker",
+            "--dangerous-allow-native-commands",
+        ])
+        .unwrap();
+        assert!(dangerous.dangerous_allow_native_commands);
+        assert!(dangerous
+            .node_capabilities()
+            .capabilities
+            .contains(&Capability::Command));
+        assert!(
+            Args::try_parse_from(["clusterflux-node", "--worker", "--allow-native-commands",])
+                .is_err()
+        );
+        assert!(Args::try_parse_from([
+            "clusterflux-node",
+            "--worker",
+            "--cap",
+            "windows-command-dev",
+        ])
+        .is_err());
         assert!(Args::try_parse_from([
             "clusterflux-node",
             "--coordinator",
@@ -2033,6 +2154,7 @@ mod tests {
             emit_ready: false,
             worker: false,
             capabilities: Vec::new(),
+            dangerous_allow_native_commands: false,
             no_workflow_compilation: true,
             system_tasks_only: false,
             system_compiler_image: None,

@@ -871,6 +871,7 @@ fn set_private_file(file: &fs::File) -> Result<(), ReceiveError> {
         use std::os::unix::fs::PermissionsExt;
         file.set_permissions(fs::Permissions::from_mode(0o600))?;
     }
+    let _ = file;
     Ok(())
 }
 

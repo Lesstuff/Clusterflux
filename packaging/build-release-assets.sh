@@ -1,8 +1,8 @@
 #!/bin/sh
 set -eu
 
-if [ "$#" -ne 8 ]; then
-  echo "usage: build-release-assets.sh <commit> <ref> <archive> <deb> <rpm> <vsix> <installer> <checksums>" >&2
+if [ "$#" -ne 7 ]; then
+  echo "usage: build-release-assets.sh <commit> <ref> <archive> <deb> <rpm> <vsix> <installer>" >&2
   exit 2
 fi
 
@@ -13,7 +13,6 @@ deb_output=$4
 rpm_output=$5
 vsix_output=$6
 installer_output=$7
-checksums_output=$8
 
 case "$commit" in
   ''|*[!0-9a-f]*) echo "invalid commit SHA" >&2; exit 1 ;;
@@ -199,17 +198,6 @@ sed \
   packaging/install.sh.in > "$assets/install.sh"
 chmod 0755 "$assets/install.sh"
 
-(
-  cd "$assets"
-  sha256sum \
-    clusterflux-linux-x86_64.tar.gz \
-    clusterflux-linux-amd64.deb \
-    clusterflux-linux-x86_64.rpm \
-    clusterflux-vscode.vsix \
-    install.sh \
-    > SHA256SUMS
-)
-
 for name in \
   system-compiler-image.oci.tar \
   system-bundles.json \
@@ -231,6 +219,4 @@ install -m 0644 "$assets/clusterflux-linux-amd64.deb" "$deb_output"
 install -m 0644 "$assets/clusterflux-linux-x86_64.rpm" "$rpm_output"
 install -m 0644 "$assets/clusterflux-vscode.vsix" "$vsix_output"
 install -m 0755 "$assets/install.sh" "$installer_output"
-install -m 0644 "$assets/SHA256SUMS" "$checksums_output"
-
 printf 'VERSION=%s\nTAG=%s\nPRERELEASE=%s\n' "$version" "$release_tag" "$prerelease"

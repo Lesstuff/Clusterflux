@@ -2,7 +2,7 @@
   "name": "clusterflux-vscode",
   "displayName": "Clusterflux",
   "description": "VS Code support for Clusterflux build programs, environments, and debugging.",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "publisher": "clusterflux",
   "repository": {
     "type": "git",

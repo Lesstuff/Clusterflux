@@ -257,6 +257,8 @@ fn node_doctor_is_read_only_and_reports_remote_runtime_facts() {
         NodeDoctorArgs {
             scope: scope(),
             node: Some("node-1".to_owned()),
+            full: false,
+            environment: None,
         },
         temp.path().to_path_buf(),
     )

@@ -218,7 +218,7 @@ fn source_for(trigger: &CommitTrigger, commit_sha: &str) -> WorkflowSource {
             WorkflowSourceFile::new(
                 ".clusterflux/Cargo.toml",
                 0o100644,
-                b"[package]\nname='automation-test'\nversion='0.0.0'\nedition='2024'\npublish=false\n[lib]\npath='main.rs'\ncrate-type=['cdylib']\n[dependencies]\nclusterflux={package='clusterflux-sdk',version='=0.1.2'}\n[workspace]\nresolver='3'\n"
+                b"[package]\nname='automation-test'\nversion='0.0.0'\nedition='2024'\npublish=false\n[lib]\npath='main.rs'\ncrate-type=['cdylib']\n[dependencies]\nclusterflux={package='clusterflux-sdk',version='=0.2.0'}\n[workspace]\nresolver='3'\n"
                     .to_vec(),
             )
             .unwrap(),
@@ -1021,7 +1021,7 @@ fn source_identity_and_system_assignment_lease_ownership_fail_closed() {
                         "-Cpanic=abort".to_owned(),
                         "--remap-path-prefix=/workspace=.clusterflux".to_owned(),
                     ],
-                    sdk_version: "0.1.2".to_owned(),
+                    sdk_version: "0.2.0".to_owned(),
                     sdk_digest: system_manifest.sdk_digest,
                     trusted_dependencies: Vec::new(),
                     sandbox_image_digest: Some(system_manifest.environment_digest),
@@ -1349,7 +1349,7 @@ fn secret_authority_uses_explicit_request_and_capabilities_not_task_name() {
     let legacy_refs = ["refs/heads/main".to_owned(), "refs/tags/v0.1.1".to_owned()];
     assert!(super::super::secrets::secret_ref_is_authorized(
         &legacy_refs,
-        "refs/tags/v0.1.2"
+        "refs/tags/v0.2.0"
     ));
     assert!(!super::super::secrets::secret_ref_is_authorized(
         &legacy_refs,
@@ -1357,6 +1357,6 @@ fn secret_authority_uses_explicit_request_and_capabilities_not_task_name() {
     ));
     assert!(!super::super::secrets::secret_ref_is_authorized(
         &legacy_refs,
-        "refs/tags/v0.1.2-rc.1"
+        "refs/tags/v0.2.0-rc.1"
     ));
 }

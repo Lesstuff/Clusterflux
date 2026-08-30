@@ -1,12 +1,14 @@
 mod release;
 mod tasks;
+mod windows;
 
 use clusterflux::prelude::*;
 use release::{PublicationResult, PublishInput, publish};
 use tasks::{
-    BuildReleaseInput, CacheNixInput, TestInput, build_release_assets, cache_nix_package,
-    test_public_repo,
+    BuildReleaseInput, CacheNixInput, FinalizeReleaseInput, PRODUCT_VERSION, TestInput,
+    build_linux_release_assets, cache_nix_package, finalize_release_assets, test_public_repo,
 };
+use windows::{WindowsReleaseInput, build_windows_release_package};
 
 #[clusterflux::main]
 pub async fn main() -> Result<Option<PublicationResult>> {
@@ -28,10 +30,28 @@ pub async fn main() -> Result<Option<PublicationResult>> {
         return Ok(None);
     }
 
-    let assets = clusterflux::spawn!(build_release_assets(BuildReleaseInput {
+    let linux = clusterflux::spawn!(build_linux_release_assets(BuildReleaseInput {
         source: source.clone(),
         commit_sha: trigger.commit_sha.clone(),
         git_ref: trigger.git_ref.clone(),
+    }))
+    .on(clusterflux::env!("release-build"))
+    .await?;
+    let windows = clusterflux::spawn!(build_windows_release_package(WindowsReleaseInput {
+        source: source.clone(),
+        commit_sha: trigger.commit_sha.clone(),
+        version: PRODUCT_VERSION.to_owned(),
+    }))
+    .on(clusterflux::env!("windows-node-build"))
+    .await?;
+
+    let linux = linux.join().await?;
+    let windows = windows.join().await?;
+    let assets = clusterflux::spawn!(finalize_release_assets(FinalizeReleaseInput {
+        source: source.clone(),
+        commit_sha: trigger.commit_sha.clone(),
+        linux,
+        windows,
     }))
     .on(clusterflux::env!("release-build"))
     .await?
