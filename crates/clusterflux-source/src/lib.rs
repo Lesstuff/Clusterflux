@@ -255,12 +255,17 @@ pub fn materialize_clean_local_git_revision(
     } else {
         format!("{}/envs", slash_path(project_prefix)?)
     };
-    let mut changed = run_git(
+    // Older Git releases may still emit paths for `--name-only` when a diff is
+    // empty after `--ignore-cr-at-eol`. `--numstat` follows the filtered diff
+    // itself, so a Windows CRLF checkout is not mistaken for an environment
+    // definition change.
+    let mut changed = numstat_paths(&run_git(
         &repository_root,
         [
             "diff",
             "--cached",
-            "--name-only",
+            "--numstat",
+            "--no-renames",
             "-z",
             "--no-ext-diff",
             "--ignore-cr-at-eol",
@@ -269,30 +274,22 @@ pub fn materialize_clean_local_git_revision(
         ],
         DEFAULT_GIT_TIMEOUT,
         MAX_GIT_DIAGNOSTIC_BYTES,
-    )?
-    .split(|byte| *byte == 0)
-    .filter(|entry| !entry.is_empty())
-    .map(|entry| String::from_utf8_lossy(entry).into_owned())
-    .collect::<Vec<_>>();
-    changed.extend(
-        run_git(
-            &repository_root,
-            [
-                "diff",
-                "--name-only",
-                "-z",
-                "--no-ext-diff",
-                "--ignore-cr-at-eol",
-                "--",
-                environment_path.as_str(),
-            ],
-            DEFAULT_GIT_TIMEOUT,
-            MAX_GIT_DIAGNOSTIC_BYTES,
-        )?
-        .split(|byte| *byte == 0)
-        .filter(|entry| !entry.is_empty())
-        .map(|entry| String::from_utf8_lossy(entry).into_owned()),
-    );
+    )?);
+    changed.extend(numstat_paths(&run_git(
+        &repository_root,
+        [
+            "diff",
+            "--numstat",
+            "--no-renames",
+            "-z",
+            "--no-ext-diff",
+            "--ignore-cr-at-eol",
+            "--",
+            environment_path.as_str(),
+        ],
+        DEFAULT_GIT_TIMEOUT,
+        MAX_GIT_DIAGNOSTIC_BYTES,
+    )?));
     changed.extend(
         run_git(
             &repository_root,
@@ -387,6 +384,19 @@ pub fn materialize_clean_local_git_revision(
         _directory: directory,
         project_root: materialized_project_root,
     }))
+}
+
+fn numstat_paths(output: &[u8]) -> Vec<String> {
+    output
+        .split(|byte| *byte == 0)
+        .filter_map(|record| {
+            let mut fields = record.splitn(3, |byte| *byte == b'\t');
+            fields.next()?;
+            fields.next()?;
+            let path = fields.next()?;
+            (!path.is_empty()).then(|| String::from_utf8_lossy(path).into_owned())
+        })
+        .collect()
 }
 
 pub fn materialize_exact_repository_revision(
